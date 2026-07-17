@@ -62,6 +62,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/adamw.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
+// defines: declarative optimizer plan and blockwise square-view NorMuon
+#include "llmc/normuon.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -298,6 +300,9 @@ typedef struct {
     float* m_memory;
     float* v_memory;
     float* master_weights;     // is NULL unless fp32 weights is enabled.
+    LlmcNormuonConfig optimizer_config;
+    LlmcOptimizerPlan optimizer_plan;
+    LlmcNormuonRuntime normuon_runtime;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
@@ -342,6 +347,9 @@ void gpt2_init_common(GPT2 *model) {
     model->m_memory = NULL;
     model->v_memory = NULL;
     model->master_weights = NULL;
+    llmc_normuon_config_defaults(&model->optimizer_config);
+    llmc_optimizer_plan_reset(&model->optimizer_plan);
+    llmc_normuon_runtime_reset(&model->normuon_runtime);
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
@@ -406,6 +414,37 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
         assert(model->master_weights == nullptr);
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         memory_status |= cudaMallocConditionallyManaged((void**) &model->master_weights, shard_num_parameters * sizeof(float));
+    }
+    if (!model->optimizer_plan.built) {
+        char optimizer_error[256];
+        if (!llmc_build_optimizer_plan(
+                &model->optimizer_plan,
+                &model->optimizer_config,
+                model->config.num_layers,
+                model->config.channels,
+                model->param_elements,
+                optimizer_error,
+                sizeof(optimizer_error))) {
+            fprintf(stderr, "Failed to build optimizer plan: %s\n", optimizer_error);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (!llmc_normuon_runtime_allocate(
+            &model->normuon_runtime,
+            &model->optimizer_plan,
+            &model->optimizer_config)) {
+        fprintf(stderr, "Failed to allocate llm.c NorMuon runtime\n");
+        exit(EXIT_FAILURE);
+    }
+    if (model->optimizer_plan.normuon_parameter_type_count != 0) {
+        printf0(
+            "allocating %zu MiB for reusable blockwise square-view NorMuon workspace\n",
+            model->normuon_runtime.workspace_bytes >> 20);
+        if (model->normuon_runtime.tracked_q_bytes != 0U) {
+            printf0(
+                "allocating %zu MiB for persistent blockwise square-view NorMuon Q\n",
+                model->normuon_runtime.tracked_q_bytes >> 20);
+        }
     }
 
     // report on mixed memory allocation status (re-using our float reduce function, bit awk ok)
@@ -1032,97 +1071,7 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     return grad_norm_cpu;
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
-                 MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
-    // update the model parameters using the AdamW optimizer
-    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
-    // so we may not be responsible for the entire parameter tensor
-    // also, this function was very simple a while back but become very complex, only because we want to
-    // selectively weight decay some, but not all tensors :(
-    // TODO: revisit and probably refactor this entire function
-    NVTX_RANGE_FN();
-    if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
-        fprintf(stderr, "Need to allocate optimizer state before update");
-        exit(EXIT_FAILURE);
-    }
-
-    bool init_state = model->init_state;
-    if(init_state) {
-        model->init_state = false;
-        NvtxRange rng("InitOpt");
-        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-    }
-
-    // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
-    model->rng_state_last_update = model->rng_state;
-
-    // AdamW update
-    // handle adamw for all the transformer blocks
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        // generate a unique seed for each tensor
-        unsigned int seed = random_u32(&model->rng_state);
-
-        int num_layers = model->config.num_layers;
-        if((i < 2 || i > 13)) {
-            num_layers = 1;
-        }
-
-        ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-        ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-        ptrdiff_t local_offset_full = tensor.offset + shard.offset;
-        ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
-
-        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-        // in particular this also decays the embedding weights, but this is ok:
-        // - the token embeddings are weight shared and participate in the final projection to logits
-        // - the position embeddings actively participate at every forward/backward pass
-        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-        floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
-        floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
-
-        ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
-        float* m_ptr = model->m_memory + opt_state_offset;
-        float* v_ptr = model->v_memory + opt_state_offset;
-        float* master_ptr = nullptr;
-        if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
-        if(init_state && model->master_weights != nullptr ) {
-            size_t grid_size = CEIL_DIV(shard.size, 512);
-            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
-                                                                     shard.size, tensor.size);
-            cudaCheck(cudaGetLastError());
-        }
-
-        if (init_from_master_only) {
-            // when resuming training from a checkpoint with master weights (allows changing precision)
-            init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
-        } else {
-            // ok finally call the kernel to update the weights with AdamW
-            adamw_update(param_ptr, master_ptr, grad_ptr,
-                        m_ptr, v_ptr,
-                        shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                        learning_rate,
-                        beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
-        }
-
-        if (multi_gpu_config->zero_stage == 1) {
-#if MULTI_GPU
-            ncclCheck(ncclGroupStart());
-            for(int l = 0; l < num_layers; ++l) {
-                // gather updated shards of model->params_memory from each process
-                ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
-                                        (floatX*) model->params_memory + tensor.offset + l * tensor.size,
-                                        shard.size, ncclFloatX,
-                                        multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
-            }
-            ncclCheck(ncclGroupEnd());
-#endif
-        }
-    }
-
-    cudaCheck(cudaDeviceSynchronize());
-}
-
+#include "llmc/gpt2_optimizer.cuh"
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     /*
     Estimate model flops utilization (MFU)
@@ -1153,6 +1102,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 }
 
 void gpt2_free(GPT2 *model) {
+    llmc_normuon_runtime_free(&model->normuon_runtime);
     cudaFreeCheck(&model->params_memory);
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
@@ -1184,6 +1134,7 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     nvtxNameCudaStreamA(main_stream, "main stream");
 
     // set up cuBLAS and cuBLASLt
+    cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
@@ -1200,6 +1151,7 @@ void common_free(GPT2 &model) {
     cudaCheck(cudaStreamDestroy(main_stream));
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
+    cublasCheck(cublasDestroy(cublas_handle));
     #ifdef ENABLE_CUDNN
     destroy_cudnn();
     #endif
@@ -1283,7 +1235,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
         // restore weights from the master weights using the RNG state before last weight update
         model->rng_state = model->rng_state_last_update;
-        gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, /* init_from_master_only*/ true);
+        gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, *step, &multi_gpu_config, -1.0f, /* init_from_master_only */ true);
         model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
     }
 
@@ -1325,6 +1277,24 @@ void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoa
     // all ranks write their state file
     snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, step, rank);
     save_state(filename_buffer, step, model, train_loader);
+    if (model->optimizer_config.optimizer_selection ==
+        LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) {
+        char normuon_path[512];
+        llmc_normuon_companion_path(
+            normuon_path, sizeof(normuon_path), output_log_dir, step, rank);
+        if (!llmc_normuon_save_companion(
+                normuon_path,
+                step,
+                multi_gpu_config->num_processes,
+                rank,
+                &model->optimizer_plan,
+                &model->optimizer_config,
+                &model->normuon_runtime,
+                main_stream)) {
+            fprintf(stderr, "Failed to save NorMuon companion state: %s\n", normuon_path);
+            exit(EXIT_FAILURE);
+        }
+    }
     // DONE file is a signal that this checkpoint as a whole is complete
     multi_gpu_barrier(multi_gpu_config);
     if (rank == 0) {
@@ -1344,6 +1314,9 @@ void delete_checkpoint(const char* output_log_dir, int step, MultiGpuConfig* mul
     }
     snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, step, rank);
     remove(filename_buffer);
+    char normuon_path[512];
+    llmc_normuon_companion_path(normuon_path, sizeof(normuon_path), output_log_dir, step, rank);
+    remove(normuon_path);
     if (rank == 0) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step);
         remove(filename_buffer);
@@ -1387,6 +1360,21 @@ void error_usage() {
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    fprintf(stderr, "  -op <string> optimizer: adamw|adamw_normuon (default = adamw)\n");
+    fprintf(stderr, "  -nf <string> NorMuon families (required = mlp_wup,mlp_wdown)\n");
+    fprintf(stderr, "  -nl <float>  NorMuon learning rate (default = 2.5e-3)\n");
+    fprintf(stderr, "  -nw <float>  NorMuon weight decay (default = 1e-3)\n");
+    fprintf(stderr, "  -nb <float>  NorMuon momentum (default = 0.95)\n");
+    fprintf(stderr, "  -n2 <float>  NorMuon beta2 (default = 0.95)\n");
+    fprintf(stderr, "  -ne <float>  NorMuon epsilon (default = 1e-8)\n");
+    fprintf(stderr, "  -ns <float>  NorMuon update scale (default = 1.0)\n");
+    fprintf(stderr, "  -no <string> orthogonalization: newton_schulz|skew_polar_track_q\n");
+    fprintf(stderr, "  -nr <string> refresh policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
+    fprintf(stderr, "  -nc <string> correction policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
+    fprintf(stderr, "  -ni <int>    tracker refresh interval (default = 3)\n");
+    fprintf(stderr, "  -nn <int>    tracker correction iterations (default = 2)\n");
+    fprintf(stderr, "  -ng <float>  tracker correction gain (default = 1.0)\n");
+    fprintf(stderr, "  -nt <int>    tracker retraction enabled: 0|1 (default = 1)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
     // evaluation
@@ -1449,6 +1437,9 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    LlmcNormuonConfig optimizer_config;
+    llmc_normuon_config_defaults(&optimizer_config);
+    int optimizer_cli_explicit = 0;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1464,6 +1455,36 @@ int main(int argc, char *argv[]) {
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
+        else if (argv[i][1] == 'o' && argv[i][2] == 'p') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_optimizer_selection(argv[i+1], &optimizer_config.optimizer_selection)) { error_usage(); }
+        }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'f') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_targeted_families(argv[i+1], &optimizer_config.targeted_family_mask)) { error_usage(); }
+        }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'o') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_orthogonalization_mode(argv[i+1], &optimizer_config.orthogonalization_mode)) { error_usage(); }
+        }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'r') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_approximation_policy(argv[i+1], &optimizer_config.refresh_policy)) { error_usage(); }
+        }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'c') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_approximation_policy(argv[i+1], &optimizer_config.correction_policy)) { error_usage(); }
+        }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'l') { optimizer_cli_explicit = 1; optimizer_config.learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'w') { optimizer_cli_explicit = 1; optimizer_config.weight_decay = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'b') { optimizer_cli_explicit = 1; optimizer_config.momentum = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == '2') { optimizer_cli_explicit = 1; optimizer_config.beta2 = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'e') { optimizer_cli_explicit = 1; optimizer_config.epsilon = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 's') { optimizer_cli_explicit = 1; optimizer_config.update_scale = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'i') { optimizer_cli_explicit = 1; optimizer_config.refresh_interval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'n') { optimizer_cli_explicit = 1; optimizer_config.correction_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'g') { optimizer_cli_explicit = 1; optimizer_config.correction_gain = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 't') { optimizer_cli_explicit = 1; optimizer_config.retraction = atoi(argv[i+1]); }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
@@ -1501,6 +1522,14 @@ int main(int argc, char *argv[]) {
         else { error_usage(); }
     }
 
+    char optimizer_config_error[256];
+    if (!llmc_normuon_validate_config(
+            &optimizer_config,
+            optimizer_config_error,
+            sizeof(optimizer_config_error))) {
+        fprintf(stderr, "Invalid optimizer configuration: %s\n", optimizer_config_error);
+        exit(EXIT_FAILURE);
+    }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
 
@@ -1536,6 +1565,21 @@ int main(int argc, char *argv[]) {
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
     printf0("| weight decay          | %-50e |\n", weight_decay);
+    printf0("| optimizer             | %-50s |\n", llmc_optimizer_selection_name(optimizer_config.optimizer_selection));
+    printf0("| NorMuon families      | %-50s |\n", "mlp_wup,mlp_wdown");
+    printf0("| NorMuon LR            | %-50e |\n", optimizer_config.learning_rate);
+    printf0("| NorMuon weight decay  | %-50e |\n", optimizer_config.weight_decay);
+    printf0("| NorMuon momentum      | %-50e |\n", optimizer_config.momentum);
+    printf0("| NorMuon beta2         | %-50e |\n", optimizer_config.beta2);
+    printf0("| NorMuon epsilon       | %-50e |\n", optimizer_config.epsilon);
+    printf0("| NorMuon update scale  | %-50e |\n", optimizer_config.update_scale);
+    printf0("| NorMuon ortho mode    | %-50s |\n", llmc_normuon_orthogonalization_mode_name(optimizer_config.orthogonalization_mode));
+    printf0("| NorMuon refresh       | %-50s |\n", llmc_normuon_approximation_policy_name(optimizer_config.refresh_policy));
+    printf0("| NorMuon correction    | %-50s |\n", llmc_normuon_approximation_policy_name(optimizer_config.correction_policy));
+    printf0("| NorMuon refresh int.  | %-50u |\n", optimizer_config.refresh_interval);
+    printf0("| NorMuon correction N  | %-50u |\n", optimizer_config.correction_iterations);
+    printf0("| NorMuon corr. gain    | %-50e |\n", optimizer_config.correction_gain);
+    printf0("| NorMuon retraction    | %-50s |\n", optimizer_config.retraction ? "enabled" : "disabled");
     printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
     printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
@@ -1585,6 +1629,43 @@ int main(int argc, char *argv[]) {
         gpt_build_from_descriptor(&model, load_filename);
     }
 
+    model.optimizer_config = optimizer_config;
+    bool resume_has_normuon_companion = false;
+    char resume_normuon_path[512] = {0};
+    if (resuming == 1) {
+        LlmcNormuonCompanionInfo companion_info;
+        llmc_normuon_companion_path(
+            resume_normuon_path,
+            sizeof(resume_normuon_path),
+            output_log_dir,
+            resume_max_step,
+            multi_gpu_config.process_rank);
+        resume_has_normuon_companion =
+            llmc_normuon_companion_exists(resume_normuon_path);
+        if (resume_has_normuon_companion) {
+            if (!llmc_normuon_read_companion_info(
+                    resume_normuon_path, &companion_info) ||
+                companion_info.step != resume_max_step ||
+                companion_info.num_processes != multi_gpu_config.num_processes ||
+                companion_info.process_rank != multi_gpu_config.process_rank ||
+                companion_info.num_layers != model.config.num_layers ||
+                companion_info.channels != model.config.channels) {
+                fprintf(stderr, "Invalid or incompatible NorMuon companion state: %s\n", resume_normuon_path);
+                exit(EXIT_FAILURE);
+            }
+            if (optimizer_cli_explicit &&
+                !llmc_normuon_config_equal(&optimizer_config, &companion_info.config)) {
+                fprintf(stderr, "Explicit optimizer CLI configuration does not match the checkpoint companion state\n");
+                exit(EXIT_FAILURE);
+            }
+            model.optimizer_config = companion_info.config;
+            optimizer_config = companion_info.config;
+        } else if (optimizer_config.optimizer_selection ==
+                   LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) {
+            fprintf(stderr, "Cannot exactly resume NorMuon without its companion optimizer state file\n");
+            exit(EXIT_FAILURE);
+        }
+    }
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
@@ -1636,6 +1717,86 @@ int main(int argc, char *argv[]) {
 
     // pretty print in a table the multi-gpu configuration as well
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
+    if (model.optimizer_config.optimizer_selection ==
+        LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) {
+        if (multi_gpu_config.num_processes != 1) {
+            fprintf(stderr, "llm.c NorMuon currently supports single-GPU execution only\n");
+            exit(EXIT_FAILURE);
+        }
+        if (multi_gpu_config.zero_stage != 0) {
+            fprintf(stderr, "llm.c NorMuon rejects zero_stage != 0 because flat ZeRO shards can split a square polar view\n");
+            exit(EXIT_FAILURE);
+        }
+        if (PRECISION_MODE != PRECISION_BF16) {
+            fprintf(stderr, "llm.c NorMuon currently requires BF16 model parameters and gradients\n");
+            exit(EXIT_FAILURE);
+        }
+        if (!model.use_master_weights) {
+            fprintf(stderr, "llm.c NorMuon requires FP32 master weights (-w 1)\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    char optimizer_plan_error[256];
+    if (!llmc_build_optimizer_plan(
+            &model.optimizer_plan,
+            &model.optimizer_config,
+            model.config.num_layers,
+            model.config.channels,
+            model.param_elements,
+            optimizer_plan_error,
+            sizeof(optimizer_plan_error))) {
+        fprintf(stderr, "Failed to build optimizer plan: %s\n", optimizer_plan_error);
+        exit(EXIT_FAILURE);
+    }
+    printf0("effective_optimizer: %s\n",
+            llmc_optimizer_selection_name(model.optimizer_config.optimizer_selection));
+    for (int parameter_index = 0;
+         parameter_index < LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT;
+         ++parameter_index) {
+        const LlmcOptimizerParameterType* parameter_type =
+            &model.optimizer_plan.parameter_types[parameter_index];
+        printf0("optimizer_plan tensor=%d type=%s family=%s backend=%s hyperparameter_group=%d weight_decay=%s layers=%d views_per_layer=%d\n",
+                parameter_type->tensor_id,
+                parameter_type->name,
+                model.optimizer_plan.families[parameter_type->family_id].name,
+                model.optimizer_plan.backends[parameter_type->backend_kind].name,
+                parameter_type->hyperparameter_group,
+                parameter_type->weight_decay_policy == LLMC_WEIGHT_DECAY_ENABLED ? "enabled" : "disabled",
+                parameter_type->layer_multiplicity,
+                parameter_type->views_per_layer);
+    }
+    if (model.optimizer_plan.normuon_parameter_type_count != 0) {
+        printf0("normuon_variant: blockwise square-view NorMuon\n");
+        printf0("normuon_view_count: %d\n", model.optimizer_plan.normuon_view_count);
+        printf0("normuon_orthogonalization_mode: %s\n",
+                llmc_normuon_orthogonalization_mode_name(model.optimizer_config.orthogonalization_mode));
+        printf0("normuon_refresh_policy: %s\n",
+                llmc_normuon_approximation_policy_name(model.optimizer_config.refresh_policy));
+        printf0("normuon_correction_policy: %s\n",
+                llmc_normuon_approximation_policy_name(model.optimizer_config.correction_policy));
+        printf0("normuon_refresh_interval: %u\n", model.optimizer_config.refresh_interval);
+        printf0("normuon_correction_iterations: %u\n", model.optimizer_config.correction_iterations);
+        printf0("normuon_correction_gain: %.9g\n", model.optimizer_config.correction_gain);
+        printf0("normuon_retraction: %u\n", model.optimizer_config.retraction);
+        for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
+            const LlmcNormuonPolynomialStep coefficient =
+                model.optimizer_config.refresh_schedule[stage];
+            printf0("normuon_refresh_coefficient_%d: %.9g,%.9g,%.9g\n",
+                    stage, coefficient.a, coefficient.b, coefficient.c);
+        }
+        for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
+            const LlmcNormuonPolynomialStep coefficient =
+                model.optimizer_config.correction_schedule[stage];
+            printf0("normuon_correction_coefficient_%d: %.9g,%.9g,%.9g%s\n",
+                    stage,
+                    coefficient.a,
+                    coefficient.b,
+                    coefficient.c,
+                    stage < static_cast<int>(model.optimizer_config.correction_iterations)
+                        ? " (effective)"
+                        : "");
+        }
+    }
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -1666,6 +1827,9 @@ int main(int argc, char *argv[]) {
     LearningRateScheduler lr_scheduler;
     lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
                       warmup_iterations, train_num_batches, final_learning_rate_frac);
+    LearningRateScheduler normuon_lr_scheduler;
+    lr_scheduler_init(&normuon_lr_scheduler, lr_scheduler_type, model.optimizer_config.learning_rate,
+                      warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1678,6 +1842,19 @@ int main(int argc, char *argv[]) {
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
+        if (resume_has_normuon_companion &&
+            !llmc_normuon_load_companion(
+                resume_normuon_path,
+                step,
+                multi_gpu_config.num_processes,
+                multi_gpu_config.process_rank,
+                &model.optimizer_plan,
+                &model.optimizer_config,
+                &model.normuon_runtime,
+                main_stream)) {
+            fprintf(stderr, "Failed to load exact NorMuon companion state: %s\n", resume_normuon_path);
+            exit(EXIT_FAILURE);
+        }
     }
 
     // init an OutlierDetector the training loss
@@ -1704,11 +1881,17 @@ int main(int argc, char *argv[]) {
 
     // train
     cudaEvent_t start, end;
+    cudaEvent_t optimizer_start, optimizer_end;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
+    cudaCheck(cudaEventCreate(&optimizer_start));
+    cudaCheck(cudaEventCreate(&optimizer_end));
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
+    size_t peak_device_memory_used_bytes = 0U;
+    double total_optimizer_time_ms = 0.0;
+    int completed_optimizer_steps = 0;
     for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
@@ -1837,6 +2020,8 @@ int main(int argc, char *argv[]) {
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+        float step_normuon_learning_rate = get_learning_rate(&normuon_lr_scheduler, step);
+        float optimizer_time_ms = 0.0f;
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
         float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
@@ -1849,7 +2034,16 @@ int main(int argc, char *argv[]) {
             // clip the gradient norm to a maximum value
             float grad_clip = 1.0f;
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            cudaCheck(cudaEventRecord(optimizer_start));
+            gpt2_update(
+                &model, step_learning_rate, 0.9f, 0.95f, 1e-8f,
+                weight_decay, grad_scale, step+1, &multi_gpu_config,
+                step_normuon_learning_rate);
+            cudaCheck(cudaEventRecord(optimizer_end));
+            cudaCheck(cudaEventSynchronize(optimizer_end));
+            cudaCheck(cudaEventElapsedTime(&optimizer_time_ms, optimizer_start, optimizer_end));
+            total_optimizer_time_ms += optimizer_time_ms;
+            completed_optimizer_steps++;
         }
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
@@ -1859,6 +2053,15 @@ int main(int argc, char *argv[]) {
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
         float time_elapsed_ms;
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
+        size_t free_device_memory_bytes = 0U;
+        size_t total_device_memory_bytes = 0U;
+        cudaCheck(cudaMemGetInfo(&free_device_memory_bytes, &total_device_memory_bytes));
+        const size_t device_memory_used_bytes =
+            total_device_memory_bytes - free_device_memory_bytes;
+        if (device_memory_used_bytes > peak_device_memory_used_bytes) {
+            peak_device_memory_used_bytes = device_memory_used_bytes;
+        }
+        const bool finite_step = isfinite(model.mean_loss) && isfinite(grad_norm);
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
         float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
         float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
@@ -1869,9 +2072,12 @@ int main(int argc, char *argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-                step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
-                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| adamw_lr %.2e | normuon_lr %.2e | optimizer %.2f ms | total %.2f ms | memory_used %.1f MiB | finite %s | %.1f%% bf16 MFU | %.0f tok/s\n",
+                step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad,
+                step_learning_rate, step_normuon_learning_rate, optimizer_time_ms,
+                time_elapsed_ms, device_memory_used_bytes / (1024.0 * 1024.0),
+                finite_step ? "yes" : "no", 100*mfu,
+                bias_corrected_ema_tokens_per_second);
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
@@ -1885,8 +2091,14 @@ int main(int argc, char *argv[]) {
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
+    printf0("average optimizer time: %f ms\n",
+            completed_optimizer_steps > 0 ? total_optimizer_time_ms / completed_optimizer_steps : 0.0);
+    printf0("peak device memory used: %zu bytes\n", peak_device_memory_used_bytes);
+    printf0("CUDA allocator reserved memory: not applicable (direct cudaMalloc; no caching reserve)\n");
 
     // free and destroy everything
+    cudaCheck(cudaEventDestroy(optimizer_end));
+    cudaCheck(cudaEventDestroy(optimizer_start));
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
     if (run_hellaswag) { evalloader_free(&eval_loader); }

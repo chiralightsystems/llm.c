@@ -29,6 +29,7 @@ const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 void* cublaslt_workspace = NULL;
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
 cublasLtHandle_t cublaslt_handle;
+cublasHandle_t cublas_handle;
 
 // ----------------------------------------------------------------------------
 // Error checking

@@ -179,8 +179,14 @@ extern inline void token_check(const int* tokens, int token_count, int vocab_siz
 
 extern inline void create_dir_if_not_exists(const char *dir) {
     if (dir == NULL) { return; }
+    #ifdef _WIN32
+    struct _stat st = {0};
+    int status = _stat(dir, &st);
+    #else
     struct stat st = {0};
-    if (stat(dir, &st) == -1) {
+    int status = stat(dir, &st);
+    #endif
+    if (status == -1) {
         if (mkdir(dir, 0700) == -1) {
             printf("ERROR: could not create directory: %s\n", dir);
             exit(EXIT_FAILURE);

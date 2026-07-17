@@ -30,7 +30,6 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 #define TURN_ON_FP_FAST  __pragma(float_control(pop)) // Restore file's default settings
 
 #define mkdir(path, mode) _mkdir(path) /* sketchy way to get mkdir to work on windows */
-#define stat _stat
 
 typedef struct glob_t {
     size_t gl_pathc;    // Count of matched pathnames
