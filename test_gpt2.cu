@@ -167,6 +167,15 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     gpt2_allocate_state(&model, B, T);
+    const Gpt2NormuonWorkspaceCandidate workspace =
+        gpt2_normuon_workspace_candidate(&model);
+    const size_t expected_workspace_bytes =
+        model.acts_specs[ACTIVATION_TENSOR_OUTPUT].size * sizeof(floatX);
+    const int workspace_ok = workspace.data == model.acts.output &&
+                             workspace.data != model.acts_memory &&
+                             workspace.bytes == expected_workspace_bytes;
+    printf("normuon output workspace selection okay: %d\n", workspace_ok);
+    allok &= workspace_ok;
 
     // First, do target-free forward pass to validate logits
     gpt2_forward(&model, x, B, T);

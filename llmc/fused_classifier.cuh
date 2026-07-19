@@ -69,11 +69,26 @@ template <bool WriteDLogits = true, bool WriteProbs = false>
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     fused_classifier_kernel5(floatX* logits, float* losses, floatX* probs,
                                 const float dloss, const int* targets,
-                                int B, int T, int V, int P, std::bool_constant<WriteDLogits>) {
+                                int B, int T, int V, int P,
+                                bool mask_sequence_final_target,
+                                std::bool_constant<WriteDLogits>) {
     // note: idx is small enough that it easily fits into 32 bit;
     // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
     // are done is 64 bit
     int64_t idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
+    if (mask_sequence_final_target && idx % T == T - 1) {
+        // Packed-cache rows are independent sequences. The final input has no
+        // target inside its row, so it contributes neither loss nor gradient.
+        if (threadIdx.x == 0) {
+            losses[idx] = 0.0f;
+        }
+        if (WriteDLogits) {
+            for (int i = threadIdx.x; i < P; i += blockDim.x) {
+                logits[idx * P + i] = (floatX)0.0f;
+            }
+        }
+        return;
+    }
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -139,11 +154,25 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 template <typename Type, bool WriteDLogits>
 void fused_classifier(Type* logits, float* losses,
                       const float dloss, const int* targets,
-                      int B, int T, int V, int P, std::bool_constant<WriteDLogits> write_dlogits, cudaStream_t stream) {
+                      int B, int T, int V, int P,
+                      std::bool_constant<WriteDLogits> write_dlogits,
+                      cudaStream_t stream,
+                      bool mask_sequence_final_target = false) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits);
+    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(
+        logits,
+        losses,
+        (floatX*)NULL,
+        dloss,
+        targets,
+        B,
+        T,
+        V,
+        P,
+        mask_sequence_final_target,
+        write_dlogits);
     cudaCheck(cudaGetLastError());
 }

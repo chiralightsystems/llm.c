@@ -7,6 +7,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdarg.h>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <sys/stat.h>
 #include <sys/types.h>
 // ----------- CPU utilities -----------
@@ -64,6 +65,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/global_norm.cuh"
 // defines: declarative optimizer plan and blockwise square-view NorMuon
 #include "llmc/normuon.cuh"
+// defines: optimized same-shape BF16/FP32-accumulation NorMuon batches
+#include "llmc/normuon_batched.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -82,6 +85,46 @@ cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
 // buffer size to use for device <-> disk io
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
+
+enum LlmcSequenceBoundaryPolicy {
+    LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM = 0,
+    LLMC_SEQUENCE_BOUNDARY_ROW_RESET = 1,
+};
+
+const char* llmc_sequence_boundary_policy_name(
+    LlmcSequenceBoundaryPolicy policy) {
+    switch (policy) {
+        case LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM: return "flat_stream";
+        case LLMC_SEQUENCE_BOUNDARY_ROW_RESET: return "row_reset";
+        default: return "unknown";
+    }
+}
+
+bool llmc_parse_sequence_boundary_policy(
+    const char* text,
+    LlmcSequenceBoundaryPolicy* policy) {
+    if (strcmp(text, "flat_stream") == 0) {
+        *policy = LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM;
+        return true;
+    }
+    if (strcmp(text, "row_reset") == 0) {
+        *policy = LLMC_SEQUENCE_BOUNDARY_ROW_RESET;
+        return true;
+    }
+    return false;
+}
+
+bool llmc_masks_sequence_final_target(LlmcSequenceBoundaryPolicy policy) {
+    return policy == LLMC_SEQUENCE_BOUNDARY_ROW_RESET;
+}
+
+size_t llmc_supervised_target_count(
+    size_t B,
+    size_t T,
+    bool mask_sequence_final_target) {
+    assert(T > (mask_sequence_final_target ? 1U : 0U));
+    return B * (T - (mask_sequence_final_target ? 1U : 0U));
+}
 
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
@@ -170,6 +213,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
 }
 
 constexpr int NUM_ACTIVATION_TENSORS = 21;
+constexpr int ACTIVATION_TENSOR_OUTPUT = 18;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
@@ -249,10 +293,19 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
     tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    tensors[ACTIVATION_TENSOR_OUTPUT] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
 
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+}
+
+size_t activation_allocation_bytes(
+    const TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
+    size_t bytes = 0U;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; ++i) {
+        bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
+    }
+    return bytes;
 }
 
 void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
@@ -307,6 +360,7 @@ typedef struct {
     ActivationTensors acts;
     TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
     void* acts_memory;
+    size_t acts_memory_bytes;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
@@ -325,11 +379,29 @@ typedef struct {
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+struct Gpt2NormuonWorkspaceCandidate {
+    void* data;
+    size_t bytes;
+};
+
+inline Gpt2NormuonWorkspaceCandidate gpt2_normuon_workspace_candidate(
+    GPT2* model) {
+    if (model == nullptr) {
+        return {nullptr, 0U};
+    }
+    const TensorSpec& output_spec =
+        model->acts_specs[ACTIVATION_TENSOR_OUTPUT];
+    return {
+        model->acts.output,
+        output_spec.size * sizeof_dtype(output_spec.type),
+    };
+}
 
 void gpt2_init_common(GPT2 *model) {
     // common inits outside of the model weights
     // memory lazily initialized in forward()
     model->acts_memory = NULL;
+    model->acts_memory_bytes = 0U;
     model->inputs = NULL;
     model->targets = NULL;
     model->accumulated_mean_loss = NULL;
@@ -383,6 +455,8 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
 
     // allocate the space
     fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute);
+    model->acts_memory_bytes =
+        activation_allocation_bytes(model->acts_specs);
     model->acts_memory = malloc_and_point_activations(model->acts_specs);
     // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
@@ -429,17 +503,30 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
             exit(EXIT_FAILURE);
         }
     }
+    // Gradient-norm readback makes only acts.output explicitly dead here.
+    const Gpt2NormuonWorkspaceCandidate workspace =
+        gpt2_normuon_workspace_candidate(model);
     if (!llmc_normuon_runtime_allocate(
             &model->normuon_runtime,
             &model->optimizer_plan,
-            &model->optimizer_config)) {
+            &model->optimizer_config,
+            workspace.data,
+            workspace.bytes)) {
         fprintf(stderr, "Failed to allocate llm.c NorMuon runtime\n");
         exit(EXIT_FAILURE);
     }
     if (model->optimizer_plan.normuon_parameter_type_count != 0) {
-        printf0(
-            "allocating %zu MiB for reusable blockwise square-view NorMuon workspace\n",
-            model->normuon_runtime.workspace_bytes >> 20);
+        if (model->normuon_runtime.workspace_is_borrowed) {
+            printf0(
+                "borrowing %zu MiB of synchronized output storage for "
+                "reusable blockwise square-view NorMuon workspace\n",
+                model->normuon_runtime.workspace_bytes >> 20);
+        } else {
+            printf0(
+                "allocating %zu MiB for reusable blockwise square-view "
+                "NorMuon workspace\n",
+                model->normuon_runtime.workspace_bytes >> 20);
+        }
         if (model->normuon_runtime.tracked_q_bytes != 0U) {
             printf0(
                 "allocating %zu MiB for persistent blockwise square-view NorMuon Q\n",
@@ -797,7 +884,13 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 // Forwards both the model and the loss and is used for validation splits and evals.
 // In particular it populates cpu_losses with loss at each token.
 // Some of the evals (e.g. HellaSwag) require the per-token losses, which are produced here.
-float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T) {
+float gpt2_validate(
+    GPT2 *model,
+    const int* inputs,
+    const int* targets,
+    size_t B,
+    size_t T,
+    bool mask_sequence_final_target = false) {
     assert(targets != NULL);
     // forward the model itself
     gpt2_forward(model, inputs, B, T);
@@ -808,23 +901,42 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     NvtxRange classifier_and_loss_range("classifier_and_loss");
     ActivationTensors acts = model->acts;
     float mean_loss = 0.0f;
+    const size_t supervised_targets = llmc_supervised_target_count(
+        B, T, mask_sequence_final_target);
     // fused classifier: does the forward pass and first part of the backward pass
-    const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
+    const float dloss = 1.0f / supervised_targets;
     // note: we don't need to generate dlogits here
     cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(float)));
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
+    fused_classifier(
+        acts.output,
+        acts.losses,
+        dloss,
+        model->targets,
+        B,
+        T,
+        V,
+        Vp,
+        False,
+        main_stream,
+        mask_sequence_final_target);
     cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B*T; i++) {
         mean_loss += model->cpu_losses[i];
     }
-    mean_loss /= B*T;
+    mean_loss /= supervised_targets;
     cudaCheck(cudaDeviceSynchronize());
     return mean_loss;
 }
 
-void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
+void gpt2_backward_and_reduce(
+    GPT2 *model,
+    int* inputs,
+    const int* targets,
+    int grad_accum_steps,
+    int micro_step,
+    bool mask_sequence_final_target = false) {
     if(model->grads_memory == nullptr) {
         fprintf(stderr, "Need to allocate gradients before backward");
         exit(EXIT_FAILURE);
@@ -852,13 +964,26 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
+    const size_t supervised_targets = llmc_supervised_target_count(
+        B, T, mask_sequence_final_target);
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+    const float dloss = 1.0f / (float)(supervised_targets * grad_accum_steps);
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
+    fused_classifier(
+        acts.output,
+        acts.losses,
+        dloss,
+        model->targets,
+        B,
+        T,
+        V,
+        Vp,
+        True,
+        main_stream,
+        mask_sequence_final_target);
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
@@ -870,10 +995,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     float*  scratchF = (float*)acts.output;
     floatX* scratchX = (floatX*)acts.output;
 
-    // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
+    // we kick off the chain rule by scaling each supervised target uniformly
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
-    // total, final loss as the mean over all losses over all (B,T) positions in the batch
+    // total, final loss as the mean over the configured target set
     // next: backward the classifier matmul
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
@@ -1005,7 +1130,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     cudaCheck(cudaDeviceSynchronize());
     if(last_step) {
-        model->mean_loss /= B*T*grad_accum_steps;
+        model->mean_loss /= supervised_targets * grad_accum_steps;
     } else {
         model->mean_loss = -1.f; // no loss available yet
     }
@@ -1199,7 +1324,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     fcloseCheck(state_file);
 }
 
-void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
+void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename, bool reset_dataloader = false) {
     FILE *state_file = fopenCheck(filename, "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
@@ -1237,6 +1362,15 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         model->rng_state = model->rng_state_last_update;
         gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, *step, &multi_gpu_config, -1.0f, /* init_from_master_only */ true);
         model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
+    }
+
+    // A cache-layout change invalidates the serialized shard and intra-shard
+    // permutations, but does not invalidate model or optimizer state. Keep the
+    // freshly initialized loader when an explicit data-only reset is requested.
+    if (reset_dataloader) {
+        printf0("Resetting dataloader state while preserving checkpointed model and optimizer state.\n");
+        fcloseCheck(state_file);
+        return;
     }
 
     // revive the DataLoader object and its state
@@ -1348,10 +1482,12 @@ void error_usage() {
     fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
     fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
     fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    fprintf(stderr, "  -yd <int>   reset only dataloader state on resume? (0=exact loader resume, 1=fresh loader; default=0)\n");
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    fprintf(stderr, "  -bp <string> sequence boundary: flat_stream|row_reset (default = flat_stream)\n");
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     // optimization
@@ -1368,13 +1504,14 @@ void error_usage() {
     fprintf(stderr, "  -n2 <float>  NorMuon beta2 (default = 0.95)\n");
     fprintf(stderr, "  -ne <float>  NorMuon epsilon (default = 1e-8)\n");
     fprintf(stderr, "  -ns <float>  NorMuon update scale (default = 1.0)\n");
+    fprintf(stderr, "  -nx <string> NorMuon execution: fp32_reference|bf16_batched\n");
     fprintf(stderr, "  -no <string> orthogonalization: newton_schulz|skew_polar_track_q\n");
     fprintf(stderr, "  -nr <string> refresh policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
     fprintf(stderr, "  -nc <string> correction policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
     fprintf(stderr, "  -ni <int>    tracker refresh interval (default = 3)\n");
     fprintf(stderr, "  -nn <int>    tracker correction iterations (default = 2)\n");
     fprintf(stderr, "  -ng <float>  tracker correction gain (default = 1.0)\n");
-    fprintf(stderr, "  -nt <int>    tracker retraction enabled: 0|1 (default = 1)\n");
+    fprintf(stderr, "  -nt <string> tracker retraction: disabled|newton_schulz|commuted_canonical_stage2 (default = newton_schulz; 0|1 accepted)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
     // evaluation
@@ -1382,6 +1519,11 @@ void error_usage() {
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -gs <uint64> sample RNG seed (default = 1337)\n");
+    fprintf(stderr, "  -gt <float> sample temperature (default = 1.0)\n");
+    fprintf(stderr, "  -gk <int>   sample top-k; 0 disables (default = 0)\n");
+    fprintf(stderr, "  -gu <float> sample top-p in (0,1]; 1 disables (default = 1.0)\n");
+    fprintf(stderr, "  -gp <csv>   optional comma-separated prompt token ids (default = GPT-2 EOS)\n");
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
     // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
@@ -1415,8 +1557,11 @@ int main(int argc, char *argv[]) {
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
+    int resume_reset_dataloader = 0; // preserve optimizer/model state but start the configured dataloader fresh
     int B = 4; // batch size
     int T = 1024; // sequence length max
+    LlmcSequenceBoundaryPolicy sequence_boundary_policy =
+        LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM;
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int log_gpu_every = -1;
@@ -1429,6 +1574,11 @@ int main(int argc, char *argv[]) {
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
+    unsigned long long sample_rng_seed = 1337ULL;
+    float sample_temperature = 1.0f;
+    int sample_top_k = 0;
+    float sample_top_p = 1.0f;
+    const char* sample_prompt_token_ids_csv = nullptr;
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
@@ -1463,6 +1613,10 @@ int main(int argc, char *argv[]) {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_targeted_families(argv[i+1], &optimizer_config.targeted_family_mask)) { error_usage(); }
         }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'x') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_execution_mode(argv[i+1], &optimizer_config.execution_mode)) { error_usage(); }
+        }
         else if (argv[i][1] == 'n' && argv[i][2] == 'o') {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_orthogonalization_mode(argv[i+1], &optimizer_config.orthogonalization_mode)) { error_usage(); }
@@ -1484,10 +1638,20 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'i') { optimizer_cli_explicit = 1; optimizer_config.refresh_interval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'n') { optimizer_cli_explicit = 1; optimizer_config.correction_iterations = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'g') { optimizer_cli_explicit = 1; optimizer_config.correction_gain = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 't') { optimizer_cli_explicit = 1; optimizer_config.retraction = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 't') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_tracker_retraction_mode(argv[i+1], &optimizer_config.retraction_mode)) { error_usage(); }
+        }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y' && argv[i][2] == 'd') { resume_reset_dataloader = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y' && argv[i][2] == '\0') { resume = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b' && argv[i][2] == 'p') {
+            if (!llmc_parse_sequence_boundary_policy(
+                    argv[i+1], &sequence_boundary_policy)) {
+                error_usage();
+            }
+        }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
@@ -1501,6 +1665,11 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 's') { sample_rng_seed = strtoull(argv[i+1], nullptr, 10); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 't') { sample_temperature = atof(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'k') { sample_top_k = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'u') { sample_top_p = atof(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'p') { sample_prompt_token_ids_csv = argv[i+1]; }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
@@ -1523,6 +1692,20 @@ int main(int argc, char *argv[]) {
     }
 
     char optimizer_config_error[256];
+    if (resume_reset_dataloader < 0 || resume_reset_dataloader > 1) {
+        fprintf(stderr, "-yd must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (resume_reset_dataloader != 0 && resume != 1) {
+        fprintf(stderr, "-yd 1 requires -y 1\n");
+        exit(EXIT_FAILURE);
+    }
+    const bool mask_sequence_final_target =
+        llmc_masks_sequence_final_target(sequence_boundary_policy);
+    if (mask_sequence_final_target && T < 2) {
+        fprintf(stderr, "-bp row_reset requires sequence length T >= 2\n");
+        exit(EXIT_FAILURE);
+    }
     if (!llmc_normuon_validate_config(
             &optimizer_config,
             optimizer_config_error,
@@ -1539,6 +1722,9 @@ int main(int argc, char *argv[]) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
     }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
+    int supervised_targets_per_fwdbwd =
+        B * (T - (mask_sequence_final_target ? 1 : 0)) *
+        multi_gpu_config.num_processes;
     // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
     // in the future, we might want to set gelu fusion to 2 for SM90+ and 0 for other GPUs
@@ -1557,8 +1743,13 @@ int main(int argc, char *argv[]) {
     printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
     printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
     printf0("| resume                | %-50d |\n", resume);
+    printf0("| reset resume loader   | %-50d |\n", resume_reset_dataloader);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
+    printf0("| sequence boundary     | %-50s |\n",
+            llmc_sequence_boundary_policy_name(sequence_boundary_policy));
+    printf0("| supervised targets    | %-50d |\n",
+            supervised_targets_per_fwdbwd);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
@@ -1573,13 +1764,16 @@ int main(int argc, char *argv[]) {
     printf0("| NorMuon beta2         | %-50e |\n", optimizer_config.beta2);
     printf0("| NorMuon epsilon       | %-50e |\n", optimizer_config.epsilon);
     printf0("| NorMuon update scale  | %-50e |\n", optimizer_config.update_scale);
+    printf0("| NorMuon execution     | %-50s |\n",
+            llmc_normuon_execution_mode_name(optimizer_config.execution_mode));
     printf0("| NorMuon ortho mode    | %-50s |\n", llmc_normuon_orthogonalization_mode_name(optimizer_config.orthogonalization_mode));
     printf0("| NorMuon refresh       | %-50s |\n", llmc_normuon_approximation_policy_name(optimizer_config.refresh_policy));
     printf0("| NorMuon correction    | %-50s |\n", llmc_normuon_approximation_policy_name(optimizer_config.correction_policy));
     printf0("| NorMuon refresh int.  | %-50u |\n", optimizer_config.refresh_interval);
     printf0("| NorMuon correction N  | %-50u |\n", optimizer_config.correction_iterations);
     printf0("| NorMuon corr. gain    | %-50e |\n", optimizer_config.correction_gain);
-    printf0("| NorMuon retraction    | %-50s |\n", optimizer_config.retraction ? "enabled" : "disabled");
+    printf0("| NorMuon retraction    | %-50s |\n",
+            llmc_normuon_tracker_retraction_mode_name(optimizer_config.retraction_mode));
     printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
     printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
@@ -1587,6 +1781,12 @@ int main(int argc, char *argv[]) {
     printf0("| val_max_steps         | %-50d |\n", val_max_steps);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
+    printf0("| sample RNG seed       | %-50llu |\n", sample_rng_seed);
+    printf0("| sample temperature    | %-50f |\n", sample_temperature);
+    printf0("| sample top-k          | %-50d |\n", sample_top_k);
+    printf0("| sample top-p          | %-50f |\n", sample_top_p);
+    printf0("| sample prompt ids     | %-50s |\n",
+            sample_prompt_token_ids_csv == nullptr ? "GPT-2 EOS" : sample_prompt_token_ids_csv);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
     printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
@@ -1766,8 +1966,41 @@ int main(int argc, char *argv[]) {
                 parameter_type->views_per_layer);
     }
     if (model.optimizer_plan.normuon_parameter_type_count != 0) {
+        const bool commuted_canonical_stage2 =
+            model.optimizer_config.retraction_mode ==
+            LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
+        const bool retraction_enabled =
+            model.optimizer_config.retraction_mode !=
+            LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
         printf0("normuon_variant: blockwise square-view NorMuon\n");
         printf0("normuon_view_count: %d\n", model.optimizer_plan.normuon_view_count);
+        printf0("normuon_execution_mode: %s\n",
+                llmc_normuon_execution_mode_name(model.optimizer_config.execution_mode));
+        printf0("normuon_dense_operand_dtype: %s\n",
+                model.optimizer_config.execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED ? "bf16" : "fp32");
+        printf0("normuon_dense_accumulation_dtype: fp32\n");
+        printf0("normuon_persistent_state_dtype: fp32\n");
+        printf0("normuon_view_dispatch: %s\n",
+                model.optimizer_config.execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED
+                    ? "batched_per_parameter_family"
+                    : "serial_per_view");
+        printf0("normuon_tracker_packed_q_policy: %s\n",
+                model.optimizer_config.execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED &&
+                        model.optimizer_config.orthogonalization_mode == LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q
+                    ? "single_pack_reused_through_prefix_polynomial"
+                    : "not_applicable");
+        printf0("normuon_tracker_retraction_form: %s\n",
+                !retraction_enabled
+                    ? "disabled"
+                    : (commuted_canonical_stage2
+                           ? "canonical_taylor_stage2_post_product"
+                           : (model.optimizer_config.execution_mode ==
+                                      LLMC_NORMUON_EXECUTION_BF16_BATCHED
+                                  ? "D(3I-D^T D)/2"
+                                  : "(3I-DD^T)D/2")));
+        printf0("normuon_tracker_retraction_mode: %s\n",
+                llmc_normuon_tracker_retraction_mode_name(
+                    model.optimizer_config.retraction_mode));
         printf0("normuon_orthogonalization_mode: %s\n",
                 llmc_normuon_orthogonalization_mode_name(model.optimizer_config.orthogonalization_mode));
         printf0("normuon_refresh_policy: %s\n",
@@ -1777,7 +2010,15 @@ int main(int argc, char *argv[]) {
         printf0("normuon_refresh_interval: %u\n", model.optimizer_config.refresh_interval);
         printf0("normuon_correction_iterations: %u\n", model.optimizer_config.correction_iterations);
         printf0("normuon_correction_gain: %.9g\n", model.optimizer_config.correction_gain);
-        printf0("normuon_retraction: %u\n", model.optimizer_config.retraction);
+        printf0("normuon_retraction: %u\n", retraction_enabled ? 1U : 0U);
+        printf0("normuon_tracker_pre_product_correction_stage_count: %u\n",
+                commuted_canonical_stage2
+                    ? 1U
+                    : model.optimizer_config.correction_iterations);
+        printf0("normuon_tracker_post_product_correction_stage_count: %u\n",
+                commuted_canonical_stage2 ? 1U : 0U);
+        printf0("normuon_optimizer_companion_format_version: %u\n",
+                LLMC_NORMUON_COMPANION_VERSION);
         for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
             const LlmcNormuonPolynomialStep coefficient =
                 model.optimizer_config.refresh_schedule[stage];
@@ -1787,14 +2028,22 @@ int main(int argc, char *argv[]) {
         for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
             const LlmcNormuonPolynomialStep coefficient =
                 model.optimizer_config.correction_schedule[stage];
+            const char* placement = "";
+            if (commuted_canonical_stage2 && stage == 0) {
+                placement = " (effective_pre_product)";
+            } else if (commuted_canonical_stage2 && stage == 1) {
+                placement = " (effective_post_product_retraction)";
+            } else if (!commuted_canonical_stage2 &&
+                       stage < static_cast<int>(
+                                   model.optimizer_config.correction_iterations)) {
+                placement = " (effective_pre_product)";
+            }
             printf0("normuon_correction_coefficient_%d: %.9g,%.9g,%.9g%s\n",
                     stage,
                     coefficient.a,
                     coefficient.b,
                     coefficient.c,
-                    stage < static_cast<int>(model.optimizer_config.correction_iterations)
-                        ? " (effective)"
-                        : "");
+                    placement);
         }
     }
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
@@ -1812,6 +2061,9 @@ int main(int argc, char *argv[]) {
     // few more prints for gradient accumulation math up above
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
+    printf0("supervised targets per forward/backward: %d (%d per sequence row)\n",
+            supervised_targets_per_fwdbwd,
+            T - (mask_sequence_final_target ? 1 : 0));
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
     // set up logging
@@ -1835,13 +2087,26 @@ int main(int argc, char *argv[]) {
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+    LlmcSamplingCandidate* sample_candidates = (LlmcSamplingCandidate*)mallocCheck(
+        model.config.vocab_size * sizeof(LlmcSamplingCandidate));
 
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
     gpt2_allocate_state(&model, B, T);
+    if (model.optimizer_plan.normuon_parameter_type_count != 0) {
+        printf0("normuon_workspace_bytes: %zu\n", model.normuon_runtime.workspace_bytes);
+        printf0("normuon_workspace_source: %s\n",
+                model.normuon_runtime.workspace_is_borrowed
+                    ? "post_gradient_norm_output_arena"
+                    : "dedicated_allocation");
+        printf0("normuon_workspace_float_matrix_panels: %zu\n",
+                model.normuon_runtime.batch_float_matrix_count);
+        printf0("normuon_batch_matrix_capacity: %zu\n", model.normuon_runtime.batch_matrix_capacity);
+        printf0("normuon_tracker_q_bytes: %zu\n", model.normuon_runtime.tracked_q_bytes);
+    }
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
-        load_state(&step, &model, &train_loader, filename_buffer);
+        load_state(&step, &model, &train_loader, filename_buffer, resume_reset_dataloader != 0);
         if (resume_has_normuon_companion &&
             !llmc_normuon_load_companion(
                 resume_normuon_path,
@@ -1904,7 +2169,13 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                val_loss += gpt2_validate(&model, val_loader.inputs, val_loader.targets, B, T);
+                val_loss += gpt2_validate(
+                    &model,
+                    val_loader.inputs,
+                    val_loader.targets,
+                    B,
+                    T,
+                    mask_sequence_final_target);
             }
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
@@ -1935,15 +2206,81 @@ int main(int argc, char *argv[]) {
         if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
            (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
-            unsigned long long sample_rng_state = 1337;
+            if (!(sample_temperature > 0.0f) || !isfinite(sample_temperature)) {
+                fprintf(stderr, "sample temperature must be finite and greater than zero\n");
+                exit(EXIT_FAILURE);
+            }
+            if (sample_top_k < 0) {
+                fprintf(stderr, "sample top-k must be nonnegative\n");
+                exit(EXIT_FAILURE);
+            }
+            if (!(sample_top_p > 0.0f) || sample_top_p > 1.0f || !isfinite(sample_top_p)) {
+                fprintf(stderr, "sample top-p must be finite and in (0, 1]\n");
+                exit(EXIT_FAILURE);
+            }
+            if (genT <= 1 || genT > T) {
+                fprintf(stderr, "genT must be in [2, sequence_length]\n");
+                exit(EXIT_FAILURE);
+            }
+            std::vector<int> sample_prompt_tokens;
+            if (sample_prompt_token_ids_csv != nullptr) {
+                const char* cursor = sample_prompt_token_ids_csv;
+                while (*cursor != '\0') {
+                    char* end = nullptr;
+                    const long long token = strtoll(cursor, &end, 10);
+                    if (end == cursor || token < 0 || token >= model.config.vocab_size) {
+                        fprintf(stderr, "invalid sample prompt token id near: %s\n", cursor);
+                        exit(EXIT_FAILURE);
+                    }
+                    sample_prompt_tokens.push_back((int)token);
+                    cursor = end;
+                    while (*cursor == ' ' || *cursor == '\t') {
+                        ++cursor;
+                    }
+                    if (*cursor == '\0') {
+                        break;
+                    }
+                    if (*cursor != ',') {
+                        fprintf(stderr, "sample prompt token ids must be comma-separated\n");
+                        exit(EXIT_FAILURE);
+                    }
+                    ++cursor;
+                    while (*cursor == ' ' || *cursor == '\t') {
+                        ++cursor;
+                    }
+                }
+                if (sample_prompt_tokens.empty()) {
+                    fprintf(stderr, "sample prompt token ids cannot be empty\n");
+                    exit(EXIT_FAILURE);
+                }
+            }
+            unsigned long long sample_rng_state = sample_rng_seed;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = eot_token;
             }
+            const int prompt_length = sample_prompt_tokens.empty() ? 1 : (int)sample_prompt_tokens.size();
+            if (prompt_length >= genT) {
+                fprintf(stderr, "sample prompt must leave at least one generation position\n");
+                exit(EXIT_FAILURE);
+            }
+            for (int i = 0; i < (int)sample_prompt_tokens.size(); ++i) {
+                gen_tokens[i] = sample_prompt_tokens[i];
+            }
             // now sample from the model autoregressively
             printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
+            if (!sample_prompt_tokens.empty()) {
+                for (int i = 0; i < prompt_length; ++i) {
+                    if (tokenizer.init_ok) {
+                        safe_printf(tokenizer_decode(&tokenizer, gen_tokens[i]));
+                    } else {
+                        printf("%d ", gen_tokens[i]);
+                    }
+                }
+                fflush(stdout);
+            }
+            for (int t = prompt_length; t < genT; t++) {
                 NvtxRange generation_range("Generation step", t);
                 // we try not to be too wasteful for inference by not calculating all of B,T
                 // Using a smaller B is always bit-for-bit identical, but T is more tricky
@@ -1959,11 +2296,21 @@ int main(int argc, char *argv[]) {
                 cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
                 for (int i = 0; i < model.config.vocab_size; i++) {
-                    cpu_logits[i] = (float)cpu_logits_raw[i];
+                    cpu_logits[i] = (float)cpu_logits_raw[i] / sample_temperature;
                 }
                 // sample the next token
                 float coin = random_f32(&sample_rng_state);
-                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+                int next_token = sample_softmax_top_k_top_p(
+                    cpu_logits,
+                    model.config.vocab_size,
+                    sample_top_k,
+                    sample_top_p,
+                    coin,
+                    sample_candidates);
+                if (next_token < 0) {
+                    fprintf(stderr, "sample filtering encountered invalid or nonfinite logits\n");
+                    exit(EXIT_FAILURE);
+                }
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
                 if (tokenizer.init_ok) {
@@ -2015,7 +2362,13 @@ int main(int argc, char *argv[]) {
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
+            gpt2_backward_and_reduce(
+                &model,
+                train_loader.inputs,
+                train_loader.targets,
+                grad_accum_steps,
+                micro_step,
+                mask_sequence_final_target);
         }
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
@@ -2107,6 +2460,7 @@ int main(int argc, char *argv[]) {
     tokenizer_free(&tokenizer);
     free(cpu_logits_raw);
     free(cpu_logits);
+    free(sample_candidates);
     free(gen_tokens);
     multi_gpu_config_free(&multi_gpu_config);
     gpt2_free(&model);

@@ -144,6 +144,25 @@ inline bool gpt2_normuon_update_parameter_type(
         gpt2_get_tensor_at_layer(model, 0, parameter_type->tensor_id);
     const uint64_t global_step =
         t > 0 ? static_cast<uint64_t>(t - 1) : 0U;
+    if (!init_from_master_only &&
+        model->optimizer_config.execution_mode ==
+            LLMC_NORMUON_EXECUTION_BF16_BATCHED) {
+        const size_t tensor_offset = static_cast<size_t>(tensor.offset);
+        return llmc_normuon_update_parameter_type_batched_bf16(
+            &model->normuon_runtime,
+            cublas_handle,
+            main_stream,
+            static_cast<floatX*>(model->params_memory) + tensor_offset,
+            static_cast<const floatX*>(model->grads_memory) + tensor_offset,
+            model->m_memory + tensor_offset,
+            model->v_memory + tensor_offset,
+            model->master_weights + tensor_offset,
+            parameter_type,
+            &model->optimizer_config,
+            learning_rate,
+            gradient_scale,
+            global_step);
+    }
     for (int layer_index = 0;
          layer_index < parameter_type->layer_multiplicity;
          ++layer_index) {

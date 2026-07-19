@@ -213,14 +213,21 @@ static std::vector<float> tracker_correction_reference(
                 config.correction_gain * skew[index] / denominator;
         }
     }
+    const bool commute_canonical_stage2 =
+        config.retraction_mode ==
+        LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
     apply_polynomial_reference(
         &correction,
         width,
-        config.correction_iterations,
+        commute_canonical_stage2 ? 1U : config.correction_iterations,
         config.correction_schedule);
     std::vector<float> direction =
         matrix_multiply(tracked_q, false, correction, false, width);
-    if (config.retraction != 0U) {
+    if (commute_canonical_stage2) {
+        apply_polynomial_reference(
+            &direction, width, 1U, config.correction_schedule + 1U);
+    } else if (config.retraction_mode ==
+               LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ) {
         std::vector<float> qq_transpose =
             matrix_multiply(direction, false, direction, true, width);
         for (int row = 0; row < width; ++row) {
@@ -529,6 +536,7 @@ static void test_scratch_against_reference() {
     llmc_normuon_config_defaults(&config);
     config.optimizer_selection =
         LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
     config.orthogonalization_mode =
         LLMC_NORMUON_ORTHO_NEWTON_SCHULZ;
     llmc_normuon_resolve_schedules(&config);
@@ -777,6 +785,7 @@ static void test_tracker_reference_and_resume() {
     llmc_normuon_config_defaults(&config);
     config.optimizer_selection =
         LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
     config.orthogonalization_mode =
         LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q;
     config.refresh_interval = 3U;
@@ -786,7 +795,8 @@ static void test_tracker_reference_and_resume() {
         LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
     config.correction_iterations = 2U;
     config.correction_gain = 1.0f;
-    config.retraction = 1U;
+    config.retraction_mode =
+        LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ;
     llmc_normuon_resolve_schedules(&config);
 
     TEST_CHECK(
@@ -1118,6 +1128,7 @@ static void test_init_from_master_only_no_mutation() {
     llmc_normuon_config_defaults(&model.optimizer_config);
     model.optimizer_config.optimizer_selection =
         LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    model.optimizer_config.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
     model.optimizer_config.orthogonalization_mode =
         LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q;
     llmc_normuon_resolve_schedules(&model.optimizer_config);

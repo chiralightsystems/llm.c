@@ -25,9 +25,12 @@ constexpr int LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT = 5;
 constexpr int LLMC_NORMUON_VIEWS_PER_LAYER = 8;
 constexpr int LLMC_NORMUON_VIEWS_PER_MLP_MATRIX = 4;
 constexpr uint32_t LLMC_NORMUON_COMPANION_MAGIC = 20260716U;
-constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION = 1U;
+constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION = 3U;
+constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_EXECUTION_MODE = 2U;
+constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_FP32_ONLY = 1U;
 constexpr int LLMC_NORMUON_COMPANION_HEADER_INTS = 256;
 constexpr int LLMC_NORMUON_BLOCK_SIZE = 256;
+constexpr size_t LLMC_NORMUON_BATCH_STATS_STRIDE = 4U;
 
 enum LlmcOptimizerSelection {
     LLMC_OPTIMIZER_SELECTION_ADAMW = 0,
@@ -67,6 +70,17 @@ enum LlmcNormuonApproximationPolicy {
     LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC = 0,
     LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC = 1,
     LLMC_NORMUON_APPROX_POLAR_EXPRESS = 2,
+};
+
+enum LlmcNormuonExecutionMode {
+    LLMC_NORMUON_EXECUTION_FP32_REFERENCE = 0,
+    LLMC_NORMUON_EXECUTION_BF16_BATCHED = 1,
+};
+
+enum LlmcNormuonTrackerRetractionMode {
+    LLMC_NORMUON_TRACKER_RETRACTION_DISABLED = 0,
+    LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ = 1,
+    LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2 = 2,
 };
 
 struct LlmcNormuonPolynomialStep {
@@ -111,13 +125,14 @@ struct LlmcNormuonConfig {
     float beta2;
     float epsilon;
     float update_scale;
+    LlmcNormuonExecutionMode execution_mode;
     LlmcNormuonOrthogonalizationMode orthogonalization_mode;
     LlmcNormuonApproximationPolicy refresh_policy;
     LlmcNormuonApproximationPolicy correction_policy;
     uint32_t refresh_interval;
     uint32_t correction_iterations;
     float correction_gain;
-    uint32_t retraction;
+    LlmcNormuonTrackerRetractionMode retraction_mode;
     LlmcNormuonPolynomialStep refresh_schedule[LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT];
     LlmcNormuonPolynomialStep correction_schedule[LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT];
 };
@@ -178,10 +193,18 @@ struct LlmcOptimizerPlan {
 
 struct LlmcNormuonRuntime {
     void* workspace_allocation;
+    void* workspace;
     size_t workspace_bytes;
+    size_t workspace_capacity_bytes;
+    bool workspace_is_borrowed;
     size_t matrix_elements;
     float* matrix[5];
+    size_t batch_float_matrix_count;
+    size_t batch_matrix_capacity;
+    size_t batch_total_elements;
+    uint16_t* batch_bf16[2];
     float* axis_stats;
+    size_t axis_stats_elements;
     float* stats;
     int* nonfinite_flag;
     float* tracked_q;
@@ -244,6 +267,32 @@ inline const char* llmc_normuon_approximation_policy_name(
     }
 }
 
+inline const char* llmc_normuon_execution_mode_name(
+    LlmcNormuonExecutionMode mode) {
+    switch (mode) {
+        case LLMC_NORMUON_EXECUTION_FP32_REFERENCE:
+            return "fp32_reference";
+        case LLMC_NORMUON_EXECUTION_BF16_BATCHED:
+            return "bf16_batched";
+        default:
+            return "invalid";
+    }
+}
+
+inline const char* llmc_normuon_tracker_retraction_mode_name(
+    LlmcNormuonTrackerRetractionMode mode) {
+    switch (mode) {
+        case LLMC_NORMUON_TRACKER_RETRACTION_DISABLED:
+            return "disabled";
+        case LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ:
+            return "newton_schulz";
+        case LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2:
+            return "commuted_canonical_stage2";
+        default:
+            return "invalid";
+    }
+}
+
 inline bool llmc_parse_optimizer_selection(
     const char* value,
     LlmcOptimizerSelection* selection) {
@@ -273,6 +322,45 @@ inline bool llmc_parse_normuon_orthogonalization_mode(
     }
     if (strcmp(value, "skew_polar_track_q") == 0) {
         *mode = LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q;
+        return true;
+    }
+    return false;
+}
+
+inline bool llmc_parse_normuon_execution_mode(
+    const char* value,
+    LlmcNormuonExecutionMode* mode) {
+    if (value == nullptr || mode == nullptr) {
+        return false;
+    }
+    if (strcmp(value, "fp32_reference") == 0) {
+        *mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
+        return true;
+    }
+    if (strcmp(value, "bf16_batched") == 0) {
+        *mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
+        return true;
+    }
+    return false;
+}
+
+inline bool llmc_parse_normuon_tracker_retraction_mode(
+    const char* value,
+    LlmcNormuonTrackerRetractionMode* mode) {
+    if (value == nullptr || mode == nullptr) {
+        return false;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "disabled") == 0) {
+        *mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+        return true;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "newton_schulz") == 0) {
+        *mode = LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ;
+        return true;
+    }
+    if (strcmp(value, "commuted_canonical_stage2") == 0) {
+        *mode =
+            LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
         return true;
     }
     return false;
@@ -376,13 +464,14 @@ inline void llmc_normuon_config_defaults(LlmcNormuonConfig* config) {
     config->beta2 = 0.95f;
     config->epsilon = 1.0e-8f;
     config->update_scale = 1.0f;
+    config->execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
     config->orthogonalization_mode = LLMC_NORMUON_ORTHO_NEWTON_SCHULZ;
     config->refresh_policy = LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC;
     config->correction_policy = LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
     config->refresh_interval = 3U;
     config->correction_iterations = 2U;
     config->correction_gain = 1.0f;
-    config->retraction = 1U;
+    config->retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ;
     llmc_normuon_resolve_schedules(config);
 }
 
@@ -405,6 +494,8 @@ inline bool llmc_normuon_validate_config(
     bool valid =
         (config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW ||
          config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) &&
+        (config->execution_mode == LLMC_NORMUON_EXECUTION_FP32_REFERENCE ||
+         config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED) &&
         finite_hyperparameters &&
         config->learning_rate > 0.0f &&
         config->weight_decay >= 0.0f &&
@@ -416,7 +507,10 @@ inline bool llmc_normuon_validate_config(
         config->refresh_interval > 0U &&
         config->correction_iterations > 0U &&
         config->correction_iterations <= LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT &&
-        config->retraction <= 1U &&
+        (config->retraction_mode ==
+             LLMC_NORMUON_TRACKER_RETRACTION_DISABLED ||
+         config->retraction_mode == LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ ||
+         config->retraction_mode == LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2) &&
         llmc_normuon_policy_schedule(config->refresh_policy) != nullptr &&
         llmc_normuon_policy_schedule(config->correction_policy) != nullptr;
     if (config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
@@ -428,6 +522,22 @@ inline bool llmc_normuon_validate_config(
                 error_capacity,
                 "NorMuon currently requires targeted families exactly "
                 "mlp_wup,mlp_wdown");
+        }
+        return false;
+    }
+    if (config->retraction_mode ==
+            LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2 &&
+        (config->orthogonalization_mode !=
+             LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q ||
+         config->correction_policy !=
+             LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC ||
+         config->correction_iterations != 2U)) {
+        if (error != nullptr && error_capacity != 0U) {
+            snprintf(
+                error,
+                error_capacity,
+                "commuted_canonical_stage2 requires skew_polar_track_q, "
+                "canonical_taylor_quintic, and exactly two correction stages");
         }
         return false;
     }
@@ -1149,6 +1259,7 @@ inline void llmc_normuon_runtime_free(LlmcNormuonRuntime* runtime) {
     if (runtime == nullptr) {
         return;
     }
+    // Borrowed activation storage is owned and freed by GPT2, not this runtime.
     if (runtime->workspace_allocation != nullptr) {
         cudaCheck(cudaFree(runtime->workspace_allocation));
     }
@@ -1161,10 +1272,48 @@ inline void llmc_normuon_runtime_free(LlmcNormuonRuntime* runtime) {
     llmc_normuon_runtime_reset(runtime);
 }
 
+inline bool llmc_normuon_runtime_layout_workspace(
+    LlmcNormuonRuntime* runtime,
+    const LlmcNormuonConfig* config) {
+    if (runtime == nullptr || config == nullptr || runtime->workspace == nullptr ||
+        runtime->workspace_capacity_bytes < runtime->workspace_bytes) {
+        return false;
+    }
+    for (float*& matrix : runtime->matrix) {
+        matrix = nullptr;
+    }
+    runtime->batch_bf16[0] = nullptr;
+    runtime->batch_bf16[1] = nullptr;
+    float* cursor = static_cast<float*>(runtime->workspace);
+    for (size_t index = 0; index < runtime->batch_float_matrix_count; ++index) {
+        runtime->matrix[index] = cursor;
+        cursor += runtime->batch_total_elements;
+    }
+    if (config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED) {
+        runtime->batch_bf16[0] = reinterpret_cast<uint16_t*>(cursor);
+        runtime->batch_bf16[1] =
+            runtime->batch_bf16[0] + runtime->batch_total_elements;
+        cursor += runtime->batch_total_elements;
+    }
+    runtime->axis_stats = cursor;
+    cursor += runtime->axis_stats_elements;
+    runtime->stats = cursor;
+    cursor += runtime->batch_matrix_capacity *
+                  LLMC_NORMUON_BATCH_STATS_STRIDE +
+              8U;
+    runtime->nonfinite_flag = reinterpret_cast<int*>(cursor);
+    const size_t laid_out_bytes =
+        reinterpret_cast<char*>(cursor + 16U) -
+        static_cast<char*>(runtime->workspace);
+    return laid_out_bytes <= runtime->workspace_bytes;
+}
+
 inline bool llmc_normuon_runtime_allocate(
     LlmcNormuonRuntime* runtime,
     const LlmcOptimizerPlan* plan,
-    const LlmcNormuonConfig* config) {
+    const LlmcNormuonConfig* config,
+    void* borrowed_workspace = nullptr,
+    size_t borrowed_workspace_bytes = 0U) {
     if (runtime == nullptr || plan == nullptr || config == nullptr || !plan->built) {
         return false;
     }
@@ -1177,25 +1326,78 @@ inline bool llmc_normuon_runtime_allocate(
         return false;
     }
     const size_t matrix_elements = width * width;
+    const size_t batch_matrix_capacity =
+        config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED
+            ? static_cast<size_t>(plan->num_layers) *
+                  LLMC_NORMUON_VIEWS_PER_MLP_MATRIX
+            : 1U;
+    if (batch_matrix_capacity == 0U ||
+        batch_matrix_capacity > SIZE_MAX / matrix_elements) {
+        return false;
+    }
+    const size_t batch_total_elements =
+        batch_matrix_capacity * matrix_elements;
+    const size_t batch_float_matrix_count =
+        config->execution_mode == LLMC_NORMUON_EXECUTION_FP32_REFERENCE
+            ? 5U
+            : (config->orthogonalization_mode ==
+                       LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q
+                   ? 3U
+                   : 2U);
+    const size_t packed_float_panels =
+        config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED ? 1U : 0U;
+    if (batch_matrix_capacity >
+        (SIZE_MAX - 8U) / LLMC_NORMUON_BATCH_STATS_STRIDE) {
+        return false;
+    }
+    const size_t batch_stats_elements =
+        batch_matrix_capacity * LLMC_NORMUON_BATCH_STATS_STRIDE + 8U;
+    if (batch_matrix_capacity > SIZE_MAX / width) {
+        return false;
+    }
+    const size_t axis_stats_elements =
+        config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED
+            ? batch_matrix_capacity * width
+            : width;
+    if (batch_stats_elements > SIZE_MAX - axis_stats_elements - 16U) {
+        return false;
+    }
+    const size_t tail_elements =
+        axis_stats_elements + batch_stats_elements + 16U;
+    const size_t panel_count =
+        batch_float_matrix_count + packed_float_panels;
+    if (panel_count == 0U ||
+        batch_total_elements > (SIZE_MAX - tail_elements) / panel_count) {
+        return false;
+    }
     const size_t float_elements =
-        5U * matrix_elements + width + 16U;
+        panel_count * batch_total_elements + tail_elements;
     if (float_elements > SIZE_MAX / sizeof(float)) {
         return false;
     }
     runtime->workspace_bytes = float_elements * sizeof(float);
-    cudaCheck(cudaMalloc(&runtime->workspace_allocation, runtime->workspace_bytes));
-    cudaCheck(cudaMemset(runtime->workspace_allocation, 0, runtime->workspace_bytes));
-    runtime->matrix_elements = matrix_elements;
-    float* cursor = static_cast<float*>(runtime->workspace_allocation);
-    for (int index = 0; index < 5; ++index) {
-        runtime->matrix[index] = cursor;
-        cursor += matrix_elements;
+    if (borrowed_workspace != nullptr &&
+        borrowed_workspace_bytes >= runtime->workspace_bytes) {
+        runtime->workspace = borrowed_workspace;
+        runtime->workspace_capacity_bytes = borrowed_workspace_bytes;
+        runtime->workspace_is_borrowed = true;
+    } else {
+        cudaCheck(cudaMalloc(
+            &runtime->workspace_allocation, runtime->workspace_bytes));
+        runtime->workspace = runtime->workspace_allocation;
+        runtime->workspace_capacity_bytes = runtime->workspace_bytes;
+        cudaCheck(cudaMemset(
+            runtime->workspace_allocation, 0, runtime->workspace_bytes));
     }
-    runtime->axis_stats = cursor;
-    cursor += width;
-    runtime->stats = cursor;
-    cursor += 8U;
-    runtime->nonfinite_flag = reinterpret_cast<int*>(cursor);
+    runtime->matrix_elements = matrix_elements;
+    runtime->batch_float_matrix_count = batch_float_matrix_count;
+    runtime->batch_matrix_capacity = batch_matrix_capacity;
+    runtime->batch_total_elements = batch_total_elements;
+    runtime->axis_stats_elements = axis_stats_elements;
+    if (!llmc_normuon_runtime_layout_workspace(runtime, config)) {
+        llmc_normuon_runtime_free(runtime);
+        return false;
+    }
 
     if (config->orthogonalization_mode == LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q) {
         runtime->tracked_q_view_count =
@@ -1483,6 +1685,9 @@ inline bool llmc_normuon_update_view(
                 config->correction_gain,
                 config->epsilon);
             cudaCheck(cudaGetLastError());
+            const bool commute_canonical_stage2 =
+                config->retraction_mode ==
+                LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
             if (!llmc_normuon_apply_polynomial(
                     handle,
                     stream,
@@ -1491,7 +1696,7 @@ inline bool llmc_normuon_update_view(
                     runtime->matrix[4],
                     runtime->nonfinite_flag,
                     width,
-                    config->correction_iterations,
+                    commute_canonical_stage2 ? 1U : config->correction_iterations,
                     config->correction_schedule)) {
                 return false;
             }
@@ -1505,7 +1710,21 @@ inline bool llmc_normuon_update_view(
                 runtime->matrix[0],
                 width);
             direction = runtime->matrix[0];
-            if (config->retraction != 0U) {
+            if (commute_canonical_stage2) {
+                if (!llmc_normuon_apply_polynomial(
+                        handle,
+                        stream,
+                        direction,
+                        runtime->matrix[2],
+                        runtime->matrix[3],
+                        runtime->nonfinite_flag,
+                        width,
+                        1U,
+                        config->correction_schedule + 1U)) {
+                    return false;
+                }
+            } else if (config->retraction_mode ==
+                       LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ) {
                 llmc_normuon_row_major_gemm(
                     handle,
                     stream,
@@ -1632,7 +1851,7 @@ inline void llmc_normuon_encode_config(
     header[20] = static_cast<int>(config->correction_policy);
     header[21] = static_cast<int>(config->refresh_interval);
     header[22] = static_cast<int>(config->correction_iterations);
-    header[23] = static_cast<int>(config->retraction);
+    header[23] = static_cast<int>(config->retraction_mode);
     llmc_normuon_header_write_float(header, 24, config->learning_rate);
     llmc_normuon_header_write_float(header, 25, config->weight_decay);
     llmc_normuon_header_write_float(header, 26, config->momentum);
@@ -1640,6 +1859,7 @@ inline void llmc_normuon_encode_config(
     llmc_normuon_header_write_float(header, 28, config->epsilon);
     llmc_normuon_header_write_float(header, 29, config->update_scale);
     llmc_normuon_header_write_float(header, 30, config->correction_gain);
+    header[31] = static_cast<int>(config->execution_mode);
     int cursor = 64;
     for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
         llmc_normuon_header_write_float(header, cursor++, config->refresh_schedule[stage].a);
@@ -1656,6 +1876,7 @@ inline void llmc_normuon_encode_config(
 
 inline bool llmc_normuon_decode_config(
     const int* header,
+    uint32_t version,
     LlmcNormuonConfig* config) {
     llmc_normuon_config_defaults(config);
     config->optimizer_selection =
@@ -1669,7 +1890,12 @@ inline bool llmc_normuon_decode_config(
         static_cast<LlmcNormuonApproximationPolicy>(header[20]);
     config->refresh_interval = static_cast<uint32_t>(header[21]);
     config->correction_iterations = static_cast<uint32_t>(header[22]);
-    config->retraction = static_cast<uint32_t>(header[23]);
+    config->retraction_mode =
+        version >= LLMC_NORMUON_COMPANION_VERSION
+            ? static_cast<LlmcNormuonTrackerRetractionMode>(header[23])
+            : (header[23] == 0
+                   ? LLMC_NORMUON_TRACKER_RETRACTION_DISABLED
+                   : LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ);
     config->learning_rate = llmc_normuon_header_read_float(header, 24);
     config->weight_decay = llmc_normuon_header_read_float(header, 25);
     config->momentum = llmc_normuon_header_read_float(header, 26);
@@ -1677,6 +1903,10 @@ inline bool llmc_normuon_decode_config(
     config->epsilon = llmc_normuon_header_read_float(header, 28);
     config->update_scale = llmc_normuon_header_read_float(header, 29);
     config->correction_gain = llmc_normuon_header_read_float(header, 30);
+    config->execution_mode =
+        version >= LLMC_NORMUON_COMPANION_VERSION_EXECUTION_MODE
+            ? static_cast<LlmcNormuonExecutionMode>(header[31])
+            : LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
     int cursor = 64;
     for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
         config->refresh_schedule[stage].a =
@@ -1748,12 +1978,16 @@ inline bool llmc_normuon_read_companion_info(
         return false;
     }
     int header[LLMC_NORMUON_COMPANION_HEADER_INTS];
+    memset(header, 0, sizeof(header));
     const size_t count = fread(
         header, sizeof(int), LLMC_NORMUON_COMPANION_HEADER_INTS, file);
     fclose(file);
+    const uint32_t version = static_cast<uint32_t>(header[1]);
     if (count != LLMC_NORMUON_COMPANION_HEADER_INTS ||
         static_cast<uint32_t>(header[0]) != LLMC_NORMUON_COMPANION_MAGIC ||
-        static_cast<uint32_t>(header[1]) != LLMC_NORMUON_COMPANION_VERSION) {
+        (version != LLMC_NORMUON_COMPANION_VERSION &&
+         version != LLMC_NORMUON_COMPANION_VERSION_EXECUTION_MODE &&
+         version != LLMC_NORMUON_COMPANION_VERSION_FP32_ONLY)) {
         return false;
     }
     memset(info, 0, sizeof(*info));
@@ -1766,7 +2000,7 @@ inline bool llmc_normuon_read_companion_info(
         static_cast<size_t>(llmc_normuon_header_read_u64(header, 8));
     info->q_element_count =
         static_cast<size_t>(llmc_normuon_header_read_u64(header, 10));
-    return llmc_normuon_decode_config(header, &info->config);
+    return llmc_normuon_decode_config(header, version, &info->config);
 }
 
 inline bool llmc_normuon_save_companion(
