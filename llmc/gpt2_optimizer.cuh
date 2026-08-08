@@ -305,6 +305,13 @@ void gpt2_update(
     if (!init_from_master_only) {
         model->rng_state = update_rng_state;
     }
+    if (uses_normuon && llmc_normuon_is_cache_mode(
+            model->optimizer_config.orthogonalization_mode)) {
+        model->normuon_runtime.cache_step_probe_count = 0U;
+        model->normuon_runtime.cache_step_miss_count = 0U;
+        model->normuon_runtime.cache_step_residual_sum = 0.0;
+        model->normuon_runtime.cache_step_residual_max = 0.0f;
+    }
 
     for (int parameter_index = 0;
          parameter_index < LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT;

@@ -134,12 +134,14 @@ static void finalize_reference(
     const LlmcNormuonConfig& config,
     float learning_rate) {
     std::vector<float> row_contributions(width, 0.0f);
+    double direction_norm_squared = 0.0;
     for (int row = 0; row < width; ++row) {
         double row_sum = 0.0;
         for (int column = 0; column < width; ++column) {
             const float value =
                 direction[static_cast<size_t>(row) * width + column];
             row_sum += static_cast<double>(value) * value;
+            direction_norm_squared += static_cast<double>(value) * value;
         }
         const float mean =
             static_cast<float>(row_sum / static_cast<double>(width));
@@ -156,10 +158,8 @@ static void finalize_reference(
         normalized_norm_squared += contribution;
     }
     const float global_scale =
-        std::sqrt(static_cast<float>(width * width)) /
-        std::sqrt(std::max(
-            static_cast<float>(normalized_norm_squared),
-            config.epsilon));
+        std::sqrt(std::max(static_cast<float>(direction_norm_squared), config.epsilon)) /
+        std::sqrt(std::max(static_cast<float>(normalized_norm_squared), config.epsilon));
     const float decay_scale = 1.0f - learning_rate * config.weight_decay;
     const float update_learning_rate =
         learning_rate * config.update_scale;
@@ -204,13 +204,59 @@ static std::vector<float> tracker_correction_reference(
         std::sqrt(static_cast<float>(symmetric_norm_squared)) +
         config.epsilon;
     std::vector<float> correction(phase.size(), 0.0f);
+    float diagonal_scale = 1.0f;
+    if (config.correction_mode ==
+        LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
+        const float symmetric_scale =
+            std::sqrt(std::max(static_cast<float>(symmetric_norm_squared), 0.0f)) /
+            std::sqrt(static_cast<float>(width));
+        const float diagonal_floor = std::max(
+            LLMC_NORMUON_TRACKER_DAMPING_ETA * symmetric_scale,
+            config.epsilon);
+        double correction_norm_squared = 0.0;
+        for (int row = 0; row < width; ++row) {
+            for (int column = 0; column < width; ++column) {
+                const size_t index =
+                    static_cast<size_t>(row) * width + column;
+                const float skew_value = skew[index];
+                const float row_stiffness = std::max(
+                    phase[static_cast<size_t>(row) * width + row],
+                    diagonal_floor);
+                const float column_stiffness = std::max(
+                    phase[static_cast<size_t>(column) * width + column],
+                    diagonal_floor);
+                const float omega = config.correction_gain * 2.0f * skew_value /
+                    (row_stiffness + column_stiffness);
+                correction[index] = omega;
+                correction_norm_squared +=
+                    static_cast<double>(omega) * omega;
+            }
+        }
+        const float raw_norm =
+            std::sqrt(std::max(static_cast<float>(correction_norm_squared), 0.0f));
+        const float target_norm =
+            LLMC_NORMUON_TRACKER_CORRECTION_CAP *
+            std::sqrt(static_cast<float>(width));
+        diagonal_scale = std::min(
+            1.0f, target_norm / (raw_norm + config.epsilon));
+    }
     for (int row = 0; row < width; ++row) {
         for (int column = 0; column < width; ++column) {
             const size_t index =
                 static_cast<size_t>(row) * width + column;
+            float correction_denominator = denominator;
+            float correction_numerator = skew[index];
+            if (config.correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
+                correction[index] =
+                    (row == column ? 1.0f : 0.0f) +
+                    diagonal_scale * correction[index];
+                continue;
+            }
             correction[index] =
                 (row == column ? 1.0f : 0.0f) +
-                config.correction_gain * skew[index] / denominator;
+                config.correction_gain * correction_numerator /
+                    correction_denominator;
         }
     }
     const bool commute_canonical_stage2 =
@@ -288,9 +334,11 @@ static void copy_to_device(T* device, const std::vector<T>& host) {
 }
 
 struct ViewBuffers {
-    explicit ViewBuffers(int matrix_width)
+    explicit ViewBuffers(int matrix_width, size_t element_count = 0U)
         : width(matrix_width),
-          elements(static_cast<size_t>(matrix_width) * matrix_width) {
+          elements(element_count != 0U
+                       ? element_count
+                       : static_cast<size_t>(matrix_width) * matrix_width) {
         cudaCheck(cudaMalloc(&parameter, elements * sizeof(floatX)));
         cudaCheck(cudaMalloc(&gradient, elements * sizeof(floatX)));
         cudaCheck(cudaMalloc(&momentum, elements * sizeof(float)));
@@ -363,6 +411,37 @@ static LlmcOptimizerMatrixView contiguous_view(int width) {
     view.columns = width;
     view.row_stride = width;
     view.column_stride = 1;
+    return view;
+}
+
+static LlmcOptimizerParameterType rectangular_parameter_type(
+    int width,
+    int family_id) {
+    LlmcOptimizerParameterType parameter_type = {};
+    parameter_type.tensor_id =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 10 : 12;
+    parameter_type.name =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+            ? "fcw_rectangular_test"
+            : "fcprojw_rectangular_test";
+    parameter_type.family_id = static_cast<LlmcOptimizerFamilyId>(family_id);
+    parameter_type.backend_kind = LLMC_OPTIMIZER_BACKEND_NORMUON;
+    parameter_type.hyperparameter_group = LLMC_OPTIMIZER_HYPERPARAM_NORMUON_MLP;
+    parameter_type.weight_decay_policy = LLMC_WEIGHT_DECAY_ENABLED;
+    parameter_type.layer_multiplicity = 1;
+    parameter_type.tensor_elements = static_cast<size_t>(4 * width * width);
+    parameter_type.layer_elements = parameter_type.tensor_elements;
+    parameter_type.matrix_width = static_cast<size_t>(width);
+    parameter_type.views_per_layer = 1;
+    return parameter_type;
+}
+
+static LlmcOptimizerMatrixView rectangular_view(int width, bool wup) {
+    LlmcOptimizerMatrixView view = {};
+    view.rows = static_cast<size_t>(wup ? 4 * width : width);
+    view.columns = static_cast<size_t>(wup ? width : 4 * width);
+    view.row_stride = static_cast<size_t>(wup ? width : 4 * width);
+    view.column_stride = 1U;
     return view;
 }
 
@@ -524,6 +603,273 @@ static void test_parameter_plan_and_views() {
                 count == 1,
                 "square views cover each matrix element exactly once");
         }
+    }
+
+    config.orthogonalization_mode = LLMC_NORMUON_ORTHO_RECTANGULAR_MUON;
+    config.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+    TEST_CHECK(
+        llmc_build_optimizer_plan(
+            &plan,
+            &config,
+            small_config.num_layers,
+            small_config.channels,
+            parameter_elements,
+            error,
+            sizeof(error)),
+        "rectangular Muon scratch plan builds");
+    TEST_CHECK(
+        plan.normuon_view_count == small_config.num_layers * 2,
+        "rectangular Muon uses one view per Wup/Wdown layer");
+    for (int tensor_id : {10, 12}) {
+        const LlmcOptimizerParameterType& parameter_type =
+            plan.parameter_types[tensor_id];
+        TEST_CHECK(
+            parameter_type.views_per_layer == 1,
+            "rectangular Muon has one contiguous view per layer");
+        LlmcOptimizerMatrixView view;
+        TEST_CHECK(
+            parameter_type.enumerate_matrix_view(&parameter_type, 0, &view),
+            "rectangular view enumerator succeeds");
+        TEST_CHECK(
+            view.rows * view.columns == 4U * 17U * 17U,
+            "rectangular view preserves all 4C^2 parameters");
+        TEST_CHECK(
+            llmc_optimizer_view_within_bounds(&parameter_type, &view),
+            "rectangular view stays in bounds");
+        TEST_CHECK(
+            (tensor_id == 10 && view.rows == 68U && view.columns == 17U) ||
+                (tensor_id == 12 && view.rows == 17U && view.columns == 68U),
+            "rectangular Wup/Wdown orientation is correct");
+    }
+}
+
+static void test_rectangular_scratch_update() {
+    constexpr int width = 3;
+    constexpr size_t elements = 4U * width * width;
+    LlmcNormuonConfig config;
+    llmc_normuon_config_defaults(&config);
+    config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
+    config.orthogonalization_mode = LLMC_NORMUON_ORTHO_RECTANGULAR_MUON;
+    config.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+    llmc_normuon_resolve_schedules(&config);
+    LlmcOptimizerPlan plan = minimal_runtime_plan(width);
+    LlmcOptimizerParameterType parameter_type = rectangular_parameter_type(
+        width, LLMC_OPTIMIZER_FAMILY_MLP_WUP);
+    LlmcOptimizerMatrixView view = rectangular_view(width, true);
+    std::vector<float> gradient_host(elements);
+    std::vector<float> momentum_host(elements, 0.0f);
+    std::vector<float> second_host(elements, 0.01f);
+    std::vector<float> master_host(elements);
+    for (size_t index = 0; index < elements; ++index) {
+        gradient_host[index] = 0.01f * std::sin(static_cast<float>(index + 1));
+        master_host[index] = 0.05f * std::cos(static_cast<float>(index + 2));
+    }
+    const std::vector<floatX> gradient = quantize_to_floatx(gradient_host);
+    const std::vector<floatX> parameter = quantize_to_floatx(master_host);
+    ViewBuffers buffers(width, elements);
+    buffers.load(parameter, gradient, momentum_host, second_host, master_host);
+    LlmcNormuonRuntime runtime;
+    llmc_normuon_runtime_reset(&runtime);
+    TEST_CHECK(
+        llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+        "rectangular scratch runtime allocates");
+    TEST_CHECK(
+        llmc_normuon_update_view(
+            &runtime,
+            cublas_handle,
+            main_stream,
+            buffers.parameter,
+            buffers.gradient,
+            buffers.momentum,
+            buffers.second_moment,
+            buffers.master,
+            &parameter_type,
+            &view,
+            &config,
+            0.01f,
+            1.0f,
+            0U,
+            0,
+            0),
+        "rectangular scratch update succeeds");
+    cudaCheck(cudaStreamSynchronize(main_stream));
+    const std::vector<float> master = copy_from_device(buffers.master, elements);
+    TEST_CHECK(all_finite(master), "rectangular scratch output is finite");
+    llmc_normuon_runtime_free(&runtime);
+}
+
+static void test_rectangular_tracker_smoke() {
+    constexpr int width = 3;
+    constexpr size_t elements = 4U * width * width;
+    for (int family_id : {LLMC_OPTIMIZER_FAMILY_MLP_WUP,
+                          LLMC_OPTIMIZER_FAMILY_MLP_WDOWN}) {
+        LlmcNormuonConfig config;
+        llmc_normuon_config_defaults(&config);
+        config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+        config.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
+        config.orthogonalization_mode =
+            LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q;
+        config.refresh_interval = 3U;
+        config.refresh_policy = LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC;
+        config.correction_policy =
+            LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
+        config.correction_iterations = 2U;
+        config.retraction_mode =
+            LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
+        config.correction_mode =
+            LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER;
+        llmc_normuon_resolve_schedules(&config);
+        char config_error[256] = {};
+        TEST_CHECK(
+            llmc_normuon_validate_config(
+                &config, config_error, sizeof(config_error)),
+            "rectangular tracker configuration validates");
+        LlmcOptimizerPlan plan = minimal_runtime_plan(width);
+        LlmcOptimizerParameterType parameter_type = rectangular_parameter_type(
+            width, family_id);
+        LlmcOptimizerMatrixView view = rectangular_view(
+            width, family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP);
+        std::vector<float> gradient_host(elements);
+        std::vector<float> momentum_host(elements, 0.0f);
+        std::vector<float> second_host(elements, 0.01f);
+        std::vector<float> master_host(elements);
+        for (size_t index = 0; index < elements; ++index) {
+            gradient_host[index] = 0.01f * std::sin(
+                static_cast<float>(index + 2 * family_id));
+            master_host[index] = 0.05f * std::cos(
+                static_cast<float>(index + 3));
+        }
+        ViewBuffers buffers(width, elements);
+        buffers.load(
+            quantize_to_floatx(master_host),
+            quantize_to_floatx(gradient_host),
+            momentum_host,
+            second_host,
+            master_host);
+        LlmcNormuonRuntime runtime;
+        llmc_normuon_runtime_reset(&runtime);
+        TEST_CHECK(
+            llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+            "rectangular tracker runtime allocates");
+        for (uint64_t step = 0U; step < 2U; ++step) {
+            TEST_CHECK(
+                llmc_normuon_update_view(
+                    &runtime,
+                    cublas_handle,
+                    main_stream,
+                    buffers.parameter,
+                    buffers.gradient,
+                    buffers.momentum,
+                    buffers.second_moment,
+                    buffers.master,
+                    &parameter_type,
+                    &view,
+                    &config,
+                    0.01f,
+                    1.0f,
+                    step,
+                    0,
+                    0),
+                "rectangular tracker update succeeds");
+            cudaCheck(cudaStreamSynchronize(main_stream));
+        }
+        const std::vector<float> master = copy_from_device(
+            buffers.master, elements);
+        const std::vector<float> tracked_q = copy_from_device(
+            runtime.tracked_q, runtime.tracked_q_elements);
+        TEST_CHECK(
+            all_finite(master) && all_finite(tracked_q),
+            "rectangular tracker outputs remain finite");
+        TEST_CHECK(
+            runtime.q_valid[family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 0 : 1] != 0U,
+            "rectangular tracker records Q validity");
+        llmc_normuon_runtime_free(&runtime);
+    }
+}
+
+static void test_rectangular_cachemuon_smoke() {
+    constexpr int width = 3;
+    constexpr size_t elements = 4U * width * width;
+    for (int family_id : {LLMC_OPTIMIZER_FAMILY_MLP_WUP,
+                          LLMC_OPTIMIZER_FAMILY_MLP_WDOWN}) {
+        LlmcNormuonConfig config;
+        llmc_normuon_config_defaults(&config);
+        config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+        config.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
+        config.orthogonalization_mode =
+            LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON;
+        config.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+        config.cache_residual_threshold = 1.0e6f;
+        llmc_normuon_resolve_schedules(&config);
+        char config_error[256] = {};
+        TEST_CHECK(
+            llmc_normuon_validate_config(
+                &config, config_error, sizeof(config_error)),
+            "rectangular CacheMuon configuration validates");
+        TEST_CHECK(
+            config.refresh_policy == LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS,
+            "rectangular CacheMuon pins the paper FreshGNS schedule");
+
+        LlmcOptimizerPlan plan = minimal_runtime_plan(width);
+        LlmcOptimizerParameterType parameter_type = rectangular_parameter_type(
+            width, family_id);
+        LlmcOptimizerMatrixView view = rectangular_view(
+            width, family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP);
+        std::vector<float> gradient_host(elements);
+        std::vector<float> momentum_host(elements, 0.0f);
+        std::vector<float> second_host(elements, 0.01f);
+        std::vector<float> master_host(elements);
+        for (size_t index = 0; index < elements; ++index) {
+            gradient_host[index] =
+                0.01f * std::sin(static_cast<float>(index + family_id + 1));
+            master_host[index] =
+                0.05f * std::cos(static_cast<float>(index + 4));
+        }
+        ViewBuffers buffers(width, elements);
+        buffers.load(
+            quantize_to_floatx(master_host),
+            quantize_to_floatx(gradient_host),
+            momentum_host,
+            second_host,
+            master_host);
+        LlmcNormuonRuntime runtime;
+        llmc_normuon_runtime_reset(&runtime);
+        TEST_CHECK(
+            llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+            "rectangular CacheMuon runtime allocates");
+        const size_t q_index = family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 0U : 1U;
+        for (uint64_t step = 0U; step < 2U; ++step) {
+            TEST_CHECK(
+                llmc_normuon_update_view(
+                    &runtime,
+                    cublas_handle,
+                    main_stream,
+                    buffers.parameter,
+                    buffers.gradient,
+                    buffers.momentum,
+                    buffers.second_moment,
+                    buffers.master,
+                    &parameter_type,
+                    &view,
+                    &config,
+                    0.01f,
+                    1.0f,
+                    step,
+                    0,
+                    0),
+                "rectangular CacheMuon update succeeds");
+            cudaCheck(cudaStreamSynchronize(main_stream));
+        }
+        TEST_CHECK(
+            runtime.q_valid[q_index] != 0U && runtime.refresh_count[q_index] == 1U,
+            "rectangular CacheMuon refreshes once then accepts the cached transform");
+        TEST_CHECK(
+            all_finite(copy_from_device(buffers.master, elements)) &&
+                all_finite(copy_from_device(
+                    runtime.tracked_q, runtime.tracked_q_elements)),
+            "rectangular CacheMuon output and cached transform remain finite");
+        llmc_normuon_runtime_free(&runtime);
     }
 }
 
@@ -777,7 +1123,8 @@ static bool run_tracker_step(
         0);
 }
 
-static void test_tracker_reference_and_resume() {
+static void test_tracker_reference_and_resume(
+    LlmcNormuonTrackerCorrectionMode correction_mode) {
     constexpr int width = 5;
     constexpr float learning_rate = 0.01f;
     const size_t elements = static_cast<size_t>(width) * width;
@@ -795,6 +1142,7 @@ static void test_tracker_reference_and_resume() {
         LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
     config.correction_iterations = 2U;
     config.correction_gain = 1.0f;
+    config.correction_mode = correction_mode;
     config.retraction_mode =
         LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ;
     llmc_normuon_resolve_schedules(&config);
@@ -940,7 +1288,9 @@ static void test_tracker_reference_and_resume() {
     TEST_CHECK(all_finite(q_gpu), "tracked Q is finite");
 
     const char* companion_path =
-        "build/test_normuon_companion.bin";
+        correction_mode == LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER
+            ? "build/test_normuon_companion_diagonal.bin"
+            : "build/test_normuon_companion.bin";
     TEST_CHECK(
         llmc_normuon_save_companion(
             companion_path,
@@ -1295,8 +1645,14 @@ int main() {
     common_start(false, false);
 
     test_parameter_plan_and_views();
+    test_rectangular_scratch_update();
+    test_rectangular_tracker_smoke();
+    test_rectangular_cachemuon_smoke();
     test_scratch_against_reference();
-    test_tracker_reference_and_resume();
+    test_tracker_reference_and_resume(
+        LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS);
+    test_tracker_reference_and_resume(
+        LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER);
     test_init_from_master_only_no_mutation();
 
     GPT2 unused_model = {};

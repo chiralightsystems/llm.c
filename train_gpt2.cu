@@ -519,17 +519,16 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
         if (model->normuon_runtime.workspace_is_borrowed) {
             printf0(
                 "borrowing %zu MiB of synchronized output storage for "
-                "reusable blockwise square-view NorMuon workspace\n",
+                "reusable NorMuon workspace\n",
                 model->normuon_runtime.workspace_bytes >> 20);
         } else {
             printf0(
-                "allocating %zu MiB for reusable blockwise square-view "
-                "NorMuon workspace\n",
+                "allocating %zu MiB for reusable NorMuon workspace\n",
                 model->normuon_runtime.workspace_bytes >> 20);
         }
         if (model->normuon_runtime.tracked_q_bytes != 0U) {
             printf0(
-                "allocating %zu MiB for persistent blockwise square-view NorMuon Q\n",
+                "allocating %zu MiB for persistent tracker NorMuon Q\n",
                 model->normuon_runtime.tracked_q_bytes >> 20);
         }
     }
@@ -1483,6 +1482,7 @@ void error_usage() {
     fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
     fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
     fprintf(stderr, "  -yd <int>   reset only dataloader state on resume? (0=exact loader resume, 1=fresh loader; default=0)\n");
+    fprintf(stderr, "  -yf <int>   fork NorMuon on resume? Preserve main optimizer/dataloader state but reinitialize polar/cache state (0=exact, 1=fork; default=0)\n");
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -1504,13 +1504,16 @@ void error_usage() {
     fprintf(stderr, "  -n2 <float>  NorMuon beta2 (default = 0.95)\n");
     fprintf(stderr, "  -ne <float>  NorMuon epsilon (default = 1e-8)\n");
     fprintf(stderr, "  -ns <float>  NorMuon update scale (default = 1.0)\n");
+    fprintf(stderr, "  -nq <float>  NorMuon Wdown/c_proj learning-rate multiplier (default = 1.0)\n");
     fprintf(stderr, "  -nx <string> NorMuon execution: fp32_reference|bf16_batched\n");
-    fprintf(stderr, "  -no <string> orthogonalization: newton_schulz|skew_polar_track_q\n");
-    fprintf(stderr, "  -nr <string> refresh policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
+    fprintf(stderr, "  -no <string> orthogonalization: newton_schulz|skew_polar_track_q|rectangular_muon|rectangular_skew_polar_track_q|split_wup_square_tracker_wdown_rectangular_muon|rectangular_cache_muon\n");
+    fprintf(stderr, "  -nr <string> refresh policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express|cache_muon_gram_gns (CacheMuon pins this automatically)\n");
     fprintf(stderr, "  -nc <string> correction policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
     fprintf(stderr, "  -ni <int>    tracker refresh interval (default = 3)\n");
     fprintf(stderr, "  -nn <int>    tracker correction iterations (default = 2)\n");
     fprintf(stderr, "  -ng <float>  tracker correction gain (default = 1.0)\n");
+    fprintf(stderr, "  -nh <float>  CacheMuon normalized polar-residual threshold gamma (default = 5.0)\n");
+    fprintf(stderr, "  -nd <string> tracker correction: global_frobenius|diagonal_sylvester (default = global_frobenius; damp eta=0.05 raw-Frobenius-cap=0.25)\n");
     fprintf(stderr, "  -nt <string> tracker retraction: disabled|newton_schulz|commuted_canonical_stage2 (default = newton_schulz; 0|1 accepted)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
@@ -1558,6 +1561,7 @@ int main(int argc, char *argv[]) {
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int resume_reset_dataloader = 0; // preserve optimizer/model state but start the configured dataloader fresh
+    int resume_fork_normuon = 0; // preserve main state while explicitly changing NorMuon config and resetting polar/cache state
     int B = 4; // batch size
     int T = 1024; // sequence length max
     LlmcSequenceBoundaryPolicy sequence_boundary_policy =
@@ -1635,9 +1639,18 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == '2') { optimizer_cli_explicit = 1; optimizer_config.beta2 = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'e') { optimizer_cli_explicit = 1; optimizer_config.epsilon = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 's') { optimizer_cli_explicit = 1; optimizer_config.update_scale = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'q') { optimizer_cli_explicit = 1; optimizer_config.wdown_learning_rate_multiplier = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'i') { optimizer_cli_explicit = 1; optimizer_config.refresh_interval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'n') { optimizer_cli_explicit = 1; optimizer_config.correction_iterations = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'g') { optimizer_cli_explicit = 1; optimizer_config.correction_gain = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'h') { optimizer_cli_explicit = 1; optimizer_config.cache_residual_threshold = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'd') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_tracker_correction_mode(
+                    argv[i+1], &optimizer_config.correction_mode)) {
+                error_usage();
+            }
+        }
         else if (argv[i][1] == 'n' && argv[i][2] == 't') {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_tracker_retraction_mode(argv[i+1], &optimizer_config.retraction_mode)) { error_usage(); }
@@ -1645,6 +1658,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y' && argv[i][2] == 'd') { resume_reset_dataloader = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y' && argv[i][2] == 'f') { resume_fork_normuon = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y' && argv[i][2] == '\0') { resume = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b' && argv[i][2] == 'p') {
             if (!llmc_parse_sequence_boundary_policy(
@@ -1700,6 +1714,20 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "-yd 1 requires -y 1\n");
         exit(EXIT_FAILURE);
     }
+    if (resume_fork_normuon < 0 || resume_fork_normuon > 1) {
+        fprintf(stderr, "-yf must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (resume_fork_normuon != 0 && resume != 1) {
+        fprintf(stderr, "-yf 1 requires -y 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (resume_fork_normuon != 0 &&
+        (!optimizer_cli_explicit ||
+         optimizer_config.optimizer_selection != LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON)) {
+        fprintf(stderr, "-yf 1 requires an explicit adamw_normuon target configuration\n");
+        exit(EXIT_FAILURE);
+    }
     const bool mask_sequence_final_target =
         llmc_masks_sequence_final_target(sequence_boundary_policy);
     if (mask_sequence_final_target && T < 2) {
@@ -1744,6 +1772,7 @@ int main(int argc, char *argv[]) {
     printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
     printf0("| resume                | %-50d |\n", resume);
     printf0("| reset resume loader   | %-50d |\n", resume_reset_dataloader);
+    printf0("| fork NorMuon state    | %-50d |\n", resume_fork_normuon);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| sequence boundary     | %-50s |\n",
@@ -1764,6 +1793,7 @@ int main(int argc, char *argv[]) {
     printf0("| NorMuon beta2         | %-50e |\n", optimizer_config.beta2);
     printf0("| NorMuon epsilon       | %-50e |\n", optimizer_config.epsilon);
     printf0("| NorMuon update scale  | %-50e |\n", optimizer_config.update_scale);
+    printf0("| NorMuon Wdown LR mult. | %-49e |\n", optimizer_config.wdown_learning_rate_multiplier);
     printf0("| NorMuon execution     | %-50s |\n",
             llmc_normuon_execution_mode_name(optimizer_config.execution_mode));
     printf0("| NorMuon ortho mode    | %-50s |\n", llmc_normuon_orthogonalization_mode_name(optimizer_config.orthogonalization_mode));
@@ -1772,6 +1802,10 @@ int main(int argc, char *argv[]) {
     printf0("| NorMuon refresh int.  | %-50u |\n", optimizer_config.refresh_interval);
     printf0("| NorMuon correction N  | %-50u |\n", optimizer_config.correction_iterations);
     printf0("| NorMuon corr. gain    | %-50e |\n", optimizer_config.correction_gain);
+    printf0("| CacheMuon gamma       | %-50e |\n", optimizer_config.cache_residual_threshold);
+    printf0("| NorMuon corr. mode    | %-50s |\n",
+            llmc_normuon_tracker_correction_mode_name(
+                optimizer_config.correction_mode));
     printf0("| NorMuon retraction    | %-50s |\n",
             llmc_normuon_tracker_retraction_mode_name(optimizer_config.retraction_mode));
     printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
@@ -1853,14 +1887,25 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Invalid or incompatible NorMuon companion state: %s\n", resume_normuon_path);
                 exit(EXIT_FAILURE);
             }
-            if (optimizer_cli_explicit &&
-                !llmc_normuon_config_equal(&optimizer_config, &companion_info.config)) {
+            if (resume_fork_normuon != 0) {
+                // The ordinary state file owns FP32 master weights, momentum,
+                // second moment, and the exact dataloader cursor.  A declared
+                // fork keeps those shared states but intentionally starts the
+                // target mode's Q/cache transform invalid, so its first update
+                // performs a fresh polar solve under the new configuration.
+                resume_has_normuon_companion = false;
+                printf0("Forking NorMuon configuration at step %d; preserving main optimizer/dataloader state and reinitializing polar/cache state.\n",
+                        resume_max_step);
+            } else if (optimizer_cli_explicit &&
+                       !llmc_normuon_config_equal(&optimizer_config, &companion_info.config)) {
                 fprintf(stderr, "Explicit optimizer CLI configuration does not match the checkpoint companion state\n");
                 exit(EXIT_FAILURE);
+            } else {
+                model.optimizer_config = companion_info.config;
+                optimizer_config = companion_info.config;
             }
-            model.optimizer_config = companion_info.config;
-            optimizer_config = companion_info.config;
-        } else if (optimizer_config.optimizer_selection ==
+        } else if (resume_fork_normuon == 0 &&
+                   optimizer_config.optimizer_selection ==
                    LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) {
             fprintf(stderr, "Cannot exactly resume NorMuon without its companion optimizer state file\n");
             exit(EXIT_FAILURE);
@@ -1969,10 +2014,27 @@ int main(int argc, char *argv[]) {
         const bool commuted_canonical_stage2 =
             model.optimizer_config.retraction_mode ==
             LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
+        const bool thin_canonical_stage2 =
+            model.optimizer_config.retraction_mode ==
+            LLMC_NORMUON_TRACKER_RETRACTION_THIN_CANONICAL_STAGE2;
         const bool retraction_enabled =
             model.optimizer_config.retraction_mode !=
             LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
-        printf0("normuon_variant: blockwise square-view NorMuon\n");
+        printf0(
+            "normuon_variant: %s\n",
+            model.optimizer_config.orthogonalization_mode ==
+                    LLMC_NORMUON_ORTHO_SPLIT_WUP_SQUARE_TRACKER_WDOWN_RECTANGULAR_MUON
+                ? "split Wup square tracker + Wdown rectangular scratch Muon"
+                : model.optimizer_config.orthogonalization_mode ==
+                    LLMC_NORMUON_ORTHO_RECTANGULAR_MUON
+                ? "proper rectangular Muon (scratch-only)"
+                : model.optimizer_config.orthogonalization_mode ==
+                          LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON
+                      ? "proper rectangular CacheMuon (residual-gated FreshGNS)"
+                : model.optimizer_config.orthogonalization_mode ==
+                          LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q
+                      ? "proper rectangular polar-factor tracker"
+                      : "blockwise square-view NorMuon");
         printf0("normuon_view_count: %d\n", model.optimizer_plan.normuon_view_count);
         printf0("normuon_execution_mode: %s\n",
                 llmc_normuon_execution_mode_name(model.optimizer_config.execution_mode));
@@ -1986,18 +2048,26 @@ int main(int argc, char *argv[]) {
                     : "serial_per_view");
         printf0("normuon_tracker_packed_q_policy: %s\n",
                 model.optimizer_config.execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED &&
-                        model.optimizer_config.orthogonalization_mode == LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q
+                        llmc_normuon_is_tracker_mode(
+                            model.optimizer_config.orthogonalization_mode)
                     ? "single_pack_reused_through_prefix_polynomial"
                     : "not_applicable");
         printf0("normuon_tracker_retraction_form: %s\n",
-                !retraction_enabled
+                (model.optimizer_config.orthogonalization_mode ==
+                         LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ||
+                 model.optimizer_config.orthogonalization_mode ==
+                         LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON)
+                    ? "not_applicable_non_tracker"
+                    : (!retraction_enabled
                     ? "disabled"
                     : (commuted_canonical_stage2
                            ? "canonical_taylor_stage2_post_product"
-                           : (model.optimizer_config.execution_mode ==
+                           : (thin_canonical_stage2
+                                  ? "canonical_taylor_stage2_thin_factor"
+                                  : (model.optimizer_config.execution_mode ==
                                       LLMC_NORMUON_EXECUTION_BF16_BATCHED
-                                  ? "D(3I-D^T D)/2"
-                                  : "(3I-DD^T)D/2")));
+                                      ? "D(3I-D^T D)/2"
+                                      : "(3I-DD^T)D/2")))));
         printf0("normuon_tracker_retraction_mode: %s\n",
                 llmc_normuon_tracker_retraction_mode_name(
                     model.optimizer_config.retraction_mode));
@@ -2010,13 +2080,34 @@ int main(int argc, char *argv[]) {
         printf0("normuon_refresh_interval: %u\n", model.optimizer_config.refresh_interval);
         printf0("normuon_correction_iterations: %u\n", model.optimizer_config.correction_iterations);
         printf0("normuon_correction_gain: %.9g\n", model.optimizer_config.correction_gain);
+        printf0("normuon_cache_residual_threshold: %.9g\n",
+                model.optimizer_config.cache_residual_threshold);
+        printf0("normuon_cache_normalization_epsilon: %.9g\n",
+                LLMC_CACHEMUON_EPSILON);
+        printf0("normuon_cache_restart_stage: %u\n",
+                LLMC_CACHEMUON_RESTART_STAGE);
+        printf0("normuon_cache_gate_scope: %s\n",
+                llmc_normuon_is_cache_mode(
+                    model.optimizer_config.orthogonalization_mode)
+                    ? "per_matrix_normalized_polar_residual"
+                    : "not_applicable");
+        printf0("normuon_tracker_correction_mode: %s\n",
+                llmc_normuon_tracker_correction_mode_name(
+                    model.optimizer_config.correction_mode));
+        if (model.optimizer_config.correction_mode ==
+            LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
+            printf0("normuon_tracker_damping_eta: %.9g\n",
+                    LLMC_NORMUON_TRACKER_DAMPING_ETA);
+            printf0("normuon_tracker_correction_cap: %.9g\n",
+                    LLMC_NORMUON_TRACKER_CORRECTION_CAP);
+        }
         printf0("normuon_retraction: %u\n", retraction_enabled ? 1U : 0U);
         printf0("normuon_tracker_pre_product_correction_stage_count: %u\n",
-                commuted_canonical_stage2
+                (commuted_canonical_stage2 || thin_canonical_stage2)
                     ? 1U
                     : model.optimizer_config.correction_iterations);
         printf0("normuon_tracker_post_product_correction_stage_count: %u\n",
-                commuted_canonical_stage2 ? 1U : 0U);
+                (commuted_canonical_stage2 || thin_canonical_stage2) ? 1U : 0U);
         printf0("normuon_optimizer_companion_format_version: %u\n",
                 LLMC_NORMUON_COMPANION_VERSION);
         for (int stage = 0; stage < LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT; ++stage) {
@@ -2029,11 +2120,13 @@ int main(int argc, char *argv[]) {
             const LlmcNormuonPolynomialStep coefficient =
                 model.optimizer_config.correction_schedule[stage];
             const char* placement = "";
-            if (commuted_canonical_stage2 && stage == 0) {
+            if ((commuted_canonical_stage2 || thin_canonical_stage2) && stage == 0) {
                 placement = " (effective_pre_product)";
             } else if (commuted_canonical_stage2 && stage == 1) {
                 placement = " (effective_post_product_retraction)";
-            } else if (!commuted_canonical_stage2 &&
+            } else if (thin_canonical_stage2 && stage == 1) {
+                placement = " (effective_thin_factor_retraction)";
+            } else if (!commuted_canonical_stage2 && !thin_canonical_stage2 &&
                        stage < static_cast<int>(
                                    model.optimizer_config.correction_iterations)) {
                 placement = " (effective_pre_product)";
@@ -2431,6 +2524,25 @@ int main(int argc, char *argv[]) {
                 time_elapsed_ms, device_memory_used_bytes / (1024.0 * 1024.0),
                 finite_step ? "yes" : "no", 100*mfu,
                 bias_corrected_ema_tokens_per_second);
+        if (llmc_normuon_is_cache_mode(
+                model.optimizer_config.orthogonalization_mode)) {
+            const uint64_t probes = model.normuon_runtime.cache_step_probe_count;
+            const double mean_residual = probes > 0U
+                ? model.normuon_runtime.cache_step_residual_sum /
+                      static_cast<double>(probes)
+                : 0.0;
+            printf0(
+                "cachemuon step %d | probes %llu | misses %llu | hits %llu | "
+                "mean_residual %.6f | max_residual %.6f\n",
+                step + 1,
+                static_cast<unsigned long long>(probes),
+                static_cast<unsigned long long>(
+                    model.normuon_runtime.cache_step_miss_count),
+                static_cast<unsigned long long>(
+                    probes - model.normuon_runtime.cache_step_miss_count),
+                mean_residual,
+                model.normuon_runtime.cache_step_residual_max);
+        }
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
@@ -2448,6 +2560,24 @@ int main(int argc, char *argv[]) {
             completed_optimizer_steps > 0 ? total_optimizer_time_ms / completed_optimizer_steps : 0.0);
     printf0("peak device memory used: %zu bytes\n", peak_device_memory_used_bytes);
     printf0("CUDA allocator reserved memory: not applicable (direct cudaMalloc; no caching reserve)\n");
+    if (llmc_normuon_is_cache_mode(model.optimizer_config.orthogonalization_mode)) {
+        const uint64_t probes = model.normuon_runtime.cache_total_probe_count;
+        const double mean_residual = probes > 0U
+            ? model.normuon_runtime.cache_total_residual_sum /
+                  static_cast<double>(probes)
+            : 0.0;
+        printf0("cachemuon_total_probes: %llu\n",
+                static_cast<unsigned long long>(probes));
+        printf0("cachemuon_total_misses: %llu\n",
+                static_cast<unsigned long long>(
+                    model.normuon_runtime.cache_total_miss_count));
+        printf0("cachemuon_total_hits: %llu\n",
+                static_cast<unsigned long long>(
+                    probes - model.normuon_runtime.cache_total_miss_count));
+        printf0("cachemuon_mean_residual: %.9g\n", mean_residual);
+        printf0("cachemuon_max_residual: %.9g\n",
+                model.normuon_runtime.cache_total_residual_max);
+    }
 
     // free and destroy everything
     cudaCheck(cudaEventDestroy(optimizer_end));

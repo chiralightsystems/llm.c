@@ -164,12 +164,14 @@ static void finalize_reference_batched(
     const LlmcNormuonConfig& config,
     float learning_rate) {
     float normalized_norm_squared = 0.0f;
+    float direction_norm_squared = 0.0f;
     for (int row = 0; row < width; ++row) {
         float sum = 0.0f;
         for (int column = 0; column < width; ++column) {
             const float value =
                 direction[static_cast<size_t>(row) * width + column];
             sum += value * value;
+            direction_norm_squared += value * value;
         }
         const float mean = sum / static_cast<float>(width);
         const float next =
@@ -179,7 +181,7 @@ static void finalize_reference_batched(
         normalized_norm_squared += sum / std::max(next, config.epsilon);
     }
     const float global_scale =
-        static_cast<float>(width) /
+        std::sqrt(std::max(direction_norm_squared, config.epsilon)) /
         std::sqrt(std::max(normalized_norm_squared, config.epsilon));
     const float decay_scale = 1.0f - learning_rate * config.weight_decay;
     const float update_learning_rate = learning_rate * config.update_scale;
@@ -217,15 +219,62 @@ static std::vector<float> tracker_correction_bf16_reference(
     }
     const float denominator =
         std::sqrt(std::max(symmetric_norm_squared, 0.0f)) + config.epsilon;
+    float diagonal_scale = 1.0f;
+    if (config.correction_mode ==
+        LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
+        const float symmetric_scale =
+            std::sqrt(std::max(symmetric_norm_squared, 0.0f)) /
+            std::sqrt(static_cast<float>(width));
+        const float diagonal_floor = std::max(
+            LLMC_NORMUON_TRACKER_DAMPING_ETA * symmetric_scale,
+            config.epsilon);
+        double correction_norm_squared = 0.0;
+        for (int row = 0; row < width; ++row) {
+            for (int column = 0; column < width; ++column) {
+                const size_t index = static_cast<size_t>(row) * width + column;
+                const float transpose =
+                    phase[static_cast<size_t>(column) * width + row];
+                const float skew = 0.5f * (phase[index] - transpose);
+                const float row_stiffness = std::max(
+                    phase[static_cast<size_t>(row) * width + row],
+                    diagonal_floor);
+                const float column_stiffness = std::max(
+                    phase[static_cast<size_t>(column) * width + column],
+                    diagonal_floor);
+                const float omega = config.correction_gain * 2.0f * skew /
+                    (row_stiffness + column_stiffness);
+                correction[index] = omega;
+                correction_norm_squared +=
+                    static_cast<double>(omega) * omega;
+            }
+        }
+        const float raw_norm =
+            std::sqrt(std::max(static_cast<float>(correction_norm_squared), 0.0f));
+        const float target_norm =
+            LLMC_NORMUON_TRACKER_CORRECTION_CAP *
+            std::sqrt(static_cast<float>(width));
+        diagonal_scale = std::min(
+            1.0f, target_norm / (raw_norm + config.epsilon));
+    }
     for (int row = 0; row < width; ++row) {
         for (int column = 0; column < width; ++column) {
             const size_t index = static_cast<size_t>(row) * width + column;
             const float transpose =
                 phase[static_cast<size_t>(column) * width + row];
             const float skew = 0.5f * (phase[index] - transpose);
+            float correction_denominator = denominator;
+            float correction_numerator = skew;
+            if (config.correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
+                correction[index] =
+                    (row == column ? 1.0f : 0.0f) +
+                    diagonal_scale * correction[index];
+                continue;
+            }
             correction[index] =
                 (row == column ? 1.0f : 0.0f) +
-                config.correction_gain * skew / denominator;
+                config.correction_gain * correction_numerator /
+                    correction_denominator;
         }
     }
     const bool commute_canonical_stage2 =
@@ -435,6 +484,264 @@ struct BatchedBuffers {
     float* master = nullptr;
 };
 
+static void run_rectangular_batched_update(int family_id) {
+    constexpr int width = 3;
+    constexpr int layers = 2;
+    constexpr size_t matrix_elements = 4U * width * width;
+    const size_t tensor_elements = static_cast<size_t>(layers) * matrix_elements;
+    LlmcNormuonConfig config;
+    llmc_normuon_config_defaults(&config);
+    config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
+    config.orthogonalization_mode = LLMC_NORMUON_ORTHO_RECTANGULAR_MUON;
+    config.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+    llmc_normuon_resolve_schedules(&config);
+    LlmcOptimizerPlan plan = batched_plan(width, layers);
+    plan.normuon_view_count = layers * LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER;
+    LlmcOptimizerParameterType parameter_type = {};
+    parameter_type.tensor_id =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 10 : 12;
+    parameter_type.name =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+            ? "fcw_rectangular_batched_test"
+            : "fcprojw_rectangular_batched_test";
+    parameter_type.family_id = static_cast<LlmcOptimizerFamilyId>(family_id);
+    parameter_type.backend_kind = LLMC_OPTIMIZER_BACKEND_NORMUON;
+    parameter_type.hyperparameter_group = LLMC_OPTIMIZER_HYPERPARAM_NORMUON_MLP;
+    parameter_type.weight_decay_policy = LLMC_WEIGHT_DECAY_ENABLED;
+    parameter_type.layer_multiplicity = layers;
+    parameter_type.layer_elements = matrix_elements;
+    parameter_type.tensor_elements = tensor_elements;
+    parameter_type.matrix_width = width;
+    parameter_type.views_per_layer = 1;
+    parameter_type.enumerate_matrix_view =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+            ? llmc_enumerate_mlp_wup_rectangular_view
+            : llmc_enumerate_mlp_wdown_rectangular_view;
+    std::vector<float> master(tensor_elements);
+    std::vector<float> gradient(tensor_elements);
+    std::vector<float> momentum(tensor_elements, 0.0f);
+    std::vector<float> second(tensor_elements, 0.01f);
+    for (size_t index = 0; index < tensor_elements; ++index) {
+        master[index] = 0.02f * std::cos(static_cast<float>(index + 1));
+        gradient[index] = 0.01f * std::sin(static_cast<float>(index + 2));
+    }
+    LlmcNormuonRuntime runtime;
+    llmc_normuon_runtime_reset(&runtime);
+    BATCHED_CHECK(
+        llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+        "rectangular batched runtime allocates");
+    BatchedBuffers buffers(tensor_elements);
+    buffers.load(master, gradient, momentum, second);
+    BATCHED_CHECK(
+        llmc_normuon_update_parameter_type_batched_bf16(
+            &runtime,
+            cublas_handle,
+            main_stream,
+            buffers.parameter,
+            buffers.gradient,
+            buffers.momentum,
+            buffers.second_moment,
+            buffers.master,
+            &parameter_type,
+            &config,
+            0.01f,
+            1.0f,
+            0U),
+        "rectangular batched update succeeds");
+    cudaCheck(cudaStreamSynchronize(main_stream));
+    BATCHED_CHECK(
+        batched_all_finite(batched_copy_from_device(buffers.master, tensor_elements)),
+        "rectangular batched output is finite");
+    llmc_normuon_runtime_free(&runtime);
+}
+
+static void test_rectangular_batched_update() {
+    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WUP);
+    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+}
+
+static void run_rectangular_batched_tracker(int family_id) {
+    constexpr int width = 3;
+    constexpr int layers = 2;
+    constexpr size_t matrix_elements = 4U * width * width;
+    const size_t tensor_elements = static_cast<size_t>(layers) * matrix_elements;
+    LlmcNormuonConfig config;
+    llmc_normuon_config_defaults(&config);
+    config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
+    config.orthogonalization_mode =
+        LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q;
+    config.refresh_interval = 3U;
+    config.refresh_policy = LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC;
+    config.correction_policy =
+        LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
+    config.correction_iterations = 2U;
+    config.retraction_mode =
+        LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
+    config.correction_mode =
+        LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER;
+    llmc_normuon_resolve_schedules(&config);
+    LlmcOptimizerPlan plan = batched_plan(width, layers);
+    plan.normuon_view_count = layers * LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER;
+    LlmcOptimizerParameterType parameter_type = {};
+    parameter_type.tensor_id = family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 10 : 12;
+    parameter_type.name = "rectangular_tracker_batched_test";
+    parameter_type.family_id = static_cast<LlmcOptimizerFamilyId>(family_id);
+    parameter_type.backend_kind = LLMC_OPTIMIZER_BACKEND_NORMUON;
+    parameter_type.hyperparameter_group = LLMC_OPTIMIZER_HYPERPARAM_NORMUON_MLP;
+    parameter_type.weight_decay_policy = LLMC_WEIGHT_DECAY_ENABLED;
+    parameter_type.layer_multiplicity = layers;
+    parameter_type.layer_elements = matrix_elements;
+    parameter_type.tensor_elements = tensor_elements;
+    parameter_type.matrix_width = width;
+    parameter_type.views_per_layer = 1;
+    parameter_type.enumerate_matrix_view =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+            ? llmc_enumerate_mlp_wup_rectangular_view
+            : llmc_enumerate_mlp_wdown_rectangular_view;
+    std::vector<float> master(tensor_elements);
+    std::vector<float> gradient(tensor_elements);
+    std::vector<float> momentum(tensor_elements, 0.0f);
+    std::vector<float> second(tensor_elements, 0.01f);
+    for (size_t index = 0; index < tensor_elements; ++index) {
+        master[index] = 0.02f * std::cos(static_cast<float>(index + 1));
+        gradient[index] = 0.01f * std::sin(static_cast<float>(index + 2));
+    }
+    BatchedBuffers buffers(tensor_elements);
+    buffers.load(master, gradient, momentum, second);
+    LlmcNormuonRuntime runtime;
+    llmc_normuon_runtime_reset(&runtime);
+    BATCHED_CHECK(
+        llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+        "rectangular tracker batched runtime allocates");
+    for (uint64_t step = 0U; step < 2U; ++step) {
+        BATCHED_CHECK(
+            llmc_normuon_update_parameter_type_batched_bf16(
+                &runtime,
+                cublas_handle,
+                main_stream,
+                buffers.parameter,
+                buffers.gradient,
+                buffers.momentum,
+                buffers.second_moment,
+                buffers.master,
+                &parameter_type,
+                &config,
+                0.01f,
+                1.0f,
+                step),
+            "rectangular tracker batched update succeeds");
+        cudaCheck(cudaStreamSynchronize(main_stream));
+    }
+    BATCHED_CHECK(
+        batched_all_finite(batched_copy_from_device(buffers.master, tensor_elements)) &&
+            batched_all_finite(batched_copy_from_device(
+                runtime.tracked_q, runtime.tracked_q_elements)),
+        "rectangular tracker batched outputs remain finite");
+    BATCHED_CHECK(
+        runtime.q_valid[family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 0 : 1] != 0U,
+        "rectangular tracker batched records Q validity");
+    llmc_normuon_runtime_free(&runtime);
+}
+
+static void test_rectangular_batched_tracker() {
+    run_rectangular_batched_tracker(LLMC_OPTIMIZER_FAMILY_MLP_WUP);
+    run_rectangular_batched_tracker(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+}
+
+static void run_rectangular_batched_cachemuon(int family_id) {
+    constexpr int width = 3;
+    constexpr int layers = 2;
+    constexpr size_t matrix_elements = 4U * width * width;
+    const size_t tensor_elements = static_cast<size_t>(layers) * matrix_elements;
+    LlmcNormuonConfig config;
+    llmc_normuon_config_defaults(&config);
+    config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
+    config.orthogonalization_mode =
+        LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON;
+    config.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+    config.cache_residual_threshold = 1.0e6f;
+    llmc_normuon_resolve_schedules(&config);
+    LlmcOptimizerPlan plan = batched_plan(width, layers);
+    plan.normuon_view_count = layers * LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER;
+    LlmcOptimizerParameterType parameter_type = {};
+    parameter_type.tensor_id =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 10 : 12;
+    parameter_type.name = "rectangular_cachemuon_batched_test";
+    parameter_type.family_id = static_cast<LlmcOptimizerFamilyId>(family_id);
+    parameter_type.backend_kind = LLMC_OPTIMIZER_BACKEND_NORMUON;
+    parameter_type.hyperparameter_group = LLMC_OPTIMIZER_HYPERPARAM_NORMUON_MLP;
+    parameter_type.weight_decay_policy = LLMC_WEIGHT_DECAY_ENABLED;
+    parameter_type.layer_multiplicity = layers;
+    parameter_type.layer_elements = matrix_elements;
+    parameter_type.tensor_elements = tensor_elements;
+    parameter_type.matrix_width = width;
+    parameter_type.views_per_layer = 1;
+    parameter_type.enumerate_matrix_view =
+        family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+            ? llmc_enumerate_mlp_wup_rectangular_view
+            : llmc_enumerate_mlp_wdown_rectangular_view;
+
+    std::vector<float> master(tensor_elements);
+    std::vector<float> gradient(tensor_elements);
+    std::vector<float> momentum(tensor_elements, 0.0f);
+    std::vector<float> second(tensor_elements, 0.01f);
+    for (size_t index = 0; index < tensor_elements; ++index) {
+        master[index] = 0.02f * std::cos(static_cast<float>(index + 1));
+        gradient[index] = 0.01f * std::sin(static_cast<float>(index + 2));
+    }
+    BatchedBuffers buffers(tensor_elements);
+    buffers.load(master, gradient, momentum, second);
+    LlmcNormuonRuntime runtime;
+    llmc_normuon_runtime_reset(&runtime);
+    BATCHED_CHECK(
+        llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+        "rectangular CacheMuon batched runtime allocates");
+    for (uint64_t step = 0U; step < 2U; ++step) {
+        BATCHED_CHECK(
+            llmc_normuon_update_parameter_type_batched_bf16(
+                &runtime,
+                cublas_handle,
+                main_stream,
+                buffers.parameter,
+                buffers.gradient,
+                buffers.momentum,
+                buffers.second_moment,
+                buffers.master,
+                &parameter_type,
+                &config,
+                0.01f,
+                1.0f,
+                step),
+            "rectangular CacheMuon batched update succeeds");
+        cudaCheck(cudaStreamSynchronize(main_stream));
+    }
+    bool exactly_one_refresh = true;
+    for (int layer = 0; layer < layers; ++layer) {
+        const size_t q_index = static_cast<size_t>(layer) *
+                                   LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER +
+                               (family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 0U : 1U);
+        exactly_one_refresh = exactly_one_refresh && runtime.q_valid[q_index] != 0U &&
+                              runtime.refresh_count[q_index] == 1U;
+    }
+    BATCHED_CHECK(
+        exactly_one_refresh,
+        "rectangular CacheMuon compacts initial misses then accepts cached transforms");
+    BATCHED_CHECK(
+        batched_all_finite(batched_copy_from_device(buffers.master, tensor_elements)) &&
+            batched_all_finite(batched_copy_from_device(
+                runtime.tracked_q, runtime.tracked_q_elements)),
+        "rectangular CacheMuon batched outputs remain finite");
+    llmc_normuon_runtime_free(&runtime);
+}
+
+static void test_rectangular_batched_cachemuon() {
+    run_rectangular_batched_cachemuon(LLMC_OPTIMIZER_FAMILY_MLP_WUP);
+    run_rectangular_batched_cachemuon(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+}
+
 struct ScratchResult {
     bool succeeded = false;
     bool second_padding_unchanged = false;
@@ -611,6 +918,20 @@ static void test_execution_mode_and_workspace() {
     BATCHED_CHECK(
         !llmc_parse_normuon_execution_mode("silent_fallback", &parsed),
         "unknown execution mode is rejected");
+    LlmcNormuonOrthogonalizationMode orthogonalization =
+        LLMC_NORMUON_ORTHO_NEWTON_SCHULZ;
+    BATCHED_CHECK(
+        llmc_parse_normuon_orthogonalization_mode(
+            "rectangular_cache_muon", &orthogonalization) &&
+            orthogonalization == LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON,
+        "rectangular CacheMuon mode parses explicitly");
+    LlmcNormuonApproximationPolicy approximation =
+        LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC;
+    BATCHED_CHECK(
+        llmc_parse_normuon_approximation_policy(
+            "cache_muon_gram_gns", &approximation) &&
+            approximation == LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS,
+        "CacheMuon FreshGNS policy parses explicitly");
 
     LlmcNormuonTrackerRetractionMode retraction =
         LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
@@ -632,6 +953,23 @@ static void test_execution_mode_and_workspace() {
         !llmc_parse_normuon_tracker_retraction_mode(
             "silent_substitution", &retraction),
         "unknown tracker retraction mode is rejected");
+    LlmcNormuonTrackerCorrectionMode correction_mode =
+        LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS;
+    BATCHED_CHECK(
+        llmc_parse_normuon_tracker_correction_mode(
+            "diagonal_sylvester", &correction_mode) &&
+            correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER,
+        "diagonal Sylvester tracker correction mode parses");
+    BATCHED_CHECK(
+        llmc_parse_normuon_tracker_correction_mode("0", &correction_mode) &&
+            correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS,
+        "global Frobenius tracker correction mode parses");
+    BATCHED_CHECK(
+        !llmc_parse_normuon_tracker_correction_mode(
+            "silent_substitution", &correction_mode),
+        "unknown tracker correction mode is rejected");
     LlmcNormuonConfig commuted = config;
     commuted.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
     commuted.orthogonalization_mode =
@@ -639,6 +977,8 @@ static void test_execution_mode_and_workspace() {
     commuted.correction_policy =
         LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
     commuted.correction_iterations = 2U;
+    commuted.correction_mode =
+        LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER;
     commuted.retraction_mode =
         LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
     char config_error[256];
@@ -1096,24 +1436,26 @@ static void test_batched_tracker_and_checkpoint() {
         }
     }
 
-    const char* current_path = "build/test_normuon_batched_v3.bin";
+    const char* current_path = "build/test_normuon_batched_current.bin";
     BATCHED_CHECK(
         llmc_normuon_save_companion(
             current_path, 2, 1, 0, &plan, &config, &runtime, main_stream),
-        "batched tracker v3 companion saves");
+        "batched tracker current companion saves");
     LlmcNormuonCompanionInfo info;
     BATCHED_CHECK(
         llmc_normuon_read_companion_info(current_path, &info) &&
             info.config.execution_mode ==
-                LLMC_NORMUON_EXECUTION_BF16_BATCHED,
-        "v3 companion records the exact BF16 execution mode");
+                LLMC_NORMUON_EXECUTION_BF16_BATCHED &&
+            info.config.correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS,
+        "current companion records the exact BF16 execution mode and correction mode");
     LlmcNormuonRuntime resumed;
     llmc_normuon_runtime_reset(&resumed);
     BATCHED_CHECK(
         llmc_normuon_runtime_allocate(&resumed, &plan, &config) &&
             llmc_normuon_load_companion(
                 current_path, 2, 1, 0, &plan, &config, &resumed, main_stream),
-        "v3 batched tracker state resumes exactly");
+        "current batched tracker state resumes exactly");
     cudaCheck(cudaStreamSynchronize(main_stream));
     const std::vector<float> resumed_q = batched_copy_from_device(
         resumed.tracked_q, resumed.tracked_q_elements);
@@ -1135,7 +1477,43 @@ static void test_batched_tracker_and_checkpoint() {
                 resumed.last_refresh_step,
                 runtime.last_refresh_step,
                 runtime.tracked_q_view_count * sizeof(int64_t)) == 0,
-        "v3 resume preserves Q and tracker phase bit-exactly");
+        "current resume preserves Q and tracker phase bit-exactly");
+    const char* v3_path = "build/test_normuon_batched_v3.bin";
+    BATCHED_CHECK(
+        llmc_normuon_save_companion(
+            v3_path, 2, 1, 0, &plan, &config, &runtime, main_stream),
+        "v3 compatibility fixture companion saves");
+    FILE* v3_file = fopen(v3_path, "r+b");
+    BATCHED_CHECK(v3_file != nullptr, "v3 compatibility fixture opens");
+    if (v3_file != nullptr) {
+        const int v3 = static_cast<int>(
+            LLMC_NORMUON_COMPANION_VERSION_TRACKER_CORRECTION_MODE - 1U);
+        const int ignored_correction_mode = static_cast<int>(
+            LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER);
+        fseek(v3_file, sizeof(int), SEEK_SET);
+        fwrite(&v3, sizeof(v3), 1U, v3_file);
+        fseek(v3_file, 32L * static_cast<long>(sizeof(int)), SEEK_SET);
+        fwrite(&ignored_correction_mode, sizeof(ignored_correction_mode), 1U,
+               v3_file);
+        fclose(v3_file);
+    }
+    LlmcNormuonCompanionInfo v3_info;
+    BATCHED_CHECK(
+        llmc_normuon_read_companion_info(v3_path, &v3_info) &&
+            v3_info.config.correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS,
+        "v3 companion defaults the new correction mode to global Frobenius");
+    BATCHED_CHECK(
+        llmc_normuon_load_companion(
+            v3_path,
+            2,
+            1,
+            0,
+            &plan,
+            &config,
+            &resumed,
+            main_stream),
+        "v3 companion remains loadable after the correction-mode extension");
     LlmcNormuonConfig mode_mismatch = config;
     mode_mismatch.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
     BATCHED_CHECK(
@@ -1259,6 +1637,7 @@ static void test_batched_tracker_and_checkpoint() {
     }
 
     remove(current_path);
+    remove(v3_path);
     remove(v2_path);
     remove(v1_path);
     llmc_normuon_runtime_free(&v1_runtime);
@@ -1266,7 +1645,8 @@ static void test_batched_tracker_and_checkpoint() {
     llmc_normuon_runtime_free(&runtime);
 }
 
-static void test_batched_commuted_tracker() {
+static void test_batched_commuted_tracker(
+    LlmcNormuonTrackerCorrectionMode correction_mode) {
     constexpr int width = 8;
     constexpr int layers = 1;
     constexpr float learning_rate = 0.01f;
@@ -1288,6 +1668,7 @@ static void test_batched_commuted_tracker() {
     config.refresh_interval = 3U;
     config.correction_iterations = 2U;
     config.correction_gain = 1.0f;
+    config.correction_mode = correction_mode;
     config.retraction_mode =
         LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
     char config_error[256];
@@ -1509,11 +1890,17 @@ int main() {
     set_zero_configs(&multi_gpu_config, 0, 1);
     common_start(false, false);
 
+    test_rectangular_batched_update();
+    test_rectangular_batched_tracker();
+    test_rectangular_batched_cachemuon();
     test_execution_mode_and_workspace();
     test_batched_layout_scratch_and_guard();
     test_batched_tracker_and_checkpoint();
     test_polynomial_factor_override_preserves_packed_q();
-    test_batched_commuted_tracker();
+    test_batched_commuted_tracker(
+        LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS);
+    test_batched_commuted_tracker(
+        LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER);
 
     GPT2 unused_model = {};
     common_free(unused_model);
