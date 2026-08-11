@@ -7,6 +7,12 @@ parameter-offset helpers are defined.
 #ifndef LLMC_GPT2_OPTIMIZER_CUH
 #define LLMC_GPT2_OPTIMIZER_CUH
 
+inline uint64_t llmc_gpt2_normuon_global_step(int one_based_update_step) {
+    return one_based_update_step > 0
+        ? static_cast<uint64_t>(one_based_update_step - 1)
+        : 0U;
+}
+
 inline void gpt2_initialize_master_parameter_type(
     GPT2* model,
     const LlmcOptimizerParameterType* parameter_type,
@@ -142,8 +148,7 @@ inline bool gpt2_normuon_update_parameter_type(
     bool init_from_master_only) {
     ShardInfo tensor =
         gpt2_get_tensor_at_layer(model, 0, parameter_type->tensor_id);
-    const uint64_t global_step =
-        t > 0 ? static_cast<uint64_t>(t - 1) : 0U;
+    const uint64_t global_step = llmc_gpt2_normuon_global_step(t);
     if (!init_from_master_only &&
         model->optimizer_config.execution_mode ==
             LLMC_NORMUON_EXECUTION_BF16_BATCHED) {
@@ -230,6 +235,100 @@ inline bool gpt2_normuon_update_parameter_type(
     return true;
 }
 
+inline const LlmcOptimizerParameterType* gpt2_normuon_parameter_type_for_family(
+    const GPT2* model,
+    LlmcOptimizerFamilyId family_id) {
+    if (model == nullptr || !model->optimizer_plan.built) {
+        return nullptr;
+    }
+    for (int parameter_index = 0;
+         parameter_index < LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT;
+         ++parameter_index) {
+        const LlmcOptimizerParameterType* parameter_type =
+            &model->optimizer_plan.parameter_types[parameter_index];
+        if (parameter_type->family_id == family_id &&
+            parameter_type->backend_kind == LLMC_OPTIMIZER_BACKEND_NORMUON) {
+            return parameter_type;
+        }
+    }
+    return nullptr;
+}
+
+inline bool gpt2_normuon_batch_replay_snapshot_wdown(
+    GPT2* model,
+    float* snapshot) {
+    const LlmcOptimizerParameterType* parameter_type =
+        gpt2_normuon_parameter_type_for_family(
+            model, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+    if (model == nullptr || snapshot == nullptr || parameter_type == nullptr ||
+        model->master_weights == nullptr) {
+        return false;
+    }
+    const ShardInfo tensor =
+        gpt2_get_tensor_at_layer(model, 0, parameter_type->tensor_id);
+    cudaCheck(cudaMemcpyAsync(
+        snapshot,
+        model->master_weights + tensor.offset,
+        parameter_type->tensor_elements * sizeof(float),
+        cudaMemcpyDeviceToDevice,
+        main_stream));
+    return true;
+}
+
+inline bool gpt2_normuon_batch_replay_snapshot_wdown_parameter(
+    GPT2* model,
+    floatX* snapshot) {
+    const LlmcOptimizerParameterType* parameter_type =
+        gpt2_normuon_parameter_type_for_family(
+            model, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+    if (model == nullptr || snapshot == nullptr || parameter_type == nullptr) {
+        return false;
+    }
+    const ShardInfo tensor =
+        gpt2_get_tensor_at_layer(model, 0, parameter_type->tensor_id);
+    cudaCheck(cudaMemcpyAsync(
+        snapshot,
+        static_cast<floatX*>(model->params_memory) + tensor.offset,
+        parameter_type->tensor_elements * sizeof(floatX),
+        cudaMemcpyDeviceToDevice,
+        main_stream));
+    return true;
+}
+
+inline bool gpt2_normuon_batch_replay_set_wdown(
+    GPT2* model,
+    const float* snapshot,
+    float normuon_learning_rate,
+    float extra_multiplier,
+    uint64_t global_step,
+    const floatX* reference_parameter = nullptr,
+    unsigned long long* changed_count = nullptr,
+    const float* row_scales_override = nullptr) {
+    const LlmcOptimizerParameterType* parameter_type =
+        gpt2_normuon_parameter_type_for_family(
+            model, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+    if (model == nullptr || snapshot == nullptr || parameter_type == nullptr ||
+        model->master_weights == nullptr) {
+        return false;
+    }
+    const ShardInfo tensor =
+        gpt2_get_tensor_at_layer(model, 0, parameter_type->tensor_id);
+    return llmc_normuon_batch_replay_set_square_wdown(
+        &model->normuon_runtime,
+        main_stream,
+        static_cast<floatX*>(model->params_memory) + tensor.offset,
+        model->master_weights + tensor.offset,
+        snapshot,
+        parameter_type,
+        &model->optimizer_config,
+        normuon_learning_rate,
+        extra_multiplier,
+        global_step,
+        reference_parameter,
+        changed_count,
+        row_scales_override);
+}
+
 void gpt2_update(
     GPT2* model,
     float learning_rate,
@@ -311,6 +410,12 @@ void gpt2_update(
         model->normuon_runtime.cache_step_miss_count = 0U;
         model->normuon_runtime.cache_step_residual_sum = 0.0;
         model->normuon_runtime.cache_step_residual_max = 0.0f;
+    }
+    if (uses_normuon && llmc_normuon_is_tracker_mode(
+            model->optimizer_config.orthogonalization_mode)) {
+        llmc_normuon_tracker_diagnostics_begin_step(
+            &model->normuon_runtime,
+            llmc_gpt2_normuon_global_step(t));
     }
 
     for (int parameter_index = 0;

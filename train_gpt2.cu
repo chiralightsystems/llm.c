@@ -1507,14 +1507,30 @@ void error_usage() {
     fprintf(stderr, "  -nq <float>  NorMuon Wdown/c_proj learning-rate multiplier (default = 1.0)\n");
     fprintf(stderr, "  -nx <string> NorMuon execution: fp32_reference|bf16_batched\n");
     fprintf(stderr, "  -no <string> orthogonalization: newton_schulz|skew_polar_track_q|rectangular_muon|rectangular_skew_polar_track_q|split_wup_square_tracker_wdown_rectangular_muon|rectangular_cache_muon\n");
-    fprintf(stderr, "  -nr <string> refresh policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express|cache_muon_gram_gns (CacheMuon pins this automatically)\n");
+    fprintf(stderr, "  -nr <string> refresh policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express|cache_muon_gram_gns (FreshGNS every step for rectangular_muon; CacheMuon pins it automatically)\n");
     fprintf(stderr, "  -nc <string> correction policy: canonical_taylor_quintic|stock_normuon_quintic|polar_express\n");
-    fprintf(stderr, "  -ni <int>    tracker refresh interval (default = 3)\n");
+    fprintf(stderr, "  -na <string> tracker refresh mode: fixed_cadence|adaptive_mean_skew (default = fixed_cadence)\n");
+    fprintf(stderr, "  -ni <int>    tracker fixed cadence (adaptive mode checks every stale step; default = 3)\n");
+    fprintf(stderr, "  -nj <int>    adaptive tracker maximum refresh age (default = 9)\n");
+    fprintf(stderr, "  -nu <float>  adaptive tracker Wup family-mean skew threshold (default = 0.52)\n");
+    fprintf(stderr, "  -nv <float>  adaptive tracker Wdown family-mean skew threshold (default = 0.57)\n");
     fprintf(stderr, "  -nn <int>    tracker correction iterations (default = 2)\n");
     fprintf(stderr, "  -ng <float>  tracker correction gain (default = 1.0)\n");
     fprintf(stderr, "  -nh <float>  CacheMuon normalized polar-residual threshold gamma (default = 5.0)\n");
     fprintf(stderr, "  -nd <string> tracker correction: global_frobenius|diagonal_sylvester (default = global_frobenius; damp eta=0.05 raw-Frobenius-cap=0.25)\n");
     fprintf(stderr, "  -nt <string> tracker retraction: disabled|newton_schulz|commuted_canonical_stage2 (default = newton_schulz; 0|1 accepted)\n");
+    fprintf(stderr, "  -np <int>    square-tracker diagnostics every N optimizer steps (0=off; default=0)\n");
+    fprintf(stderr, "  -da <float>  square-tracker LR dither amplitude in [0,1) (0=off; default=0)\n");
+    fprintf(stderr, "  -di <int>    square-tracker LR dither pulse interval (default=12)\n");
+    fprintf(stderr, "  -dm <string> LR dither mode: walsh_pulse|sinusoidal|heterodyne_chopper (default=walsh_pulse)\n");
+    fprintf(stderr, "  -dh <int>    heterodyne chopper slow-envelope period in carrier blocks (default=127)\n");
+    fprintf(stderr, "  -du <int>    sinusoidal Wup period in optimizer steps (default=384)\n");
+    fprintf(stderr, "  -dv <int>    sinusoidal Wdown period in optimizer steps (default=512)\n");
+    fprintf(stderr, "  -dp <float>  sinusoidal phase polarity, exactly +1 or -1 (default=+1)\n");
+    fprintf(stderr, "  -dx <float>  Wup excitation scale in [0,1] (default=1)\n");
+    fprintf(stderr, "  -dy <float>  Wdown excitation scale in [0,1] (default=1)\n");
+    fprintf(stderr, "  -dr <int>    non-committing same-batch Wdown LR replay every N updates (0=off)\n");
+    fprintf(stderr, "  -dz <float>  mirrored Wdown replay LR half-span in (0,64] (default=0.5)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
     // evaluation
@@ -1594,6 +1610,19 @@ int main(int argc, char *argv[]) {
     LlmcNormuonConfig optimizer_config;
     llmc_normuon_config_defaults(&optimizer_config);
     int optimizer_cli_explicit = 0;
+    int normuon_tracker_diagnostics_every = 0;
+    float normuon_lr_dither_amplitude = 0.0f;
+    int normuon_lr_dither_interval = 12;
+    LlmcNormuonLrDitherMode normuon_lr_dither_mode =
+        LLMC_NORMUON_LR_DITHER_WALSH_PULSE;
+    int normuon_lr_dither_wup_period = 384;
+    int normuon_lr_dither_wdown_period = 512;
+    int normuon_lr_dither_envelope_blocks = 127;
+    float normuon_lr_dither_phase_polarity = 1.0f;
+    float normuon_lr_dither_wup_scale = 1.0f;
+    float normuon_lr_dither_wdown_scale = 1.0f;
+    int normuon_batch_replay_every = 0;
+    float normuon_batch_replay_amplitude = 0.5f;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1640,7 +1669,17 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'e') { optimizer_cli_explicit = 1; optimizer_config.epsilon = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 's') { optimizer_cli_explicit = 1; optimizer_config.update_scale = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'q') { optimizer_cli_explicit = 1; optimizer_config.wdown_learning_rate_multiplier = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'a') {
+            optimizer_cli_explicit = 1;
+            if (!llmc_parse_normuon_tracker_refresh_mode(
+                    argv[i+1], &optimizer_config.tracker_refresh_mode)) {
+                error_usage();
+            }
+        }
         else if (argv[i][1] == 'n' && argv[i][2] == 'i') { optimizer_cli_explicit = 1; optimizer_config.refresh_interval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'j') { optimizer_cli_explicit = 1; optimizer_config.tracker_max_refresh_age = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'u') { optimizer_cli_explicit = 1; optimizer_config.tracker_wup_skew_threshold = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'v') { optimizer_cli_explicit = 1; optimizer_config.tracker_wdown_skew_threshold = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'n') { optimizer_cli_explicit = 1; optimizer_config.correction_iterations = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'g') { optimizer_cli_explicit = 1; optimizer_config.correction_gain = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'h') { optimizer_cli_explicit = 1; optimizer_config.cache_residual_threshold = atof(argv[i+1]); }
@@ -1654,6 +1693,45 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 't') {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_tracker_retraction_mode(argv[i+1], &optimizer_config.retraction_mode)) { error_usage(); }
+        }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'p') {
+            normuon_tracker_diagnostics_every = atoi(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'a') {
+            normuon_lr_dither_amplitude = atof(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'i') {
+            normuon_lr_dither_interval = atoi(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'm') {
+            if (!llmc_parse_normuon_lr_dither_mode(
+                    argv[i+1], &normuon_lr_dither_mode)) {
+                error_usage();
+            }
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'u') {
+            normuon_lr_dither_wup_period = atoi(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'v') {
+            normuon_lr_dither_wdown_period = atoi(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'h') {
+            normuon_lr_dither_envelope_blocks = atoi(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'p') {
+            normuon_lr_dither_phase_polarity = atof(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'x') {
+            normuon_lr_dither_wup_scale = atof(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'y') {
+            normuon_lr_dither_wdown_scale = atof(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'r') {
+            normuon_batch_replay_every = atoi(argv[i+1]);
+        }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'z') {
+            normuon_batch_replay_amplitude = atof(argv[i+1]);
         }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
@@ -1728,6 +1806,114 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "-yf 1 requires an explicit adamw_normuon target configuration\n");
         exit(EXIT_FAILURE);
     }
+    if (normuon_tracker_diagnostics_every < 0) {
+        fprintf(stderr, "-np must be nonnegative\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_tracker_diagnostics_every > 0 &&
+        (optimizer_config.optimizer_selection !=
+             LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON ||
+         optimizer_config.execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
+         optimizer_config.orthogonalization_mode !=
+             LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q)) {
+        fprintf(
+            stderr,
+            "-np currently requires adamw_normuon, bf16_batched, and "
+            "skew_polar_track_q\n");
+        exit(EXIT_FAILURE);
+    }
+    if (!isfinite(normuon_lr_dither_amplitude) ||
+        normuon_lr_dither_amplitude < 0.0f ||
+        normuon_lr_dither_amplitude >= 1.0f) {
+        fprintf(stderr, "-da must be finite and in [0,1)\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_lr_dither_amplitude > 0.0f &&
+        (optimizer_config.optimizer_selection !=
+             LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON ||
+         optimizer_config.execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
+         optimizer_config.orthogonalization_mode !=
+             LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q ||
+         optimizer_config.tracker_refresh_mode !=
+             LLMC_NORMUON_TRACKER_REFRESH_FIXED_CADENCE)) {
+        fprintf(
+            stderr,
+            "LR dither requires adamw_normuon, bf16_batched square tracker, "
+            "and fixed cadence\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_lr_dither_amplitude > 0.0f &&
+        normuon_lr_dither_mode == LLMC_NORMUON_LR_DITHER_WALSH_PULSE &&
+        (normuon_lr_dither_interval <= 0 ||
+         (static_cast<uint32_t>(normuon_lr_dither_interval) %
+              optimizer_config.refresh_interval) != 0U)) {
+        fprintf(
+            stderr,
+            "Walsh LR dither requires a positive pulse interval divisible "
+            "by the tracker refresh interval\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_lr_dither_amplitude > 0.0f &&
+        normuon_lr_dither_mode == LLMC_NORMUON_LR_DITHER_SINUSOIDAL &&
+        (normuon_lr_dither_wup_period < 4 ||
+         normuon_lr_dither_wdown_period < 4 ||
+         !isfinite(normuon_lr_dither_phase_polarity) ||
+         fabsf(fabsf(normuon_lr_dither_phase_polarity) - 1.0f) > 1.0e-6f)) {
+        fprintf(
+            stderr,
+            "Sinusoidal LR dither requires both periods >= 4 and phase "
+            "polarity exactly +1 or -1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_lr_dither_amplitude > 0.0f &&
+        normuon_lr_dither_mode == LLMC_NORMUON_LR_DITHER_HETERODYNE_CHOPPER &&
+        (normuon_lr_dither_envelope_blocks < 4 ||
+         !isfinite(normuon_lr_dither_phase_polarity) ||
+         fabsf(fabsf(normuon_lr_dither_phase_polarity) - 1.0f) > 1.0e-6f)) {
+        fprintf(
+            stderr,
+            "Heterodyne-chopper LR dither requires envelope blocks >= 4 and "
+            "phase polarity exactly +1 or -1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_lr_dither_amplitude > 0.0f &&
+        (!isfinite(normuon_lr_dither_wup_scale) ||
+         !isfinite(normuon_lr_dither_wdown_scale) ||
+         normuon_lr_dither_wup_scale < 0.0f ||
+         normuon_lr_dither_wup_scale > 1.0f ||
+         normuon_lr_dither_wdown_scale < 0.0f ||
+         normuon_lr_dither_wdown_scale > 1.0f ||
+         (normuon_lr_dither_wup_scale == 0.0f &&
+          normuon_lr_dither_wdown_scale == 0.0f))) {
+        fprintf(
+            stderr,
+            "LR dither family scales must be finite in [0,1], with at least "
+            "one family active\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_batch_replay_every < 0 ||
+        !isfinite(normuon_batch_replay_amplitude) ||
+        !(normuon_batch_replay_amplitude > 0.0f) ||
+        normuon_batch_replay_amplitude > 64.0f) {
+        fprintf(stderr, "-dr must be nonnegative and -dz must be finite in (0,64]\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_batch_replay_every > 0 &&
+        (optimizer_config.optimizer_selection !=
+             LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON ||
+         optimizer_config.execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
+         optimizer_config.orthogonalization_mode !=
+             LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q ||
+         optimizer_config.tracker_refresh_mode !=
+             LLMC_NORMUON_TRACKER_REFRESH_FIXED_CADENCE ||
+         num_processes != 1 || zero_stage != 0 || !use_master_weights)) {
+        fprintf(
+            stderr,
+            "same-batch Wdown LR replay requires single-GPU zero-stage-0 "
+            "adamw_normuon with master weights, bf16_batched square tracker, "
+            "and fixed cadence\n");
+        exit(EXIT_FAILURE);
+    }
     const bool mask_sequence_final_target =
         llmc_masks_sequence_final_target(sequence_boundary_policy);
     if (mask_sequence_final_target && T < 2) {
@@ -1760,6 +1946,10 @@ int main(int argc, char *argv[]) {
     // calculate the number of gradient accumulation steps from the desired total batch size
     assert(total_batch_size % tokens_per_fwdbwd == 0);
     int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+    if (normuon_batch_replay_every > 0 && grad_accum_steps != 1) {
+        fprintf(stderr, "same-batch Wdown LR replay currently requires grad_accum_steps=1\n");
+        exit(EXIT_FAILURE);
+    }
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
     // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
     if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
@@ -1799,7 +1989,13 @@ int main(int argc, char *argv[]) {
     printf0("| NorMuon ortho mode    | %-50s |\n", llmc_normuon_orthogonalization_mode_name(optimizer_config.orthogonalization_mode));
     printf0("| NorMuon refresh       | %-50s |\n", llmc_normuon_approximation_policy_name(optimizer_config.refresh_policy));
     printf0("| NorMuon correction    | %-50s |\n", llmc_normuon_approximation_policy_name(optimizer_config.correction_policy));
+    printf0("| Tracker refresh mode  | %-50s |\n",
+            llmc_normuon_tracker_refresh_mode_name(
+                optimizer_config.tracker_refresh_mode));
     printf0("| NorMuon refresh int.  | %-50u |\n", optimizer_config.refresh_interval);
+    printf0("| Tracker max age       | %-50u |\n", optimizer_config.tracker_max_refresh_age);
+    printf0("| Tracker Wup skew gate | %-50e |\n", optimizer_config.tracker_wup_skew_threshold);
+    printf0("| Tracker Wdn skew gate | %-50e |\n", optimizer_config.tracker_wdown_skew_threshold);
     printf0("| NorMuon correction N  | %-50u |\n", optimizer_config.correction_iterations);
     printf0("| NorMuon corr. gain    | %-50e |\n", optimizer_config.correction_gain);
     printf0("| CacheMuon gamma       | %-50e |\n", optimizer_config.cache_residual_threshold);
@@ -1808,6 +2004,30 @@ int main(int argc, char *argv[]) {
                 optimizer_config.correction_mode));
     printf0("| NorMuon retraction    | %-50s |\n",
             llmc_normuon_tracker_retraction_mode_name(optimizer_config.retraction_mode));
+    printf0("| Tracker diagnostics N | %-50d |\n",
+            normuon_tracker_diagnostics_every);
+    printf0("| Tracker LR dither amp | %-50e |\n",
+            normuon_lr_dither_amplitude);
+    printf0("| Tracker LR dither mode| %-50s |\n",
+            llmc_normuon_lr_dither_mode_name(normuon_lr_dither_mode));
+    printf0("| Tracker LR dither int | %-50d |\n",
+            normuon_lr_dither_interval);
+    printf0("| Tracker LR sine Wup T | %-50d |\n",
+            normuon_lr_dither_wup_period);
+    printf0("| Tracker LR sine Wdn T | %-50d |\n",
+            normuon_lr_dither_wdown_period);
+    printf0("| Tracker LR chop env T | %-50d |\n",
+            normuon_lr_dither_envelope_blocks);
+    printf0("| Tracker LR sine phase | %-50e |\n",
+            normuon_lr_dither_phase_polarity);
+    printf0("| Tracker LR Wup scale  | %-50e |\n",
+            normuon_lr_dither_wup_scale);
+    printf0("| Tracker LR Wdn scale  | %-50e |\n",
+            normuon_lr_dither_wdown_scale);
+    printf0("| Wdown batch replay N  | %-50d |\n",
+            normuon_batch_replay_every);
+    printf0("| Wdown replay halfspan | %-50e |\n",
+            normuon_batch_replay_amplitude);
     printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
     printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
@@ -2011,6 +2231,8 @@ int main(int argc, char *argv[]) {
                 parameter_type->views_per_layer);
     }
     if (model.optimizer_plan.normuon_parameter_type_count != 0) {
+        const bool fresh_gns_scratch =
+            llmc_normuon_uses_fresh_gns_scratch(&model.optimizer_config);
         const bool commuted_canonical_stage2 =
             model.optimizer_config.retraction_mode ==
             LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
@@ -2027,7 +2249,9 @@ int main(int argc, char *argv[]) {
                 ? "split Wup square tracker + Wdown rectangular scratch Muon"
                 : model.optimizer_config.orthogonalization_mode ==
                     LLMC_NORMUON_ORTHO_RECTANGULAR_MUON
-                ? "proper rectangular Muon (scratch-only)"
+                ? (fresh_gns_scratch
+                       ? "proper rectangular Muon (scratch FreshGNS every step)"
+                       : "proper rectangular Muon (scratch-only)")
                 : model.optimizer_config.orthogonalization_mode ==
                           LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON
                       ? "proper rectangular CacheMuon (residual-gated FreshGNS)"
@@ -2075,9 +2299,42 @@ int main(int argc, char *argv[]) {
                 llmc_normuon_orthogonalization_mode_name(model.optimizer_config.orthogonalization_mode));
         printf0("normuon_refresh_policy: %s\n",
                 llmc_normuon_approximation_policy_name(model.optimizer_config.refresh_policy));
+        printf0("normuon_fresh_gns_scratch_active: %u\n",
+                fresh_gns_scratch ? 1U : 0U);
+        printf0("normuon_refresh_solver: %s\n",
+                fresh_gns_scratch
+                    ? "fresh_gns_gram_restart2_every_step"
+                    : (llmc_normuon_is_cache_mode(
+                           model.optimizer_config.orthogonalization_mode)
+                           ? "fresh_gns_gram_restart2_residual_gated"
+                           : "direct_matrix_polynomial"));
         printf0("normuon_correction_policy: %s\n",
                 llmc_normuon_approximation_policy_name(model.optimizer_config.correction_policy));
+        printf0("normuon_tracker_refresh_mode: %s\n",
+                llmc_normuon_tracker_refresh_mode_name(
+                    model.optimizer_config.tracker_refresh_mode));
         printf0("normuon_refresh_interval: %u\n", model.optimizer_config.refresh_interval);
+        printf0("normuon_tracker_refresh_interval_semantics: %s\n",
+                model.optimizer_config.tracker_refresh_mode ==
+                        LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW
+                    ? "fixed_cadence_parameter_inert_adaptive_checks_every_stale_step"
+                    : "fixed_cadence");
+        printf0("normuon_tracker_adaptive_check_interval: %u\n",
+                model.optimizer_config.tracker_refresh_mode ==
+                        LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW
+                    ? 1U
+                    : 0U);
+        printf0("normuon_tracker_max_refresh_age: %u\n",
+                model.optimizer_config.tracker_max_refresh_age);
+        printf0("normuon_tracker_wup_skew_threshold: %.9g\n",
+                model.optimizer_config.tracker_wup_skew_threshold);
+        printf0("normuon_tracker_wdown_skew_threshold: %.9g\n",
+                model.optimizer_config.tracker_wdown_skew_threshold);
+        printf0("normuon_tracker_refresh_gate_scope: %s\n",
+                model.optimizer_config.tracker_refresh_mode ==
+                        LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW
+                    ? "family_mean_skew_ratio_all_views_refresh_together"
+                    : "not_applicable");
         printf0("normuon_correction_iterations: %u\n", model.optimizer_config.correction_iterations);
         printf0("normuon_correction_gain: %.9g\n", model.optimizer_config.correction_gain);
         printf0("normuon_cache_residual_threshold: %.9g\n",
@@ -2186,6 +2443,37 @@ int main(int argc, char *argv[]) {
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
     gpt2_allocate_state(&model, B, T);
+    if ((normuon_tracker_diagnostics_every > 0 ||
+         normuon_lr_dither_amplitude > 0.0f) &&
+        !llmc_normuon_enable_tracker_diagnostics(
+            &model.normuon_runtime,
+            static_cast<uint32_t>(normuon_tracker_diagnostics_every))) {
+        fprintf(stderr, "Failed to allocate square-tracker diagnostics\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_batch_replay_every > 0 &&
+        normuon_tracker_diagnostics_every > 0 &&
+        !llmc_normuon_enable_tracker_h_stability(
+            &model.normuon_runtime,
+            LLMC_OPTIMIZER_FAMILY_MLP_WDOWN)) {
+        fprintf(stderr, "Failed to allocate Wdown H-stability telemetry\n");
+        exit(EXIT_FAILURE);
+    }
+    if (normuon_lr_dither_amplitude > 0.0f &&
+        !llmc_normuon_enable_lr_dither_probe(
+            &model.normuon_runtime,
+            normuon_lr_dither_amplitude,
+            static_cast<uint32_t>(normuon_lr_dither_interval),
+            normuon_lr_dither_mode,
+            static_cast<uint32_t>(normuon_lr_dither_wup_period),
+            static_cast<uint32_t>(normuon_lr_dither_wdown_period),
+            normuon_lr_dither_phase_polarity,
+            normuon_lr_dither_wup_scale,
+            normuon_lr_dither_wdown_scale,
+            static_cast<uint32_t>(normuon_lr_dither_envelope_blocks))) {
+        fprintf(stderr, "Failed to allocate square-tracker LR dither probe\n");
+        exit(EXIT_FAILURE);
+    }
     if (model.optimizer_plan.normuon_parameter_type_count != 0) {
         printf0("normuon_workspace_bytes: %zu\n", model.normuon_runtime.workspace_bytes);
         printf0("normuon_workspace_source: %s\n",
@@ -2194,6 +2482,12 @@ int main(int argc, char *argv[]) {
                     : "dedicated_allocation");
         printf0("normuon_workspace_float_matrix_panels: %zu\n",
                 model.normuon_runtime.batch_float_matrix_count);
+        printf0("normuon_tracker_h_stability_active: %d\n",
+                model.normuon_runtime.tracker_h_stability_normalized != nullptr &&
+                    model.normuon_runtime.tracker_h_stability_previous != nullptr);
+        printf0("normuon_tracker_h_stability_bytes: %zu\n",
+                model.normuon_runtime.tracker_h_stability_elements *
+                    sizeof(float) * 2U);
         printf0("normuon_batch_matrix_capacity: %zu\n", model.normuon_runtime.batch_matrix_capacity);
         printf0("normuon_tracker_q_bytes: %zu\n", model.normuon_runtime.tracked_q_bytes);
     }
@@ -2213,6 +2507,45 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Failed to load exact NorMuon companion state: %s\n", resume_normuon_path);
             exit(EXIT_FAILURE);
         }
+    }
+
+    float* normuon_batch_replay_wdown_snapshot = nullptr;
+    floatX* normuon_batch_replay_center_parameter = nullptr;
+    float* normuon_batch_replay_row_scales = nullptr;
+    unsigned long long* normuon_batch_replay_changed_count = nullptr;
+    size_t normuon_batch_replay_wdown_elements = 0U;
+    size_t normuon_batch_replay_row_scale_elements = 0U;
+    if (normuon_batch_replay_every > 0) {
+        const LlmcOptimizerParameterType* wdown_parameter_type =
+            gpt2_normuon_parameter_type_for_family(
+                &model, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+        if (wdown_parameter_type == nullptr) {
+            fprintf(stderr, "same-batch replay could not locate the NorMuon Wdown family\n");
+            exit(EXIT_FAILURE);
+        }
+        normuon_batch_replay_wdown_elements = wdown_parameter_type->tensor_elements;
+        normuon_batch_replay_row_scale_elements = static_cast<size_t>(
+            wdown_parameter_type->layer_multiplicity *
+            wdown_parameter_type->views_per_layer) *
+            wdown_parameter_type->matrix_width;
+        cudaCheck(cudaMalloc(
+            &normuon_batch_replay_wdown_snapshot,
+            normuon_batch_replay_wdown_elements * sizeof(float)));
+        cudaCheck(cudaMalloc(
+            &normuon_batch_replay_center_parameter,
+            normuon_batch_replay_wdown_elements * sizeof(floatX)));
+        cudaCheck(cudaMalloc(
+            &normuon_batch_replay_row_scales,
+            normuon_batch_replay_row_scale_elements * sizeof(float)));
+        cudaCheck(cudaMalloc(
+            &normuon_batch_replay_changed_count,
+            sizeof(unsigned long long)));
+        printf0(
+            "normuon_batch_replay_snapshot_bytes: %zu\n",
+            normuon_batch_replay_wdown_elements *
+                (sizeof(float) + sizeof(floatX)) +
+                normuon_batch_replay_row_scale_elements * sizeof(float) +
+                sizeof(unsigned long long));
     }
 
     // init an OutlierDetector the training loss
@@ -2240,10 +2573,15 @@ int main(int argc, char *argv[]) {
     // train
     cudaEvent_t start, end;
     cudaEvent_t optimizer_start, optimizer_end;
+    cudaEvent_t batch_replay_start = nullptr, batch_replay_end = nullptr;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
     cudaCheck(cudaEventCreate(&optimizer_start));
     cudaCheck(cudaEventCreate(&optimizer_end));
+    if (normuon_batch_replay_every > 0) {
+        cudaCheck(cudaEventCreate(&batch_replay_start));
+        cudaCheck(cudaEventCreate(&batch_replay_end));
+    }
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
@@ -2468,6 +2806,20 @@ int main(int argc, char *argv[]) {
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         float step_normuon_learning_rate = get_learning_rate(&normuon_lr_scheduler, step);
         float optimizer_time_ms = 0.0f;
+        bool batch_replay_probed = false;
+        float batch_replay_base_loss = 0.0f;
+        float batch_replay_plus_loss = 0.0f;
+        float batch_replay_minus_loss = 0.0f;
+        float batch_replay_time_ms = 0.0f;
+        unsigned long long batch_replay_plus_changed = 0ULL;
+        unsigned long long batch_replay_minus_changed = 0ULL;
+        float batch_replay_q_sample_max = 0.0f;
+        float batch_replay_row_scale_sample_max = 0.0f;
+        float batch_replay_sample_update_abs = 0.0f;
+        float batch_replay_sample_base_master = 0.0f;
+        float batch_replay_sample_plus_master = 0.0f;
+        float batch_replay_sample_center_parameter = 0.0f;
+        float batch_replay_sample_plus_parameter = 0.0f;
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
         float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
@@ -2490,6 +2842,207 @@ int main(int argc, char *argv[]) {
             cudaCheck(cudaEventElapsedTime(&optimizer_time_ms, optimizer_start, optimizer_end));
             total_optimizer_time_ms += optimizer_time_ms;
             completed_optimizer_steps++;
+            if (normuon_batch_replay_every > 0 &&
+                (step % normuon_batch_replay_every) == 0) {
+                const uint64_t optimizer_global_step =
+                    llmc_gpt2_normuon_global_step(step + 1);
+                const uint64_t replay_rounding_step =
+                    optimizer_global_step ^ 0xd1b54a32d192ed03ULL;
+                const LlmcOptimizerParameterType* replay_parameter_type =
+                    gpt2_normuon_parameter_type_for_family(
+                        &model, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+                if (replay_parameter_type == nullptr) {
+                    fprintf(stderr, "failed to locate Wdown replay parameter metadata\n");
+                    exit(EXIT_FAILURE);
+                }
+                const size_t replay_width = replay_parameter_type->matrix_width;
+                const size_t replay_matrix_elements = replay_width * replay_width;
+                const size_t replay_q_sample_count =
+                    replay_matrix_elements < 1024U ? replay_matrix_elements : 1024U;
+                const size_t replay_scale_sample_count =
+                    replay_width < 1024U ? replay_width : 1024U;
+                float replay_q_sample[1024];
+                float replay_scale_sample[1024];
+                const size_t replay_q_offset =
+                    LLMC_NORMUON_VIEWS_PER_MLP_MATRIX * replay_matrix_elements;
+                cudaCheck(cudaMemcpyAsync(
+                    normuon_batch_replay_row_scales,
+                    model.normuon_runtime.axis_stats,
+                    normuon_batch_replay_row_scale_elements * sizeof(float),
+                    cudaMemcpyDeviceToDevice,
+                    main_stream));
+                cudaCheck(cudaMemcpy(
+                    replay_q_sample,
+                    model.normuon_runtime.tracked_q + replay_q_offset,
+                    replay_q_sample_count * sizeof(float),
+                    cudaMemcpyDeviceToHost));
+                cudaCheck(cudaMemcpy(
+                    replay_scale_sample,
+                    normuon_batch_replay_row_scales,
+                    replay_scale_sample_count * sizeof(float),
+                    cudaMemcpyDeviceToHost));
+                for (size_t sample_index = 0;
+                     sample_index < replay_q_sample_count;
+                     ++sample_index) {
+                    batch_replay_q_sample_max = fmaxf(
+                        batch_replay_q_sample_max,
+                        fabsf(replay_q_sample[sample_index]));
+                }
+                for (size_t sample_index = 0;
+                     sample_index < replay_scale_sample_count;
+                     ++sample_index) {
+                    batch_replay_row_scale_sample_max = fmaxf(
+                        batch_replay_row_scale_sample_max,
+                        fabsf(replay_scale_sample[sample_index]));
+                }
+                size_t replay_sample_index = 0U;
+                for (size_t sample_index = 0;
+                     sample_index < replay_q_sample_count;
+                     ++sample_index) {
+                    const size_t row = sample_index / replay_width;
+                    const float update_abs = fabsf(
+                        replay_q_sample[sample_index] *
+                        replay_scale_sample[row]);
+                    if (update_abs > batch_replay_sample_update_abs) {
+                        batch_replay_sample_update_abs = update_abs;
+                        replay_sample_index = sample_index;
+                    }
+                }
+                const size_t replay_sample_row = replay_sample_index / replay_width;
+                const size_t replay_sample_column =
+                    replay_sample_index - replay_sample_row * replay_width;
+                const size_t replay_sample_parameter_offset =
+                    replay_sample_row * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX *
+                        replay_width +
+                    replay_sample_column;
+                const ShardInfo replay_tensor = gpt2_get_tensor_at_layer(
+                    &model, 0, replay_parameter_type->tensor_id);
+                cudaCheck(cudaEventRecord(batch_replay_start));
+                if (!gpt2_normuon_batch_replay_snapshot_wdown(
+                        &model, normuon_batch_replay_wdown_snapshot)) {
+                    fprintf(stderr, "failed to snapshot Wdown for same-batch replay\n");
+                    exit(EXIT_FAILURE);
+                }
+                if (!gpt2_normuon_batch_replay_set_wdown(
+                        &model,
+                        normuon_batch_replay_wdown_snapshot,
+                        step_normuon_learning_rate,
+                        0.0f,
+                        replay_rounding_step,
+                        nullptr,
+                        nullptr,
+                        normuon_batch_replay_row_scales)) {
+                    fprintf(stderr, "failed to apply common replay rounding at the center point\n");
+                    exit(EXIT_FAILURE);
+                }
+                if (!gpt2_normuon_batch_replay_snapshot_wdown_parameter(
+                        &model, normuon_batch_replay_center_parameter)) {
+                    fprintf(stderr, "failed to snapshot the common-rounded replay center\n");
+                    exit(EXIT_FAILURE);
+                }
+                floatX replay_center_parameter_value;
+                cudaCheck(cudaMemcpy(
+                    &batch_replay_sample_base_master,
+                    normuon_batch_replay_wdown_snapshot +
+                        replay_sample_parameter_offset,
+                    sizeof(float),
+                    cudaMemcpyDeviceToHost));
+                cudaCheck(cudaMemcpy(
+                    &replay_center_parameter_value,
+                    normuon_batch_replay_center_parameter +
+                        replay_sample_parameter_offset,
+                    sizeof(floatX),
+                    cudaMemcpyDeviceToHost));
+                batch_replay_sample_center_parameter =
+                    static_cast<float>(replay_center_parameter_value);
+                batch_replay_base_loss = gpt2_validate(
+                    &model,
+                    train_loader.inputs,
+                    train_loader.targets,
+                    B,
+                    T,
+                    mask_sequence_final_target);
+                if (!gpt2_normuon_batch_replay_set_wdown(
+                        &model,
+                        normuon_batch_replay_wdown_snapshot,
+                        step_normuon_learning_rate,
+                        normuon_batch_replay_amplitude,
+                        replay_rounding_step,
+                        normuon_batch_replay_center_parameter,
+                        normuon_batch_replay_changed_count,
+                        normuon_batch_replay_row_scales)) {
+                    fprintf(stderr, "failed to apply the positive Wdown replay perturbation\n");
+                    exit(EXIT_FAILURE);
+                }
+                cudaCheck(cudaMemcpy(
+                    &batch_replay_plus_changed,
+                    normuon_batch_replay_changed_count,
+                    sizeof(unsigned long long),
+                    cudaMemcpyDeviceToHost));
+                floatX replay_plus_parameter_value;
+                cudaCheck(cudaMemcpy(
+                    &batch_replay_sample_plus_master,
+                    model.master_weights + replay_tensor.offset +
+                        replay_sample_parameter_offset,
+                    sizeof(float),
+                    cudaMemcpyDeviceToHost));
+                cudaCheck(cudaMemcpy(
+                    &replay_plus_parameter_value,
+                    static_cast<floatX*>(model.params_memory) +
+                        replay_tensor.offset + replay_sample_parameter_offset,
+                    sizeof(floatX),
+                    cudaMemcpyDeviceToHost));
+                batch_replay_sample_plus_parameter =
+                    static_cast<float>(replay_plus_parameter_value);
+                batch_replay_plus_loss = gpt2_validate(
+                    &model,
+                    train_loader.inputs,
+                    train_loader.targets,
+                    B,
+                    T,
+                    mask_sequence_final_target);
+                if (!gpt2_normuon_batch_replay_set_wdown(
+                        &model,
+                        normuon_batch_replay_wdown_snapshot,
+                        step_normuon_learning_rate,
+                        -normuon_batch_replay_amplitude,
+                        replay_rounding_step,
+                        normuon_batch_replay_center_parameter,
+                        normuon_batch_replay_changed_count,
+                        normuon_batch_replay_row_scales)) {
+                    fprintf(stderr, "failed to apply the negative Wdown replay perturbation\n");
+                    exit(EXIT_FAILURE);
+                }
+                cudaCheck(cudaMemcpy(
+                    &batch_replay_minus_changed,
+                    normuon_batch_replay_changed_count,
+                    sizeof(unsigned long long),
+                    cudaMemcpyDeviceToHost));
+                batch_replay_minus_loss = gpt2_validate(
+                    &model,
+                    train_loader.inputs,
+                    train_loader.targets,
+                    B,
+                    T,
+                    mask_sequence_final_target);
+                if (!gpt2_normuon_batch_replay_set_wdown(
+                        &model,
+                        normuon_batch_replay_wdown_snapshot,
+                        step_normuon_learning_rate,
+                        0.0f,
+                        optimizer_global_step,
+                        nullptr,
+                        nullptr,
+                        normuon_batch_replay_row_scales)) {
+                    fprintf(stderr, "failed to restore Wdown after same-batch replay\n");
+                    exit(EXIT_FAILURE);
+                }
+                cudaCheck(cudaEventRecord(batch_replay_end));
+                cudaCheck(cudaEventSynchronize(batch_replay_end));
+                cudaCheck(cudaEventElapsedTime(
+                    &batch_replay_time_ms, batch_replay_start, batch_replay_end));
+                batch_replay_probed = true;
+            }
         }
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
@@ -2524,6 +3077,60 @@ int main(int argc, char *argv[]) {
                 time_elapsed_ms, device_memory_used_bytes / (1024.0 * 1024.0),
                 finite_step ? "yes" : "no", 100*mfu,
                 bias_corrected_ema_tokens_per_second);
+        if (batch_replay_probed) {
+            const float replay_amplitude = normuon_batch_replay_amplitude;
+            const float replay_slope =
+                (batch_replay_plus_loss - batch_replay_minus_loss) /
+                (2.0f * replay_amplitude);
+            const float replay_curvature =
+                (batch_replay_plus_loss - 2.0f * batch_replay_base_loss +
+                 batch_replay_minus_loss) /
+                (replay_amplitude * replay_amplitude);
+            const bool replay_optimum_valid =
+                isfinite(replay_slope) && isfinite(replay_curvature) &&
+                replay_curvature > 0.0f;
+            const float replay_optimum_multiplier = replay_optimum_valid
+                ? 1.0f - replay_slope / replay_curvature
+                : 0.0f;
+            printf0(
+                "batch_replay {\"step\":%d,\"family\":\"mlp_wdown\","
+                "\"amplitude\":%.9g,\"minus_multiplier\":%.9g,"
+                "\"base_multiplier\":1,\"plus_multiplier\":%.9g,"
+                "\"minus_loss\":%.9g,\"base_loss\":%.9g,"
+                "\"plus_loss\":%.9g,\"slope_per_multiplier\":%.9g,"
+                "\"curvature_per_multiplier2\":%.9g,"
+                "\"quadratic_optimum_valid\":%s,"
+                "\"quadratic_optimum_multiplier\":%.9g,"
+                "\"common_random_rounding\":true,"
+                "\"minus_changed_bf16\":%llu,\"plus_changed_bf16\":%llu,"
+                "\"q_sample_max\":%.9g,\"row_scale_sample_max\":%.9g,"
+                "\"sample_update_abs\":%.9g,"
+                "\"sample_base_master\":%.9g,\"sample_plus_master\":%.9g,"
+                "\"sample_center_parameter\":%.9g,"
+                "\"sample_plus_parameter\":%.9g,"
+                "\"replay_time_ms\":%.9g}\n",
+                step + 1,
+                replay_amplitude,
+                1.0f - replay_amplitude,
+                1.0f + replay_amplitude,
+                batch_replay_minus_loss,
+                batch_replay_base_loss,
+                batch_replay_plus_loss,
+                replay_slope,
+                replay_curvature,
+                replay_optimum_valid ? "true" : "false",
+                replay_optimum_multiplier,
+                batch_replay_minus_changed,
+                batch_replay_plus_changed,
+                batch_replay_q_sample_max,
+                batch_replay_row_scale_sample_max,
+                batch_replay_sample_update_abs,
+                batch_replay_sample_base_master,
+                batch_replay_sample_plus_master,
+                batch_replay_sample_center_parameter,
+                batch_replay_sample_plus_parameter,
+                batch_replay_time_ms);
+        }
         if (llmc_normuon_is_cache_mode(
                 model.optimizer_config.orthogonalization_mode)) {
             const uint64_t probes = model.normuon_runtime.cache_step_probe_count;
@@ -2542,6 +3149,193 @@ int main(int argc, char *argv[]) {
                     probes - model.normuon_runtime.cache_step_miss_count),
                 mean_residual,
                 model.normuon_runtime.cache_step_residual_max);
+        }
+        if (model.normuon_runtime.tracker_diagnostics_active_step) {
+            for (int diagnostic_slot = 0;
+                 diagnostic_slot < LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT;
+                 ++diagnostic_slot) {
+                const LlmcNormuonTrackerFamilyDiagnostics& diagnostics =
+                    model.normuon_runtime
+                        .tracker_step_diagnostics[diagnostic_slot];
+                if (!diagnostics.valid) {
+                    continue;
+                }
+                const char* family_name =
+                    diagnostics.family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+                        ? "mlp_wup"
+                        : "mlp_wdown";
+                printf0(
+                    "tracker_diag {\"step\":%d,\"family\":\"%s\","
+                    "\"refreshed\":%s,\"age_since_refresh\":%lld,"
+                    "\"phase_probe_count\":%llu,"
+                    "\"skew_ratio_mean\":%.9g,\"skew_ratio_p50\":%.9g,"
+                    "\"skew_ratio_p95\":%.9g,\"skew_ratio_max\":%.9g,"
+                    "\"dimension_normalized_skew_mean\":%.9g,"
+                    "\"dimension_normalized_skew_max\":%.9g,"
+                    "\"correction_frobenius_mean\":%.9g,"
+                    "\"correction_frobenius_max\":%.9g,"
+                    "\"refresh_comparison_count\":%llu,"
+                     "\"refresh_cosine_mean\":%.9g,"
+                     "\"refresh_cosine_min\":%.9g,"
+                     "\"refresh_relative_error_mean\":%.9g,"
+                     "\"refresh_relative_error_p95\":%.9g,"
+                     "\"refresh_relative_error_max\":%.9g,"
+                     "\"lr_dither_response_probed\":%s,"
+                     "\"lr_dither_source_step\":%llu,"
+                     "\"lr_dither_mode\":\"%s\","
+                     "\"lr_dither_sign\":%d,"
+                     "\"lr_dither_amplitude\":%.9g,"
+                     "\"lr_dither_signal\":%.9g,"
+                     "\"lr_dither_multiplier\":%.9g,"
+                     "\"gradient_dot_previous_update_sum\":%.9g,"
+                     "\"normalized_phase_trace_sum\":%.9g,"
+                     "\"raw_phase_trace_sum\":%.9g,"
+                     "\"h_stability_comparison_count\":%llu,"
+                     "\"h_stability_reference_step\":%llu,"
+                     "\"h_stability_interval_steps\":%llu,"
+                     "\"h_relative_frobenius\":%.9g,"
+                     "\"h_cosine\":%.9g,"
+                     "\"h_norm_ratio\":%.9g,"
+                     "\"h_view_relative_p50\":%.9g,"
+                     "\"h_view_relative_p95\":%.9g,"
+                     "\"h_view_relative_max\":%.9g}\n",
+                    step + 1,
+                    family_name,
+                    diagnostics.refreshed ? "true" : "false",
+                    static_cast<long long>(diagnostics.age_since_refresh),
+                    static_cast<unsigned long long>(
+                        diagnostics.phase_probe_count),
+                    diagnostics.skew_ratio_mean,
+                    diagnostics.skew_ratio_p50,
+                    diagnostics.skew_ratio_p95,
+                    diagnostics.skew_ratio_max,
+                    diagnostics.dimension_normalized_skew_mean,
+                    diagnostics.dimension_normalized_skew_max,
+                    diagnostics.correction_frobenius_mean,
+                    diagnostics.correction_frobenius_max,
+                    static_cast<unsigned long long>(
+                        diagnostics.refresh_comparison_count),
+                    diagnostics.refresh_cosine_mean,
+                    diagnostics.refresh_cosine_min,
+                     diagnostics.refresh_relative_error_mean,
+                     diagnostics.refresh_relative_error_p95,
+                     diagnostics.refresh_relative_error_max,
+                     diagnostics.lr_dither_response_probed ? "true" : "false",
+                     static_cast<unsigned long long>(
+                         diagnostics.lr_dither_source_step),
+                     llmc_normuon_lr_dither_mode_name(
+                         model.normuon_runtime.lr_dither_mode),
+                     diagnostics.lr_dither_sign,
+                     diagnostics.lr_dither_amplitude,
+                     diagnostics.lr_dither_signal,
+                     diagnostics.lr_dither_multiplier,
+                     diagnostics.gradient_dot_previous_update_sum,
+                     diagnostics.normalized_phase_trace_sum,
+                     diagnostics.raw_phase_trace_sum,
+                     static_cast<unsigned long long>(
+                         diagnostics.h_stability_comparison_count),
+                     static_cast<unsigned long long>(
+                         diagnostics.h_stability_reference_step),
+                     static_cast<unsigned long long>(
+                         diagnostics.h_stability_interval_steps),
+                     diagnostics.h_relative_frobenius,
+                     diagnostics.h_cosine,
+                     diagnostics.h_norm_ratio,
+                     diagnostics.h_view_relative_p50,
+                     diagnostics.h_view_relative_p95,
+                     diagnostics.h_view_relative_max);
+            }
+            for (size_t diagnostic_index = 0;
+                 diagnostic_index <
+                     model.normuon_runtime
+                         .tracker_step_view_diagnostic_capacity;
+                 ++diagnostic_index) {
+                if (model.normuon_runtime.lr_dither_enabled &&
+                    (model.normuon_runtime.lr_dither_mode ==
+                         LLMC_NORMUON_LR_DITHER_SINUSOIDAL ||
+                     model.normuon_runtime.lr_dither_mode ==
+                         LLMC_NORMUON_LR_DITHER_HETERODYNE_CHOPPER)) {
+                    break;
+                }
+                const LlmcNormuonTrackerViewDiagnostics& diagnostics =
+                    model.normuon_runtime
+                        .tracker_step_view_diagnostics[diagnostic_index];
+                if (!diagnostics.valid || !diagnostics.phase_probed) {
+                    continue;
+                }
+                const char* family_name =
+                    diagnostics.family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+                        ? "mlp_wup"
+                        : "mlp_wdown";
+                const int layer_index =
+                    diagnostics.matrix_index /
+                    LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+                const int view_index =
+                    diagnostics.matrix_index -
+                    layer_index * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+                printf0(
+                    "tracker_diag_view {\"step\":%d,"
+                    "\"family\":\"%s\",\"matrix_index\":%d,"
+                    "\"layer\":%d,\"view\":%d,"
+                    "\"refreshed\":%s,\"age_since_refresh\":%lld,"
+                    "\"skew_ratio\":%.9g,"
+                    "\"dimension_normalized_skew\":%.9g,"
+                    "\"correction_frobenius\":%.9g,"
+                     "\"refresh_compared\":%s,"
+                     "\"refresh_cosine\":%.9g,"
+                     "\"refresh_relative_error\":%.9g,"
+                     "\"lr_dither_response_probed\":%s,"
+                     "\"lr_dither_source_step\":%llu,"
+                     "\"lr_dither_mode\":\"%s\","
+                     "\"lr_dither_sign\":%d,"
+                     "\"lr_dither_amplitude\":%.9g,"
+                     "\"lr_dither_signal\":%.9g,"
+                     "\"lr_dither_multiplier\":%.9g,"
+                     "\"gradient_dot_previous_update\":%.9g,"
+                     "\"raw_nesterov_norm\":%.9g,"
+                     "\"normalized_phase_trace\":%.9g,"
+                     "\"raw_phase_trace\":%.9g,"
+                     "\"h_stability_compared\":%s,"
+                     "\"h_stability_reference_step\":%llu,"
+                     "\"h_stability_interval_steps\":%llu,"
+                     "\"h_relative_frobenius\":%.9g,"
+                     "\"h_cosine\":%.9g,"
+                     "\"h_norm_ratio\":%.9g}\n",
+                    step + 1,
+                    family_name,
+                    diagnostics.matrix_index,
+                    layer_index,
+                    view_index,
+                    diagnostics.refreshed ? "true" : "false",
+                    static_cast<long long>(diagnostics.age_since_refresh),
+                    diagnostics.skew_ratio,
+                    diagnostics.dimension_normalized_skew,
+                    diagnostics.correction_frobenius,
+                     diagnostics.refresh_compared ? "true" : "false",
+                     diagnostics.refresh_cosine,
+                     diagnostics.refresh_relative_error,
+                     diagnostics.lr_dither_response_probed ? "true" : "false",
+                     static_cast<unsigned long long>(
+                         diagnostics.lr_dither_source_step),
+                     llmc_normuon_lr_dither_mode_name(
+                         model.normuon_runtime.lr_dither_mode),
+                     diagnostics.lr_dither_sign,
+                     diagnostics.lr_dither_amplitude,
+                     diagnostics.lr_dither_signal,
+                     diagnostics.lr_dither_multiplier,
+                     diagnostics.gradient_dot_previous_update,
+                     diagnostics.raw_nesterov_norm,
+                     diagnostics.normalized_phase_trace,
+                     diagnostics.raw_phase_trace,
+                     diagnostics.h_stability_compared ? "true" : "false",
+                     static_cast<unsigned long long>(
+                         diagnostics.h_stability_reference_step),
+                     static_cast<unsigned long long>(
+                         diagnostics.h_stability_interval_steps),
+                     diagnostics.h_relative_frobenius,
+                     diagnostics.h_cosine,
+                     diagnostics.h_norm_ratio);
+            }
         }
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
@@ -2578,8 +3372,40 @@ int main(int argc, char *argv[]) {
         printf0("cachemuon_max_residual: %.9g\n",
                 model.normuon_runtime.cache_total_residual_max);
     }
+    if (model.optimizer_config.tracker_refresh_mode ==
+        LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW) {
+        static constexpr const char* adaptive_family_names[2] = {
+            "mlp_wup", "mlp_wdown"};
+        for (int family_slot = 0; family_slot < 2; ++family_slot) {
+            printf0("tracker_adaptive_%s_checks: %llu\n",
+                    adaptive_family_names[family_slot],
+                    static_cast<unsigned long long>(
+                        model.normuon_runtime
+                            .tracker_adaptive_check_count[family_slot]));
+            printf0("tracker_adaptive_%s_threshold_refreshes: %llu\n",
+                    adaptive_family_names[family_slot],
+                    static_cast<unsigned long long>(
+                        model.normuon_runtime
+                            .tracker_adaptive_threshold_refresh_count[
+                                family_slot]));
+            printf0("tracker_adaptive_%s_forced_refreshes: %llu\n",
+                    adaptive_family_names[family_slot],
+                    static_cast<unsigned long long>(
+                        model.normuon_runtime
+                            .tracker_adaptive_forced_refresh_count[
+                                family_slot]));
+            printf0("tracker_adaptive_%s_initial_refreshes: %llu\n",
+                    adaptive_family_names[family_slot],
+                    static_cast<unsigned long long>(
+                        model.normuon_runtime
+                            .tracker_adaptive_initial_refresh_count[
+                                family_slot]));
+        }
+    }
 
     // free and destroy everything
+    if (batch_replay_end != nullptr) { cudaCheck(cudaEventDestroy(batch_replay_end)); }
+    if (batch_replay_start != nullptr) { cudaCheck(cudaEventDestroy(batch_replay_start)); }
     cudaCheck(cudaEventDestroy(optimizer_end));
     cudaCheck(cudaEventDestroy(optimizer_start));
     cudaCheck(cudaEventDestroy(end));
@@ -2592,6 +3418,18 @@ int main(int argc, char *argv[]) {
     free(cpu_logits);
     free(sample_candidates);
     free(gen_tokens);
+    if (normuon_batch_replay_wdown_snapshot != nullptr) {
+        cudaCheck(cudaFree(normuon_batch_replay_wdown_snapshot));
+    }
+    if (normuon_batch_replay_center_parameter != nullptr) {
+        cudaCheck(cudaFree(normuon_batch_replay_center_parameter));
+    }
+    if (normuon_batch_replay_row_scales != nullptr) {
+        cudaCheck(cudaFree(normuon_batch_replay_row_scales));
+    }
+    if (normuon_batch_replay_changed_count != nullptr) {
+        cudaCheck(cudaFree(normuon_batch_replay_changed_count));
+    }
     multi_gpu_config_free(&multi_gpu_config);
     gpt2_free(&model);
     common_free(model);

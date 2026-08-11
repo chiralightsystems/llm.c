@@ -199,6 +199,66 @@ __global__ void llmc_normuon_batch_prepare_rectangular_momentum_kernel(
     }
 }
 
+__global__ void llmc_normuon_batch_copy_norm_squared_kernel(
+    const float* stats,
+    float* norm_squared,
+    size_t matrix_count) {
+    size_t matrix_index =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (matrix_index < matrix_count) {
+        norm_squared[matrix_index] =
+            stats[matrix_index * LLMC_NORMUON_BATCH_STATS_STRIDE];
+    }
+}
+
+__global__ void llmc_normuon_batch_previous_update_gradient_dot_kernel(
+    const floatX* gradient,
+    const float* tracked_q,
+    const float* previous_row_scales,
+    float* response,
+    int* nonfinite,
+    size_t matrix_count,
+    size_t width,
+    int family_id,
+    float gradient_scale) {
+    const size_t matrix_index = blockIdx.x;
+    if (matrix_index >= matrix_count) {
+        return;
+    }
+    const size_t matrix_elements = width * width;
+    __shared__ float local[LLMC_NORMUON_BLOCK_SIZE];
+    float sum = 0.0f;
+    for (size_t index = threadIdx.x;
+         index < matrix_elements;
+         index += blockDim.x) {
+        const size_t row = index / width;
+        const size_t parameter_offset = llmc_normuon_batch_tensor_offset(
+            family_id, matrix_index, index, width);
+        const size_t q_offset = llmc_normuon_batch_q_offset(
+            family_id, matrix_index, index, matrix_elements);
+        const float grad =
+            gradient_scale * static_cast<float>(gradient[parameter_offset]);
+        const float update_direction = tracked_q[q_offset] *
+            previous_row_scales[matrix_index * width + row];
+        const float product = grad * update_direction;
+        if (!isfinite(product)) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        sum += product;
+    }
+    local[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local[threadIdx.x] += local[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        response[matrix_index] = local[0];
+    }
+}
+
 __global__ void llmc_normuon_batch_normalize_pack_bf16_kernel(
     float* direction,
     const float* stats,
@@ -387,8 +447,12 @@ __global__ void llmc_normuon_batch_sym_skew_stats_kernel(
     }
     const size_t matrix_elements = width * width;
     const float* matrix = phase + matrix_index * panel_stride;
-    __shared__ float local[LLMC_NORMUON_BLOCK_SIZE];
-    float sum = 0.0f;
+    __shared__ float local_symmetric[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_skew[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_trace[LLMC_NORMUON_BLOCK_SIZE];
+    float symmetric_sum = 0.0f;
+    float skew_sum = 0.0f;
+    float trace_sum = 0.0f;
     for (size_t index = threadIdx.x;
          index < matrix_elements;
          index += blockDim.x) {
@@ -396,21 +460,206 @@ __global__ void llmc_normuon_batch_sym_skew_stats_kernel(
         const size_t column = index - row * width;
         const float symmetric =
             0.5f * (matrix[index] + matrix[column * width + row]);
-        if (!isfinite(symmetric)) {
+        const float skew =
+            0.5f * (matrix[index] - matrix[column * width + row]);
+        if (!isfinite(symmetric) || !isfinite(skew)) {
             llmc_normuon_mark_nonfinite(nonfinite);
         }
-        sum += symmetric * symmetric;
+        symmetric_sum += symmetric * symmetric;
+        skew_sum += skew * skew;
+        if (row == column) {
+            trace_sum += symmetric;
+        }
     }
-    local[threadIdx.x] = sum;
+    local_symmetric[threadIdx.x] = symmetric_sum;
+    local_skew[threadIdx.x] = skew_sum;
+    local_trace[threadIdx.x] = trace_sum;
     __syncthreads();
     for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
         if (threadIdx.x < offset) {
-            local[threadIdx.x] += local[threadIdx.x + offset];
+            local_symmetric[threadIdx.x] +=
+                local_symmetric[threadIdx.x + offset];
+            local_skew[threadIdx.x] += local_skew[threadIdx.x + offset];
+            local_trace[threadIdx.x] += local_trace[threadIdx.x + offset];
         }
         __syncthreads();
     }
     if (threadIdx.x == 0U) {
-        stats[matrix_index * LLMC_NORMUON_BATCH_STATS_STRIDE] = local[0];
+        float* matrix_stats =
+            stats + matrix_index * LLMC_NORMUON_BATCH_STATS_STRIDE;
+        matrix_stats[0] = local_symmetric[0];
+        matrix_stats[1] = local_skew[0];
+        matrix_stats[2] = local_trace[0];
+        matrix_stats[3] = 0.0f;
+    }
+}
+
+__global__ void llmc_normuon_batch_h_stability_kernel(
+    const float* phase,
+    float* previous_h,
+    float* stability_stats,
+    int* nonfinite,
+    size_t matrix_count,
+    size_t matrix_elements,
+    size_t panel_stride,
+    size_t width,
+    bool compared) {
+    const size_t matrix_index = blockIdx.x;
+    if (matrix_index >= matrix_count) {
+        return;
+    }
+    const size_t panel_offset = matrix_index * panel_stride;
+    const size_t history_offset = matrix_index * matrix_elements;
+    __shared__ float local_current[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_previous[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_difference[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_dot[LLMC_NORMUON_BLOCK_SIZE];
+    float current_sum = 0.0f;
+    float previous_sum = 0.0f;
+    float difference_sum = 0.0f;
+    float dot_sum = 0.0f;
+    for (size_t index = threadIdx.x;
+         index < matrix_elements;
+         index += blockDim.x) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const float current = 0.5f * (
+            phase[panel_offset + index] +
+            phase[panel_offset + column * width + row]);
+        const float previous = compared
+            ? previous_h[history_offset + index]
+            : 0.0f;
+        const float difference = current - previous;
+        if (!isfinite(current) || (compared && !isfinite(previous))) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        current_sum += current * current;
+        if (compared) {
+            previous_sum += previous * previous;
+            difference_sum += difference * difference;
+            dot_sum += current * previous;
+        }
+        previous_h[history_offset + index] = current;
+    }
+    local_current[threadIdx.x] = current_sum;
+    local_previous[threadIdx.x] = previous_sum;
+    local_difference[threadIdx.x] = difference_sum;
+    local_dot[threadIdx.x] = dot_sum;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local_current[threadIdx.x] += local_current[threadIdx.x + offset];
+            local_previous[threadIdx.x] += local_previous[threadIdx.x + offset];
+            local_difference[threadIdx.x] +=
+                local_difference[threadIdx.x + offset];
+            local_dot[threadIdx.x] += local_dot[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        float* stats = stability_stats + matrix_index * 4U;
+        stats[0] = local_current[0];
+        stats[1] = local_previous[0];
+        stats[2] = local_difference[0];
+        stats[3] = local_dot[0];
+    }
+}
+
+__global__ void llmc_normuon_batch_mean_skew_ratio_kernel(
+    const float* stats,
+    float* mean_skew_ratio,
+    int* nonfinite,
+    size_t matrix_count,
+    float epsilon) {
+    __shared__ float local_sum[LLMC_NORMUON_BLOCK_SIZE];
+    float sum = 0.0f;
+    for (size_t matrix_index = threadIdx.x;
+         matrix_index < matrix_count;
+         matrix_index += blockDim.x) {
+        const float* matrix_stats =
+            stats + matrix_index * LLMC_NORMUON_BATCH_STATS_STRIDE;
+        const float symmetric_norm = sqrtf(fmaxf(matrix_stats[0], 0.0f));
+        const float skew_norm = sqrtf(fmaxf(matrix_stats[1], 0.0f));
+        const float ratio = skew_norm / (symmetric_norm + epsilon);
+        if (!isfinite(ratio)) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        sum += ratio;
+    }
+    local_sum[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local_sum[threadIdx.x] += local_sum[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        *mean_skew_ratio = local_sum[0] / static_cast<float>(matrix_count);
+    }
+}
+
+__global__ void llmc_normuon_batch_refresh_comparison_stats_kernel(
+    const float* fresh_direction,
+    const float* tracked_q,
+    float* stats,
+    int* nonfinite,
+    size_t matrix_count,
+    size_t matrix_elements,
+    int family_id) {
+    const size_t matrix_index = blockIdx.x;
+    if (matrix_index >= matrix_count) {
+        return;
+    }
+    const float* fresh = fresh_direction + matrix_index * matrix_elements;
+    __shared__ float local_dot[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_old_norm[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_fresh_norm[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_difference[LLMC_NORMUON_BLOCK_SIZE];
+    float dot = 0.0f;
+    float old_norm = 0.0f;
+    float fresh_norm = 0.0f;
+    float difference = 0.0f;
+    for (size_t index = threadIdx.x;
+         index < matrix_elements;
+         index += blockDim.x) {
+        const size_t q_offset = llmc_normuon_batch_q_offset(
+            family_id, matrix_index, index, matrix_elements);
+        const float old_value = tracked_q[q_offset];
+        const float fresh_value = fresh[index];
+        const float delta = old_value - fresh_value;
+        if (!isfinite(old_value) || !isfinite(fresh_value)) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        dot += old_value * fresh_value;
+        old_norm += old_value * old_value;
+        fresh_norm += fresh_value * fresh_value;
+        difference += delta * delta;
+    }
+    local_dot[threadIdx.x] = dot;
+    local_old_norm[threadIdx.x] = old_norm;
+    local_fresh_norm[threadIdx.x] = fresh_norm;
+    local_difference[threadIdx.x] = difference;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local_dot[threadIdx.x] += local_dot[threadIdx.x + offset];
+            local_old_norm[threadIdx.x] +=
+                local_old_norm[threadIdx.x + offset];
+            local_fresh_norm[threadIdx.x] +=
+                local_fresh_norm[threadIdx.x + offset];
+            local_difference[threadIdx.x] +=
+                local_difference[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        float* matrix_stats =
+            stats + matrix_index * LLMC_NORMUON_BATCH_STATS_STRIDE;
+        matrix_stats[0] = local_dot[0];
+        matrix_stats[1] = local_old_norm[0];
+        matrix_stats[2] = local_fresh_norm[0];
+        matrix_stats[3] = local_difference[0];
     }
 }
 
@@ -2193,25 +2442,25 @@ inline bool llmc_normuon_apply_rectangular_polynomial_batched_bf16(
     return true;
 }
 
-inline bool llmc_normuon_tracker_direction_batched_bf16(
+inline bool llmc_normuon_tracker_phase_batched_bf16(
     LlmcNormuonRuntime* runtime,
     cublasHandle_t handle,
     cudaStream_t stream,
-    const LlmcNormuonConfig* config,
     int family_id,
     int width,
-    int matrix_count,
-    const float** direction_out) {
+    int matrix_count) {
+    if (runtime == nullptr || handle == nullptr || width <= 0 ||
+        matrix_count <= 0 || runtime->tracked_q == nullptr) {
+        return false;
+    }
     const size_t matrix_elements = static_cast<size_t>(width) * width;
     const size_t total_elements =
         static_cast<size_t>(matrix_count) * matrix_elements;
     const uint32_t grid = llmc_normuon_grid_for_count(total_elements);
     float* normalized = runtime->matrix[0];
     float* phase = runtime->matrix[1];
-    float* correction = runtime->matrix[2];
     uint16_t* packed_a = runtime->batch_bf16[0];
     uint16_t* packed_b = runtime->batch_bf16[1];
-
     llmc_normuon_batch_pack_bf16_kernel<<<
         grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
         normalized, packed_a, total_elements);
@@ -2245,6 +2494,144 @@ inline bool llmc_normuon_tracker_direction_batched_bf16(
         matrix_elements,
         width);
     cudaCheck(cudaGetLastError());
+    if (runtime->tracker_diagnostics_active_step) {
+        if (runtime->tracker_host_phase_stats == nullptr) {
+            return false;
+        }
+        cudaCheck(cudaMemcpyAsync(
+            runtime->tracker_host_phase_stats,
+            runtime->stats,
+            static_cast<size_t>(matrix_count) *
+                LLMC_NORMUON_BATCH_STATS_STRIDE * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream));
+        runtime->tracker_phase_stats_pending = true;
+    }
+    return true;
+}
+
+// Measure H against the direction that will actually be committed.  The
+// ordinary phase diagnostic above intentionally compares normalized momentum
+// with the pre-update tracked Q, which is stale on refresh steps.  Reusing it
+// for H stability would therefore measure refresh debt instead of temporal H
+// stability.  This diagnostic-only path snapshots normalized momentum before
+// the tracker mutates its workspace, then forms M_hat Q_final^T here.
+inline bool llmc_normuon_capture_tracker_h_stability_post_update_batched_bf16(
+    LlmcNormuonRuntime* runtime,
+    cublasHandle_t handle,
+    cudaStream_t stream,
+    int family_id,
+    int width,
+    int matrix_count,
+    const float* direction) {
+    if (runtime == nullptr || handle == nullptr || direction == nullptr ||
+        width <= 0 || matrix_count <= 0 ||
+        family_id != runtime->tracker_h_stability_family_id ||
+        runtime->tracker_h_stability_normalized == nullptr ||
+        runtime->tracker_h_stability_previous == nullptr ||
+        runtime->tracker_h_stability_device_stats == nullptr ||
+        runtime->tracker_h_stability_host_stats == nullptr) {
+        return false;
+    }
+    const size_t matrix_elements = static_cast<size_t>(width) * width;
+    const size_t total_elements =
+        static_cast<size_t>(matrix_count) * matrix_elements;
+    if (total_elements > runtime->tracker_h_stability_elements) {
+        return false;
+    }
+    const uint32_t grid = llmc_normuon_grid_for_count(total_elements);
+    uint16_t* packed_a = runtime->batch_bf16[0];
+    uint16_t* packed_b = runtime->batch_bf16[1];
+    float* phase = runtime->matrix[1];
+    llmc_normuon_batch_pack_bf16_kernel<<<
+        grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+        runtime->tracker_h_stability_normalized,
+        packed_a,
+        total_elements);
+    cudaCheck(cudaGetLastError());
+    llmc_normuon_batch_pack_bf16_kernel<<<
+        grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+        direction,
+        packed_b,
+        total_elements);
+    cudaCheck(cudaGetLastError());
+    llmc_normuon_batched_gemm_bf16(
+        handle,
+        packed_a,
+        CUBLAS_OP_N,
+        packed_b,
+        CUBLAS_OP_T,
+        phase,
+        width,
+        matrix_count);
+
+    const bool compared = runtime->tracker_h_stability_valid;
+    llmc_normuon_batch_h_stability_kernel<<<
+        static_cast<uint32_t>(matrix_count),
+        LLMC_NORMUON_BLOCK_SIZE,
+        0,
+        stream>>>(
+        phase,
+        runtime->tracker_h_stability_previous,
+        runtime->tracker_h_stability_device_stats,
+        runtime->nonfinite_flag,
+        static_cast<size_t>(matrix_count),
+        matrix_elements,
+        matrix_elements,
+        static_cast<size_t>(width),
+        compared);
+    cudaCheck(cudaGetLastError());
+    cudaCheck(cudaMemcpyAsync(
+        runtime->tracker_h_stability_host_stats,
+        runtime->tracker_h_stability_device_stats,
+        static_cast<size_t>(matrix_count) * 4U * sizeof(float),
+        cudaMemcpyDeviceToHost,
+        stream));
+    runtime->tracker_h_stability_pending = true;
+    runtime->tracker_h_stability_pending_compared = compared;
+    runtime->tracker_h_stability_pending_reference_step =
+        runtime->tracker_h_stability_reference_step;
+    runtime->tracker_h_stability_pending_interval_steps = compared
+        ? runtime->tracker_diagnostics_global_step -
+            runtime->tracker_h_stability_reference_step
+        : 0U;
+    runtime->tracker_h_stability_valid = true;
+    runtime->tracker_h_stability_reference_step =
+        runtime->tracker_diagnostics_global_step;
+    return true;
+}
+
+inline bool llmc_normuon_tracker_direction_batched_bf16(
+    LlmcNormuonRuntime* runtime,
+    cublasHandle_t handle,
+    cudaStream_t stream,
+    const LlmcNormuonConfig* config,
+    int family_id,
+    int width,
+    int matrix_count,
+    const float** direction_out,
+    bool phase_precomputed = false) {
+    const size_t matrix_elements = static_cast<size_t>(width) * width;
+    const size_t total_elements =
+        static_cast<size_t>(matrix_count) * matrix_elements;
+    const uint32_t grid = llmc_normuon_grid_for_count(total_elements);
+    float* normalized = runtime->matrix[0];
+    float* phase = runtime->matrix[1];
+    float* correction = runtime->matrix[2];
+    uint16_t* packed_a = runtime->batch_bf16[0];
+    uint16_t* packed_b = runtime->batch_bf16[1];
+
+    if (!phase_precomputed) {
+        if (!llmc_normuon_tracker_phase_batched_bf16(
+                runtime,
+                handle,
+                stream,
+                family_id,
+                width,
+                matrix_count)) {
+            return false;
+        }
+    }
     if (config->correction_mode ==
         LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
         llmc_normuon_batch_build_damped_diagonal_correction_kernel<<<
@@ -3205,6 +3592,437 @@ inline void llmc_normuon_batch_commit_tracker_metadata(
     }
 }
 
+inline bool llmc_normuon_batch_tracker_family_state(
+    const LlmcNormuonRuntime* runtime,
+    const LlmcOptimizerParameterType* parameter_type,
+    uint64_t global_step,
+    bool* q_valid,
+    uint64_t* age_since_refresh) {
+    if (runtime == nullptr || parameter_type == nullptr || q_valid == nullptr ||
+        age_since_refresh == nullptr) {
+        return false;
+    }
+    bool first_valid = false;
+    int64_t first_last_refresh = -1;
+    bool have_first = false;
+    for (int layer_index = 0;
+         layer_index < parameter_type->layer_multiplicity;
+         ++layer_index) {
+        for (int view_index = 0;
+             view_index < parameter_type->views_per_layer;
+             ++view_index) {
+            const size_t q_index = llmc_normuon_q_view_index(
+                parameter_type, layer_index, view_index, false);
+            if (q_index >= runtime->tracked_q_view_count) {
+                return false;
+            }
+            const bool current_valid = runtime->q_valid[q_index] != 0U;
+            const int64_t current_last_refresh =
+                runtime->last_refresh_step[q_index];
+            if (!have_first) {
+                first_valid = current_valid;
+                first_last_refresh = current_last_refresh;
+                have_first = true;
+            } else if (current_valid != first_valid ||
+                       current_last_refresh != first_last_refresh) {
+                return false;
+            }
+        }
+    }
+    if (!have_first) {
+        return false;
+    }
+    *q_valid = first_valid;
+    if (!first_valid) {
+        if (first_last_refresh != -1) {
+            return false;
+        }
+        *age_since_refresh = 0U;
+        return true;
+    }
+    if (first_last_refresh < 0 ||
+        global_step < static_cast<uint64_t>(first_last_refresh)) {
+        return false;
+    }
+    *age_since_refresh =
+        global_step - static_cast<uint64_t>(first_last_refresh);
+    return true;
+}
+
+inline int llmc_normuon_tracker_diagnostic_family_slot(int family_id) {
+    if (family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP) {
+        return 0;
+    }
+    if (family_id == LLMC_OPTIMIZER_FAMILY_MLP_WDOWN) {
+        return 1;
+    }
+    return -1;
+}
+
+inline void llmc_normuon_tracker_diagnostic_sort(
+    float* values,
+    int count) {
+    for (int index = 1; index < count; ++index) {
+        const float value = values[index];
+        int insertion = index;
+        while (insertion > 0 && values[insertion - 1] > value) {
+            values[insertion] = values[insertion - 1];
+            --insertion;
+        }
+        values[insertion] = value;
+    }
+}
+
+inline float llmc_normuon_tracker_diagnostic_quantile(
+    const float* sorted_values,
+    int count,
+    float quantile) {
+    if (sorted_values == nullptr || count <= 0) {
+        return 0.0f;
+    }
+    const float position = quantile * static_cast<float>(count - 1);
+    const int lower = static_cast<int>(floorf(position));
+    const int upper = lower + 1 < count ? lower + 1 : lower;
+    const float fraction = position - static_cast<float>(lower);
+    return sorted_values[lower] * (1.0f - fraction) +
+           sorted_values[upper] * fraction;
+}
+
+inline bool llmc_normuon_batch_commit_tracker_diagnostics(
+    LlmcNormuonRuntime* runtime,
+    const LlmcOptimizerParameterType* parameter_type,
+    uint64_t global_step,
+    bool refreshed,
+    int width,
+    int matrix_count,
+    float correction_gain,
+    float epsilon,
+    float normalization_multiplier) {
+    if (runtime == nullptr || parameter_type == nullptr || width <= 0 ||
+        matrix_count <= 0 || !runtime->tracker_diagnostics_active_step) {
+        return true;
+    }
+    const int slot = llmc_normuon_tracker_diagnostic_family_slot(
+        parameter_type->family_id);
+    if (slot < 0 ||
+        slot >= LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT ||
+        runtime->tracker_host_metric_scratch == nullptr) {
+        return false;
+    }
+    LlmcNormuonTrackerFamilyDiagnostics* diagnostics =
+        &runtime->tracker_step_diagnostics[slot];
+    memset(diagnostics, 0, sizeof(*diagnostics));
+    diagnostics->valid = true;
+    diagnostics->refreshed = refreshed;
+    diagnostics->family_id = parameter_type->family_id;
+    const size_t first_q_index = llmc_normuon_q_view_index(
+        parameter_type, 0, 0, false);
+    if (first_q_index >= runtime->tracked_q_view_count) {
+        return false;
+    }
+    const int64_t last_refresh = runtime->last_refresh_step[first_q_index];
+    diagnostics->age_since_refresh = last_refresh >= 0
+        ? static_cast<int64_t>(global_step) - last_refresh
+        : -1;
+    const size_t view_base =
+        static_cast<size_t>(slot) * runtime->batch_matrix_capacity;
+    if (runtime->tracker_step_view_diagnostics == nullptr ||
+        view_base + static_cast<size_t>(matrix_count) >
+            runtime->tracker_step_view_diagnostic_capacity) {
+        return false;
+    }
+    for (int matrix_index = 0;
+         matrix_index < matrix_count;
+         ++matrix_index) {
+        LlmcNormuonTrackerViewDiagnostics* view_diagnostics =
+            &runtime->tracker_step_view_diagnostics[
+                view_base + static_cast<size_t>(matrix_index)];
+        view_diagnostics->valid = true;
+        view_diagnostics->refreshed = refreshed;
+        view_diagnostics->family_id = parameter_type->family_id;
+        view_diagnostics->matrix_index = matrix_index;
+        view_diagnostics->age_since_refresh =
+            diagnostics->age_since_refresh;
+    }
+
+    if (runtime->lr_dither_response_active_step &&
+        runtime->lr_dither_previous_row_scales_valid[slot] &&
+        runtime->lr_dither_host_response != nullptr &&
+        runtime->lr_dither_host_raw_norm_squared != nullptr) {
+        diagnostics->lr_dither_response_probed = true;
+        const uint64_t dither_source_global_step = global_step - 1U;
+        // Diagnostic logs use the trainer's one-based displayed update step.
+        diagnostics->lr_dither_source_step = dither_source_global_step + 1U;
+        diagnostics->lr_dither_signal = llmc_normuon_lr_dither_signal(
+            runtime,
+            parameter_type->family_id,
+            dither_source_global_step);
+        diagnostics->lr_dither_sign =
+            (diagnostics->lr_dither_signal > 0.0f) -
+            (diagnostics->lr_dither_signal < 0.0f);
+        diagnostics->lr_dither_amplitude = runtime->lr_dither_amplitude;
+        diagnostics->lr_dither_multiplier =
+            llmc_normuon_lr_dither_multiplier(
+                runtime, parameter_type->family_id, dither_source_global_step);
+        double gradient_dot_sum = 0.0;
+        double normalized_trace_sum = 0.0;
+        double raw_trace_sum = 0.0;
+        for (int matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
+            const size_t host_index = view_base +
+                static_cast<size_t>(matrix_index);
+            LlmcNormuonTrackerViewDiagnostics* view_diagnostics =
+                &runtime->tracker_step_view_diagnostics[host_index];
+            const float raw_norm = sqrtf(fmaxf(
+                runtime->lr_dither_host_raw_norm_squared[host_index], 0.0f));
+            const float normalized_trace =
+                runtime->tracker_host_phase_stats[
+                    static_cast<size_t>(matrix_index) *
+                        LLMC_NORMUON_BATCH_STATS_STRIDE + 2U];
+            const float raw_trace = normalized_trace *
+                (normalization_multiplier * raw_norm + epsilon);
+            const float gradient_dot =
+                runtime->lr_dither_host_response[host_index];
+            view_diagnostics->lr_dither_response_probed = true;
+            view_diagnostics->lr_dither_source_step =
+                diagnostics->lr_dither_source_step;
+            view_diagnostics->lr_dither_sign = diagnostics->lr_dither_sign;
+            view_diagnostics->lr_dither_amplitude =
+                diagnostics->lr_dither_amplitude;
+            view_diagnostics->lr_dither_signal =
+                diagnostics->lr_dither_signal;
+            view_diagnostics->lr_dither_multiplier =
+                diagnostics->lr_dither_multiplier;
+            view_diagnostics->gradient_dot_previous_update = gradient_dot;
+            view_diagnostics->raw_nesterov_norm = raw_norm;
+            view_diagnostics->normalized_phase_trace = normalized_trace;
+            view_diagnostics->raw_phase_trace = raw_trace;
+            gradient_dot_sum += static_cast<double>(gradient_dot);
+            normalized_trace_sum += static_cast<double>(normalized_trace);
+            raw_trace_sum += static_cast<double>(raw_trace);
+        }
+        diagnostics->gradient_dot_previous_update_sum =
+            static_cast<float>(gradient_dot_sum);
+        diagnostics->normalized_phase_trace_sum =
+            static_cast<float>(normalized_trace_sum);
+        diagnostics->raw_phase_trace_sum = static_cast<float>(raw_trace_sum);
+    }
+
+    if (runtime->tracker_phase_stats_pending) {
+        double skew_ratio_sum = 0.0;
+        double dimension_normalized_skew_sum = 0.0;
+        double normalized_phase_trace_sum = 0.0;
+        float skew_ratio_max = 0.0f;
+        float dimension_normalized_skew_max = 0.0f;
+        const float dimension_scale = sqrtf(static_cast<float>(width));
+        for (int matrix_index = 0;
+             matrix_index < matrix_count;
+             ++matrix_index) {
+            const float* stats = runtime->tracker_host_phase_stats +
+                static_cast<size_t>(matrix_index) *
+                    LLMC_NORMUON_BATCH_STATS_STRIDE;
+            const float symmetric_norm = sqrtf(fmaxf(stats[0], 0.0f));
+            const float skew_norm = sqrtf(fmaxf(stats[1], 0.0f));
+            const float skew_ratio =
+                skew_norm / (symmetric_norm + epsilon);
+            const float dimension_normalized_skew =
+                skew_norm / dimension_scale;
+            const float normalized_phase_trace = stats[2];
+            LlmcNormuonTrackerViewDiagnostics* view_diagnostics =
+                &runtime->tracker_step_view_diagnostics[
+                    view_base + static_cast<size_t>(matrix_index)];
+            view_diagnostics->phase_probed = true;
+            view_diagnostics->skew_ratio = skew_ratio;
+            view_diagnostics->dimension_normalized_skew =
+                dimension_normalized_skew;
+            view_diagnostics->normalized_phase_trace = normalized_phase_trace;
+            view_diagnostics->correction_frobenius =
+                correction_gain * skew_ratio;
+            runtime->tracker_host_metric_scratch[matrix_index] = skew_ratio;
+            skew_ratio_sum += static_cast<double>(skew_ratio);
+            dimension_normalized_skew_sum +=
+                static_cast<double>(dimension_normalized_skew);
+            normalized_phase_trace_sum +=
+                static_cast<double>(normalized_phase_trace);
+            skew_ratio_max = fmaxf(skew_ratio_max, skew_ratio);
+            dimension_normalized_skew_max = fmaxf(
+                dimension_normalized_skew_max,
+                dimension_normalized_skew);
+        }
+        llmc_normuon_tracker_diagnostic_sort(
+            runtime->tracker_host_metric_scratch,
+            matrix_count);
+        diagnostics->phase_probe_count =
+            static_cast<uint64_t>(matrix_count);
+        diagnostics->skew_ratio_mean = static_cast<float>(
+            skew_ratio_sum / static_cast<double>(matrix_count));
+        diagnostics->skew_ratio_p50 =
+            llmc_normuon_tracker_diagnostic_quantile(
+                runtime->tracker_host_metric_scratch,
+                matrix_count,
+                0.50f);
+        diagnostics->skew_ratio_p95 =
+            llmc_normuon_tracker_diagnostic_quantile(
+                runtime->tracker_host_metric_scratch,
+                matrix_count,
+                0.95f);
+        diagnostics->skew_ratio_max = skew_ratio_max;
+        diagnostics->dimension_normalized_skew_mean = static_cast<float>(
+            dimension_normalized_skew_sum /
+            static_cast<double>(matrix_count));
+        diagnostics->normalized_phase_trace_sum =
+            static_cast<float>(normalized_phase_trace_sum);
+        diagnostics->dimension_normalized_skew_max =
+            dimension_normalized_skew_max;
+        diagnostics->correction_frobenius_mean =
+            correction_gain * diagnostics->skew_ratio_mean;
+        diagnostics->correction_frobenius_max =
+            correction_gain * diagnostics->skew_ratio_max;
+    }
+
+    if (runtime->tracker_h_stability_pending &&
+        parameter_type->family_id == runtime->tracker_h_stability_family_id) {
+        diagnostics->h_stability_reference_step =
+            runtime->tracker_h_stability_pending_compared
+                ? runtime->tracker_h_stability_pending_reference_step + 1U
+                : 0U;
+        diagnostics->h_stability_interval_steps =
+            runtime->tracker_h_stability_pending_interval_steps;
+        if (runtime->tracker_h_stability_pending_compared) {
+            double current_sum = 0.0;
+            double previous_sum = 0.0;
+            double difference_sum = 0.0;
+            double dot_sum = 0.0;
+            float view_relative_max = 0.0f;
+            for (int matrix_index = 0;
+                 matrix_index < matrix_count;
+                 ++matrix_index) {
+                const float* stats =
+                    runtime->tracker_h_stability_host_stats +
+                    static_cast<size_t>(matrix_index) * 4U;
+                const float current_norm = sqrtf(fmaxf(stats[0], 0.0f));
+                const float previous_norm = sqrtf(fmaxf(stats[1], 0.0f));
+                const float difference_norm = sqrtf(fmaxf(stats[2], 0.0f));
+                const float relative =
+                    difference_norm / (previous_norm + epsilon);
+                const float cosine = fminf(
+                    1.0f,
+                    fmaxf(
+                        -1.0f,
+                        stats[3] /
+                            (current_norm * previous_norm + epsilon)));
+                const float norm_ratio =
+                    current_norm / (previous_norm + epsilon);
+                LlmcNormuonTrackerViewDiagnostics* view_diagnostics =
+                    &runtime->tracker_step_view_diagnostics[
+                        view_base + static_cast<size_t>(matrix_index)];
+                view_diagnostics->h_stability_compared = true;
+                view_diagnostics->h_stability_reference_step =
+                    diagnostics->h_stability_reference_step;
+                view_diagnostics->h_stability_interval_steps =
+                    diagnostics->h_stability_interval_steps;
+                view_diagnostics->h_relative_frobenius = relative;
+                view_diagnostics->h_cosine = cosine;
+                view_diagnostics->h_norm_ratio = norm_ratio;
+                runtime->tracker_host_metric_scratch[matrix_index] = relative;
+                current_sum += static_cast<double>(stats[0]);
+                previous_sum += static_cast<double>(stats[1]);
+                difference_sum += static_cast<double>(stats[2]);
+                dot_sum += static_cast<double>(stats[3]);
+                view_relative_max = fmaxf(view_relative_max, relative);
+            }
+            llmc_normuon_tracker_diagnostic_sort(
+                runtime->tracker_host_metric_scratch,
+                matrix_count);
+            const double current_norm = sqrt(fmax(current_sum, 0.0));
+            const double previous_norm = sqrt(fmax(previous_sum, 0.0));
+            diagnostics->h_stability_comparison_count =
+                static_cast<uint64_t>(matrix_count);
+            diagnostics->h_relative_frobenius = static_cast<float>(
+                sqrt(fmax(difference_sum, 0.0)) /
+                (previous_norm + static_cast<double>(epsilon)));
+            diagnostics->h_cosine = static_cast<float>(fmin(
+                1.0,
+                fmax(
+                    -1.0,
+                    dot_sum /
+                        (current_norm * previous_norm +
+                         static_cast<double>(epsilon)))));
+            diagnostics->h_norm_ratio = static_cast<float>(
+                current_norm /
+                (previous_norm + static_cast<double>(epsilon)));
+            diagnostics->h_view_relative_p50 =
+                llmc_normuon_tracker_diagnostic_quantile(
+                    runtime->tracker_host_metric_scratch,
+                    matrix_count,
+                    0.50f);
+            diagnostics->h_view_relative_p95 =
+                llmc_normuon_tracker_diagnostic_quantile(
+                    runtime->tracker_host_metric_scratch,
+                    matrix_count,
+                    0.95f);
+            diagnostics->h_view_relative_max = view_relative_max;
+        }
+        runtime->tracker_h_stability_pending = false;
+        runtime->tracker_h_stability_pending_compared = false;
+    }
+
+    if (runtime->tracker_refresh_stats_pending) {
+        double cosine_sum = 0.0;
+        double relative_error_sum = 0.0;
+        float cosine_min = 1.0f;
+        float relative_error_max = 0.0f;
+        const float dimension_scale = sqrtf(static_cast<float>(width));
+        for (int matrix_index = 0;
+             matrix_index < matrix_count;
+             ++matrix_index) {
+            const float* stats = runtime->tracker_host_refresh_stats +
+                static_cast<size_t>(matrix_index) *
+                    LLMC_NORMUON_BATCH_STATS_STRIDE;
+            const float denominator =
+                sqrtf(fmaxf(stats[1], 0.0f) * fmaxf(stats[2], 0.0f)) +
+                epsilon;
+            const float cosine = fminf(
+                1.0f,
+                fmaxf(-1.0f, stats[0] / denominator));
+            const float relative_error =
+                sqrtf(fmaxf(stats[3], 0.0f)) / dimension_scale;
+            LlmcNormuonTrackerViewDiagnostics* view_diagnostics =
+                &runtime->tracker_step_view_diagnostics[
+                    view_base + static_cast<size_t>(matrix_index)];
+            view_diagnostics->refresh_compared = true;
+            view_diagnostics->refresh_cosine = cosine;
+            view_diagnostics->refresh_relative_error = relative_error;
+            runtime->tracker_host_metric_scratch[matrix_index] =
+                relative_error;
+            cosine_sum += static_cast<double>(cosine);
+            relative_error_sum += static_cast<double>(relative_error);
+            cosine_min = fminf(cosine_min, cosine);
+            relative_error_max = fmaxf(
+                relative_error_max,
+                relative_error);
+        }
+        llmc_normuon_tracker_diagnostic_sort(
+            runtime->tracker_host_metric_scratch,
+            matrix_count);
+        diagnostics->refresh_comparison_count =
+            static_cast<uint64_t>(matrix_count);
+        diagnostics->refresh_cosine_mean = static_cast<float>(
+            cosine_sum / static_cast<double>(matrix_count));
+        diagnostics->refresh_cosine_min = cosine_min;
+        diagnostics->refresh_relative_error_mean = static_cast<float>(
+            relative_error_sum / static_cast<double>(matrix_count));
+        diagnostics->refresh_relative_error_p95 =
+            llmc_normuon_tracker_diagnostic_quantile(
+                runtime->tracker_host_metric_scratch,
+                matrix_count,
+                0.95f);
+        diagnostics->refresh_relative_error_max = relative_error_max;
+    }
+    runtime->tracker_phase_stats_pending = false;
+    runtime->tracker_refresh_stats_pending = false;
+    return true;
+}
+
 inline bool llmc_normuon_update_parameter_type_batched_bf16(
     LlmcNormuonRuntime* runtime,
     cublasHandle_t handle,
@@ -3240,6 +4058,9 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
         family_mode == LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q;
     const bool rectangular_cache =
         family_mode == LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON;
+    const bool rectangular_fresh_gns_scratch =
+        family_mode == LLMC_NORMUON_ORTHO_RECTANGULAR_MUON &&
+        llmc_normuon_uses_fresh_gns_scratch(config);
     // Split mode shares one over-sized workspace allocation, but the active
     // family still needs its native panel stride.  Switching this stride at
     // the family boundary keeps square Wup GEMMs contiguous while retaining
@@ -3257,10 +4078,21 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
                ? width
                : 4 * width)
         : width;
+    const int lr_dither_family_slot =
+        llmc_normuon_lr_dither_family_slot(parameter_type->family_id);
+    if (runtime->lr_dither_enabled &&
+        (family_mode != LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q ||
+         lr_dither_family_slot < 0 ||
+         runtime->lr_dither_matrix_width != static_cast<size_t>(width))) {
+        return false;
+    }
     const float learning_rate_multiplier =
         parameter_type->family_id == LLMC_OPTIMIZER_FAMILY_MLP_WDOWN
             ? config->wdown_learning_rate_multiplier
             : 1.0f;
+    const float effective_learning_rate_multiplier =
+        learning_rate_multiplier * llmc_normuon_lr_dither_multiplier(
+            runtime, parameter_type->family_id, global_step);
     const int matrix_count = parameter_type->layer_multiplicity *
                              parameter_type->views_per_layer;
     if (width <= 0 || matrix_count <= 0 ||
@@ -3276,6 +4108,50 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
     }
     cublasCheck(cublasSetStream(handle, stream));
     llmc_normuon_reset_guard(runtime, stream);
+    if (runtime->tracker_diagnostics_active_step) {
+        runtime->tracker_phase_stats_pending = false;
+        runtime->tracker_refresh_stats_pending = false;
+    }
+    const size_t lr_dither_view_base = lr_dither_family_slot >= 0
+        ? static_cast<size_t>(lr_dither_family_slot) *
+              runtime->batch_matrix_capacity
+        : 0U;
+    const size_t lr_dither_row_scale_base = lr_dither_family_slot >= 0
+        ? lr_dither_view_base * static_cast<size_t>(width)
+        : 0U;
+    const bool lr_dither_response_for_family =
+        runtime->lr_dither_response_active_step &&
+        lr_dither_family_slot >= 0 &&
+        runtime->lr_dither_previous_row_scales_valid[lr_dither_family_slot];
+    if (lr_dither_response_for_family) {
+        if (lr_dither_family_slot < 0 ||
+            runtime->lr_dither_device_response == nullptr ||
+            runtime->lr_dither_host_response == nullptr) {
+            return false;
+        }
+        llmc_normuon_batch_previous_update_gradient_dot_kernel<<<
+            static_cast<uint32_t>(matrix_count),
+            LLMC_NORMUON_BLOCK_SIZE,
+            0,
+            stream>>>(
+            gradient,
+            runtime->tracked_q,
+            runtime->lr_dither_previous_row_scales +
+                lr_dither_row_scale_base,
+            runtime->lr_dither_device_response,
+            runtime->nonfinite_flag,
+            matrix_count,
+            width,
+            parameter_type->family_id,
+            gradient_scale);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpyAsync(
+            runtime->lr_dither_host_response + lr_dither_view_base,
+            runtime->lr_dither_device_response,
+            static_cast<size_t>(matrix_count) * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream));
+    }
     if (rectangular) {
         llmc_normuon_batch_prepare_rectangular_momentum_kernel<<<
             static_cast<uint32_t>(matrix_count),
@@ -3311,6 +4187,34 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
         gradient_scale);
     }
     cudaCheck(cudaGetLastError());
+    const float normalization_multiplier =
+        (rectangular_cache || rectangular_fresh_gns_scratch) ? 1.0f : 1.02f;
+    const float normalization_epsilon =
+        (rectangular_cache || rectangular_fresh_gns_scratch)
+            ? LLMC_CACHEMUON_EPSILON
+            : config->epsilon;
+    if (lr_dither_response_for_family) {
+        if (runtime->lr_dither_device_raw_norm_squared == nullptr ||
+            runtime->lr_dither_host_raw_norm_squared == nullptr) {
+            return false;
+        }
+        const uint32_t norm_grid = static_cast<uint32_t>(
+            (static_cast<size_t>(matrix_count) +
+             LLMC_NORMUON_BLOCK_SIZE - 1U) /
+            LLMC_NORMUON_BLOCK_SIZE);
+        llmc_normuon_batch_copy_norm_squared_kernel<<<
+            norm_grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+            runtime->stats,
+            runtime->lr_dither_device_raw_norm_squared,
+            static_cast<size_t>(matrix_count));
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpyAsync(
+            runtime->lr_dither_host_raw_norm_squared + lr_dither_view_base,
+            runtime->lr_dither_device_raw_norm_squared,
+            static_cast<size_t>(matrix_count) * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream));
+    }
     const uint32_t grid = llmc_normuon_grid_for_count(total_elements);
     llmc_normuon_batch_normalize_pack_bf16_kernel<<<
         grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
@@ -3320,28 +4224,66 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
         runtime->nonfinite_flag,
         total_elements,
         matrix_elements,
-        llmc_normuon_is_cache_mode(family_mode) ? 1.0f : 1.02f,
-        llmc_normuon_is_cache_mode(family_mode) ? LLMC_CACHEMUON_EPSILON
-                                                : config->epsilon);
+        normalization_multiplier,
+        normalization_epsilon);
     cudaCheck(cudaGetLastError());
+
+    const bool capture_tracker_h_stability =
+        family_mode == LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q &&
+        runtime->tracker_diagnostics_active_step &&
+        parameter_type->family_id == runtime->tracker_h_stability_family_id &&
+        runtime->tracker_h_stability_normalized != nullptr &&
+        total_elements <= runtime->tracker_h_stability_elements;
+    if (capture_tracker_h_stability) {
+        cudaCheck(cudaMemcpyAsync(
+            runtime->tracker_h_stability_normalized,
+            runtime->matrix[0],
+            total_elements * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            stream));
+    }
 
     const float* direction = runtime->matrix[0];
     bool refreshed = false;
+    bool tracker_q_was_valid = false;
+    bool tracker_phase_precomputed = false;
+    bool tracker_adaptive_mean_pending = false;
+    int tracker_adaptive_family_slot = -1;
     float* cache_refreshed_transform = nullptr;
     int cache_miss_count = 0;
     if (rectangular && !rectangular_tracker && !rectangular_cache) {
-        if (!llmc_normuon_apply_rectangular_polynomial_batched_bf16(
-                runtime,
-                handle,
-                stream,
-                runtime->matrix[0],
-                runtime->matrix[1],
-                rows,
-                columns,
-                matrix_count,
-                LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT,
-                config->refresh_schedule)) {
-            return false;
+        if (rectangular_fresh_gns_scratch) {
+            float* fresh_direction = nullptr;
+            float* unused_transform = nullptr;
+            if (!llmc_cachemuon_fresh_gns_batched_bf16(
+                    runtime,
+                    handle,
+                    stream,
+                    runtime->matrix[0],
+                    runtime->matrix[1],
+                    rows,
+                    columns,
+                    matrix_count,
+                    runtime->matrix_elements,
+                    &fresh_direction,
+                    &unused_transform)) {
+                return false;
+            }
+            direction = fresh_direction;
+        } else {
+            if (!llmc_normuon_apply_rectangular_polynomial_batched_bf16(
+                    runtime,
+                    handle,
+                    stream,
+                    runtime->matrix[0],
+                    runtime->matrix[1],
+                    rows,
+                    columns,
+                    matrix_count,
+                    LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT,
+                    config->refresh_schedule)) {
+                return false;
+            }
         }
     } else if (rectangular_cache) {
         if (!llmc_cachemuon_direction_batched_bf16(
@@ -3419,15 +4361,108 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
             return false;
         }
     } else {
-        if (!llmc_normuon_batch_tracker_refresh_state(
-                runtime,
-                parameter_type,
-                global_step,
-                config->refresh_interval,
-                &refreshed)) {
+        const size_t first_q_index = llmc_normuon_q_view_index(
+            parameter_type, 0, 0, false);
+        if (first_q_index >= runtime->tracked_q_view_count) {
             return false;
         }
+        if (config->tracker_refresh_mode ==
+            LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW) {
+            uint64_t age_since_refresh = 0U;
+            if (!llmc_normuon_batch_tracker_family_state(
+                    runtime,
+                    parameter_type,
+                    global_step,
+                    &tracker_q_was_valid,
+                    &age_since_refresh)) {
+                return false;
+            }
+            tracker_adaptive_family_slot =
+                parameter_type->family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+                    ? 0
+                    : (parameter_type->family_id ==
+                               LLMC_OPTIMIZER_FAMILY_MLP_WDOWN
+                           ? 1
+                           : -1);
+            if (tracker_adaptive_family_slot < 0 ||
+                runtime->tracker_adaptive_host_mean_skew_ratio == nullptr) {
+                return false;
+            }
+            if (!tracker_q_was_valid) {
+                refreshed = true;
+                runtime->tracker_adaptive_refresh_due[
+                    tracker_adaptive_family_slot] = false;
+                runtime->tracker_adaptive_initial_refresh_count[
+                    tracker_adaptive_family_slot]++;
+            } else if (runtime->tracker_adaptive_refresh_due[
+                           tracker_adaptive_family_slot]) {
+                refreshed = true;
+                runtime->tracker_adaptive_refresh_due[
+                    tracker_adaptive_family_slot] = false;
+                runtime->tracker_adaptive_threshold_refresh_count[
+                    tracker_adaptive_family_slot]++;
+            } else if (age_since_refresh >=
+                       config->tracker_max_refresh_age) {
+                refreshed = true;
+                runtime->tracker_adaptive_refresh_due[
+                    tracker_adaptive_family_slot] = false;
+                runtime->tracker_adaptive_forced_refresh_count[
+                    tracker_adaptive_family_slot]++;
+            } else if (age_since_refresh > 0U) {
+                if (!llmc_normuon_tracker_phase_batched_bf16(
+                        runtime,
+                        handle,
+                        stream,
+                        parameter_type->family_id,
+                        width,
+                        matrix_count)) {
+                    return false;
+                }
+                tracker_phase_precomputed = true;
+                float* device_mean_skew_ratio =
+                    runtime->stats +
+                    runtime->batch_matrix_capacity *
+                        LLMC_NORMUON_BATCH_STATS_STRIDE;
+                llmc_normuon_batch_mean_skew_ratio_kernel<<<
+                    1U, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+                    runtime->stats,
+                    device_mean_skew_ratio,
+                    runtime->nonfinite_flag,
+                    static_cast<size_t>(matrix_count),
+                    config->epsilon);
+                cudaCheck(cudaGetLastError());
+                cudaCheck(cudaMemcpyAsync(
+                    runtime->tracker_adaptive_host_mean_skew_ratio,
+                    device_mean_skew_ratio,
+                    sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream));
+                tracker_adaptive_mean_pending = true;
+            }
+        } else {
+            if (!llmc_normuon_batch_tracker_refresh_state(
+                    runtime,
+                    parameter_type,
+                    global_step,
+                    config->refresh_interval,
+                    &refreshed)) {
+                return false;
+            }
+            tracker_q_was_valid = runtime->q_valid[first_q_index] != 0U;
+        }
         if (refreshed) {
+            if (runtime->tracker_diagnostics_active_step &&
+                tracker_q_was_valid &&
+                !tracker_phase_precomputed &&
+                !llmc_normuon_tracker_phase_batched_bf16(
+                    runtime,
+                    handle,
+                    stream,
+                    parameter_type->family_id,
+                    width,
+                    matrix_count)) {
+                return false;
+            }
             if (!llmc_normuon_apply_polynomial_batched_bf16(
                     runtime,
                     handle,
@@ -3440,6 +4475,33 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
                     config->refresh_schedule)) {
                 return false;
             }
+            if (runtime->tracker_diagnostics_active_step &&
+                tracker_q_was_valid) {
+                if (runtime->tracker_host_refresh_stats == nullptr) {
+                    return false;
+                }
+                llmc_normuon_batch_refresh_comparison_stats_kernel<<<
+                    static_cast<uint32_t>(matrix_count),
+                    LLMC_NORMUON_BLOCK_SIZE,
+                    0,
+                    stream>>>(
+                    runtime->matrix[0],
+                    runtime->tracked_q,
+                    runtime->stats,
+                    runtime->nonfinite_flag,
+                    matrix_count,
+                    matrix_elements,
+                    parameter_type->family_id);
+                cudaCheck(cudaGetLastError());
+                cudaCheck(cudaMemcpyAsync(
+                    runtime->tracker_host_refresh_stats,
+                    runtime->stats,
+                    static_cast<size_t>(matrix_count) *
+                        LLMC_NORMUON_BATCH_STATS_STRIDE * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream));
+                runtime->tracker_refresh_stats_pending = true;
+            }
         } else if (!llmc_normuon_tracker_direction_batched_bf16(
                        runtime,
                        handle,
@@ -3448,9 +4510,22 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
                        parameter_type->family_id,
                        width,
                        matrix_count,
-                       &direction)) {
+                       &direction,
+                       tracker_phase_precomputed)) {
             return false;
         }
+    }
+
+    if (capture_tracker_h_stability &&
+        !llmc_normuon_capture_tracker_h_stability_post_update_batched_bf16(
+            runtime,
+            handle,
+            stream,
+            parameter_type->family_id,
+            width,
+            matrix_count,
+            direction)) {
+        return false;
     }
 
     if (rectangular) {
@@ -3503,7 +4578,7 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
             learning_rate,
             config->weight_decay,
             config->update_scale,
-            learning_rate_multiplier);
+            effective_learning_rate_multiplier);
     } else {
         llmc_normuon_batch_validate_update_kernel<<<
             grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
@@ -3518,11 +4593,54 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
             learning_rate,
             config->weight_decay,
             config->update_scale,
-            learning_rate_multiplier);
+            effective_learning_rate_multiplier);
     }
     cudaCheck(cudaGetLastError());
     if (!llmc_normuon_guard_ok(runtime, stream)) {
         return false;
+    }
+    if (tracker_adaptive_mean_pending) {
+        const float mean_skew_ratio =
+            *runtime->tracker_adaptive_host_mean_skew_ratio;
+        if (!isfinite(mean_skew_ratio) || tracker_adaptive_family_slot < 0) {
+            return false;
+        }
+        runtime->tracker_adaptive_check_count[
+            tracker_adaptive_family_slot]++;
+        const float threshold =
+            parameter_type->family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+                ? config->tracker_wup_skew_threshold
+                : config->tracker_wdown_skew_threshold;
+        runtime->tracker_adaptive_refresh_due[
+            tracker_adaptive_family_slot] = mean_skew_ratio >= threshold;
+    }
+    if (family_mode == LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q &&
+        !llmc_normuon_batch_commit_tracker_diagnostics(
+            runtime,
+            parameter_type,
+            global_step,
+            refreshed,
+            width,
+            matrix_count,
+            config->correction_gain,
+            config->epsilon,
+            normalization_multiplier)) {
+        return false;
+    }
+    if (runtime->lr_dither_pulse_active_step) {
+        if (lr_dither_family_slot < 0 ||
+            runtime->lr_dither_previous_row_scales == nullptr) {
+            return false;
+        }
+        cudaCheck(cudaMemcpyAsync(
+            runtime->lr_dither_previous_row_scales +
+                lr_dither_row_scale_base,
+            runtime->axis_stats,
+            static_cast<size_t>(matrix_count) * width * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            stream));
+        runtime->lr_dither_previous_row_scales_valid[
+            lr_dither_family_slot] = true;
     }
     if (rectangular_cache && cache_miss_count > 0) {
         if (cache_refreshed_transform == nullptr) {
@@ -3573,7 +4691,7 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
             learning_rate,
             config->weight_decay,
             config->update_scale,
-            learning_rate_multiplier,
+            effective_learning_rate_multiplier,
             global_step,
             parameter_type->tensor_id,
             rectangular_tracker ? runtime->tracked_q : nullptr,
@@ -3594,12 +4712,138 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
             learning_rate,
             config->weight_decay,
             config->update_scale,
-            learning_rate_multiplier,
+            effective_learning_rate_multiplier,
             global_step,
             parameter_type->tensor_id);
     }
     cudaCheck(cudaGetLastError());
     return true;
+}
+
+__global__ void llmc_normuon_batch_replay_set_square_wdown_kernel(
+    floatX* parameter,
+    float* master,
+    const float* base_master,
+    const float* tracked_q,
+    const float* row_scales,
+    const floatX* reference_parameter,
+    unsigned long long* changed_count,
+    int* nonfinite,
+    size_t total_elements,
+    size_t matrix_elements,
+    size_t width,
+    float extra_learning_rate,
+    uint64_t global_step,
+    int tensor_id) {
+    size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    for (; linear < total_elements; linear += stride) {
+        const size_t matrix_index = linear / matrix_elements;
+        const size_t index = linear - matrix_index * matrix_elements;
+        const size_t layer_index =
+            matrix_index / LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+        const size_t view_index = matrix_index -
+            layer_index * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+        const size_t row = index / width;
+        const size_t parameter_offset = llmc_normuon_batch_tensor_offset(
+            LLMC_OPTIMIZER_FAMILY_MLP_WDOWN,
+            matrix_index,
+            index,
+            width);
+        const size_t q_offset = llmc_normuon_batch_q_offset(
+            LLMC_OPTIMIZER_FAMILY_MLP_WDOWN,
+            matrix_index,
+            index,
+            matrix_elements);
+        const float candidate = base_master[parameter_offset] -
+            extra_learning_rate * tracked_q[q_offset] *
+                row_scales[matrix_index * width + row];
+        if (!isfinite(candidate) || !isfinite(tracked_q[q_offset]) ||
+            !isfinite(row_scales[matrix_index * width + row])) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        master[parameter_offset] = candidate;
+        const uint32_t seed = llmc_normuon_rounding_seed(
+            global_step,
+            tensor_id,
+            static_cast<int>(layer_index),
+            static_cast<int>(view_index));
+        floatX rounded;
+        llmc_normuon_stochastic_round(candidate, &rounded, seed, index);
+        if (reference_parameter != nullptr && changed_count != nullptr &&
+            static_cast<float>(rounded) !=
+                static_cast<float>(reference_parameter[parameter_offset])) {
+            atomicAdd(changed_count, 1ULL);
+        }
+        parameter[parameter_offset] = rounded;
+    }
+}
+
+inline bool llmc_normuon_batch_replay_set_square_wdown(
+    LlmcNormuonRuntime* runtime,
+    cudaStream_t stream,
+    floatX* parameter,
+    float* master,
+    const float* base_master,
+    const LlmcOptimizerParameterType* parameter_type,
+    const LlmcNormuonConfig* config,
+    float learning_rate,
+    float extra_multiplier,
+    uint64_t global_step,
+    const floatX* reference_parameter = nullptr,
+    unsigned long long* changed_count = nullptr,
+    const float* row_scales_override = nullptr) {
+    if (runtime == nullptr || parameter == nullptr || master == nullptr ||
+        base_master == nullptr || parameter_type == nullptr || config == nullptr ||
+        parameter_type->family_id != LLMC_OPTIMIZER_FAMILY_MLP_WDOWN ||
+        parameter_type->views_per_layer != LLMC_NORMUON_VIEWS_PER_MLP_MATRIX ||
+        config->orthogonalization_mode != LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q ||
+        config->execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
+        runtime->tracked_q == nullptr || runtime->axis_stats == nullptr ||
+        runtime->nonfinite_flag == nullptr || !(learning_rate > 0.0f) ||
+        !isfinite(extra_multiplier)) {
+        return false;
+    }
+    const size_t width = parameter_type->matrix_width;
+    const size_t matrix_elements = width * width;
+    const size_t matrix_count = static_cast<size_t>(
+        parameter_type->layer_multiplicity * parameter_type->views_per_layer);
+    const size_t total_elements = matrix_count * matrix_elements;
+    if (width == 0U || total_elements != parameter_type->tensor_elements ||
+        matrix_count > runtime->batch_matrix_capacity) {
+        return false;
+    }
+    const float extra_learning_rate = learning_rate * config->update_scale *
+        config->wdown_learning_rate_multiplier * extra_multiplier;
+    const float* replay_row_scales = row_scales_override != nullptr
+        ? row_scales_override
+        : runtime->axis_stats;
+    llmc_normuon_reset_guard(runtime, stream);
+    if (changed_count != nullptr) {
+        cudaCheck(cudaMemsetAsync(
+            changed_count, 0, sizeof(unsigned long long), stream));
+    }
+    llmc_normuon_batch_replay_set_square_wdown_kernel<<<
+        llmc_normuon_grid_for_count(total_elements),
+        LLMC_NORMUON_BLOCK_SIZE,
+        0,
+        stream>>>(
+        parameter,
+        master,
+        base_master,
+        runtime->tracked_q,
+        replay_row_scales,
+        reference_parameter,
+        changed_count,
+        runtime->nonfinite_flag,
+        total_elements,
+        matrix_elements,
+        width,
+        extra_learning_rate,
+        global_step,
+        parameter_type->tensor_id);
+    cudaCheck(cudaGetLastError());
+    return llmc_normuon_guard_ok(runtime, stream);
 }
 
 #endif // LLMC_NORMUON_BATCHED_CUH

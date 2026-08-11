@@ -17,6 +17,129 @@ static int batched_test_failures = 0;
         }                                                                       \
     } while (0)
 
+static void test_lr_dither_schedule() {
+    BATCHED_CHECK(
+        llmc_gpt2_normuon_global_step(200005) == 200004U,
+        "trainer display step and optimizer global step share one boundary conversion");
+    LlmcNormuonRuntime runtime = {};
+    runtime.lr_dither_enabled = true;
+    runtime.lr_dither_amplitude = 0.05f;
+    runtime.lr_dither_interval = 12U;
+    runtime.lr_dither_wup_scale = 1.0f;
+    runtime.lr_dither_wdown_scale = 1.0f;
+    const int expected_wup[4] = {1, 1, -1, -1};
+    const int expected_wdown[4] = {1, -1, 1, -1};
+    for (uint64_t probe = 0U; probe < 4U; ++probe) {
+        const uint64_t step = probe * runtime.lr_dither_interval;
+        BATCHED_CHECK(
+            llmc_normuon_lr_dither_is_pulse_step(&runtime, step),
+            "dither pulse occurs on the requested interval");
+        BATCHED_CHECK(
+            llmc_normuon_lr_dither_is_response_step(&runtime, step + 1U),
+            "dither response is sampled at one-step lag");
+        BATCHED_CHECK(
+            llmc_normuon_lr_dither_sign(
+                LLMC_OPTIMIZER_FAMILY_MLP_WUP,
+                step,
+                runtime.lr_dither_interval) == expected_wup[probe],
+            "Wup dither uses the balanced Walsh sign sequence");
+        BATCHED_CHECK(
+            llmc_normuon_lr_dither_sign(
+                LLMC_OPTIMIZER_FAMILY_MLP_WDOWN,
+                step,
+                runtime.lr_dither_interval) == expected_wdown[probe],
+            "Wdown dither uses an orthogonal balanced Walsh sign sequence");
+    }
+    BATCHED_CHECK(
+        fabsf(llmc_normuon_lr_dither_multiplier(
+                  &runtime, LLMC_OPTIMIZER_FAMILY_MLP_WUP, 0U) -
+              1.05f) < 1.0e-6f,
+        "positive dither multiplier is applied only to the update");
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_multiplier(
+            &runtime, LLMC_OPTIMIZER_FAMILY_MLP_WUP, 1U) == 1.0f,
+        "non-pulse steps preserve the base update multiplier");
+
+    LlmcNormuonRuntime sinusoidal = {};
+    sinusoidal.lr_dither_enabled = true;
+    sinusoidal.lr_dither_mode = LLMC_NORMUON_LR_DITHER_SINUSOIDAL;
+    sinusoidal.lr_dither_amplitude = 0.05f;
+    sinusoidal.lr_dither_wup_period = 8U;
+    sinusoidal.lr_dither_wdown_period = 12U;
+    sinusoidal.lr_dither_phase_polarity = -1.0f;
+    sinusoidal.lr_dither_wup_scale = 1.0f;
+    sinusoidal.lr_dither_wdown_scale = 0.0f;
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_is_pulse_step(&sinusoidal, 3U),
+        "sinusoidal dither records a source update every step");
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_is_response_step(&sinusoidal, 3U),
+        "sinusoidal dither records the continuously driven response");
+    BATCHED_CHECK(
+        !llmc_normuon_lr_dither_is_response_step(&sinusoidal, 0U),
+        "sinusoidal dither has no response before a source update exists");
+    BATCHED_CHECK(
+        fabsf(llmc_normuon_lr_dither_multiplier(
+                  &sinusoidal, LLMC_OPTIMIZER_FAMILY_MLP_WUP, 2U) -
+              0.95f) < 1.0e-6f,
+        "negative-polarity Wup sine reaches its negative peak at one quarter period");
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_multiplier(
+            &sinusoidal, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 3U) == 1.0f,
+        "a zero family scale leaves Wdown unexcited");
+    BATCHED_CHECK(
+        fabsf(llmc_normuon_lr_dither_signal(
+                  &sinusoidal, LLMC_OPTIMIZER_FAMILY_MLP_WUP, 6U) -
+              1.0f) < 1.0e-6f,
+        "phase polarity reverses the negative half-cycle");
+    sinusoidal.lr_dither_wdown_scale = 1.0f;
+    BATCHED_CHECK(
+        fabsf(llmc_normuon_lr_dither_multiplier(
+                  &sinusoidal, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 3U) -
+              0.95f) < 1.0e-6f,
+        "enabled Wdown uses its independent sinusoidal period");
+
+    LlmcNormuonRuntime heterodyne = {};
+    heterodyne.lr_dither_enabled = true;
+    heterodyne.lr_dither_mode = LLMC_NORMUON_LR_DITHER_HETERODYNE_CHOPPER;
+    heterodyne.lr_dither_amplitude = 0.05f;
+    heterodyne.lr_dither_envelope_blocks = 8U;
+    heterodyne.lr_dither_phase_polarity = 1.0f;
+    heterodyne.lr_dither_wup_scale = 0.0f;
+    heterodyne.lr_dither_wdown_scale = 1.0f;
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_is_pulse_step(&heterodyne, 5U) &&
+        llmc_normuon_lr_dither_is_response_step(&heterodyne, 5U),
+        "heterodyne chopper retains continuous one-step response telemetry");
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_signal(
+            &heterodyne, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 4U) > 0.70f &&
+        llmc_normuon_lr_dither_signal(
+            &heterodyne, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 6U) < -0.70f,
+        "heterodyne chopper uses the +1,0,-1,0 carrier under one slow envelope");
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_multiplier(
+            &heterodyne, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 5U) == 1.0f &&
+        llmc_normuon_lr_dither_multiplier(
+            &heterodyne, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 7U) == 1.0f,
+        "heterodyne chopper zero carrier slots preserve the base learning rate");
+    heterodyne.lr_dither_phase_polarity = -1.0f;
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_signal(
+            &heterodyne, LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, 4U) < -0.70f,
+        "heterodyne envelope polarity is exactly reversible");
+    BATCHED_CHECK(
+        llmc_normuon_lr_dither_multiplier(
+            &heterodyne, LLMC_OPTIMIZER_FAMILY_MLP_WUP, 4U) == 1.0f,
+        "heterodyne family isolation leaves Wup at its base learning rate");
+    BATCHED_CHECK(
+        llmc_parse_normuon_lr_dither_mode(
+            "heterodyne_chopper", &heterodyne.lr_dither_mode) &&
+        strcmp(llmc_normuon_lr_dither_mode_name(heterodyne.lr_dither_mode),
+               "heterodyne_chopper") == 0,
+        "heterodyne chopper round-trips through the native mode surface");
+}
+
 template <typename T>
 static std::vector<T> batched_copy_from_device(const T* device, size_t count) {
     std::vector<T> host(count);
@@ -484,7 +607,222 @@ struct BatchedBuffers {
     float* master = nullptr;
 };
 
-static void run_rectangular_batched_update(int family_id) {
+static void test_tracker_h_stability_kernel() {
+    constexpr size_t width = 2U;
+    constexpr size_t matrix_elements = width * width;
+    float* phase = nullptr;
+    float* previous_h = nullptr;
+    float* stats = nullptr;
+    int* nonfinite = nullptr;
+    cudaCheck(cudaMalloc(&phase, matrix_elements * sizeof(float)));
+    cudaCheck(cudaMalloc(&previous_h, matrix_elements * sizeof(float)));
+    cudaCheck(cudaMalloc(&stats, 4U * sizeof(float)));
+    cudaCheck(cudaMalloc(&nonfinite, sizeof(int)));
+    cudaCheck(cudaMemset(previous_h, 0, matrix_elements * sizeof(float)));
+    cudaCheck(cudaMemset(nonfinite, 0, sizeof(int)));
+
+    batched_copy_to_device(
+        phase,
+        std::vector<float>{2.0f, 1.0f, 3.0f, 4.0f});
+    llmc_normuon_batch_h_stability_kernel<<<
+        1U, LLMC_NORMUON_BLOCK_SIZE, 0, main_stream>>>(
+        phase,
+        previous_h,
+        stats,
+        nonfinite,
+        1U,
+        matrix_elements,
+        matrix_elements,
+        width,
+        false);
+    cudaCheck(cudaGetLastError());
+    cudaCheck(cudaStreamSynchronize(main_stream));
+    const std::vector<float> first_history =
+        batched_copy_from_device(previous_h, matrix_elements);
+    BATCHED_CHECK(
+        batched_max_abs_difference(
+            first_history,
+            std::vector<float>{2.0f, 2.0f, 2.0f, 4.0f}) == 0.0f,
+        "H-stability snapshot stores the symmetric normalized phase");
+
+    batched_copy_to_device(
+        phase,
+        std::vector<float>{3.0f, 0.0f, 4.0f, 5.0f});
+    llmc_normuon_batch_h_stability_kernel<<<
+        1U, LLMC_NORMUON_BLOCK_SIZE, 0, main_stream>>>(
+        phase,
+        previous_h,
+        stats,
+        nonfinite,
+        1U,
+        matrix_elements,
+        matrix_elements,
+        width,
+        true);
+    cudaCheck(cudaGetLastError());
+    cudaCheck(cudaStreamSynchronize(main_stream));
+    const std::vector<float> measured = batched_copy_from_device(stats, 4U);
+    BATCHED_CHECK(
+        fabsf(measured[0] - 42.0f) < 1.0e-6f &&
+            fabsf(measured[1] - 28.0f) < 1.0e-6f &&
+            fabsf(measured[2] - 2.0f) < 1.0e-6f &&
+            fabsf(measured[3] - 34.0f) < 1.0e-6f,
+        "H-stability kernel reports current, previous, delta, and dot energies");
+    const std::vector<float> second_history =
+        batched_copy_from_device(previous_h, matrix_elements);
+    BATCHED_CHECK(
+        batched_max_abs_difference(
+            second_history,
+            std::vector<float>{3.0f, 2.0f, 2.0f, 5.0f}) == 0.0f,
+        "H-stability snapshot advances only after measuring the prior state");
+
+    cudaCheck(cudaFree(phase));
+    cudaCheck(cudaFree(previous_h));
+    cudaCheck(cudaFree(stats));
+    cudaCheck(cudaFree(nonfinite));
+}
+
+static void test_square_wdown_batch_replay_restore() {
+    constexpr int width = 2;
+    constexpr int layers = 1;
+    LlmcNormuonConfig config;
+    llmc_normuon_config_defaults(&config);
+    config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
+    config.orthogonalization_mode = LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q;
+    config.update_scale = 1.0f;
+    config.wdown_learning_rate_multiplier = 1.0f;
+
+    LlmcOptimizerPlan plan = batched_plan(width, layers);
+    LlmcOptimizerParameterType parameter_type = batched_parameter_type(
+        LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, width, layers);
+    const size_t elements = parameter_type.tensor_elements;
+    const size_t matrix_count = static_cast<size_t>(
+        parameter_type.layer_multiplicity * parameter_type.views_per_layer);
+
+    LlmcNormuonRuntime runtime;
+    llmc_normuon_runtime_reset(&runtime);
+    BATCHED_CHECK(
+        llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+        "square tracker runtime allocates for batch replay");
+    BATCHED_CHECK(
+        runtime.tracked_q != nullptr && runtime.axis_stats != nullptr,
+        "square tracker replay owns Q and row-scale state");
+
+    std::vector<float> master(elements);
+    for (size_t index = 0; index < elements; ++index) {
+        master[index] = 0.12345f + 0.001f * static_cast<float>(index);
+    }
+    std::vector<float> zeros(elements, 0.0f);
+    BatchedBuffers buffers(elements);
+    buffers.load(master, zeros, zeros, zeros);
+    std::vector<float> tracked_q(runtime.tracked_q_bytes / sizeof(float), 1.0f);
+    std::vector<float> row_scales(matrix_count * width, 2.0f);
+    batched_copy_to_device(runtime.tracked_q, tracked_q);
+    batched_copy_to_device(runtime.axis_stats, row_scales);
+
+    float* snapshot = nullptr;
+    cudaCheck(cudaMalloc(&snapshot, elements * sizeof(float)));
+    cudaCheck(cudaMemcpy(
+        snapshot,
+        buffers.master,
+        elements * sizeof(float),
+        cudaMemcpyDeviceToDevice));
+    BATCHED_CHECK(
+        llmc_normuon_batch_replay_set_square_wdown(
+            &runtime,
+            main_stream,
+            buffers.parameter,
+            buffers.master,
+            snapshot,
+            &parameter_type,
+            &config,
+            0.1f,
+            0.0f,
+            17U),
+        "baseline stochastic rounding for replay test succeeds");
+    const std::vector<floatX> parameter_before =
+        batched_copy_from_device(buffers.parameter, elements);
+    const uint64_t replay_rounding_step = 17U ^ 0xd1b54a32d192ed03ULL;
+    BATCHED_CHECK(
+        llmc_normuon_batch_replay_set_square_wdown(
+            &runtime,
+            main_stream,
+            buffers.parameter,
+            buffers.master,
+            snapshot,
+            &parameter_type,
+            &config,
+            0.1f,
+            0.0f,
+            replay_rounding_step),
+        "common-random replay center rounding succeeds");
+    const std::vector<floatX> replay_center =
+        batched_copy_from_device(buffers.parameter, elements);
+    BATCHED_CHECK(
+        llmc_normuon_batch_replay_set_square_wdown(
+            &runtime,
+            main_stream,
+            buffers.parameter,
+            buffers.master,
+            snapshot,
+            &parameter_type,
+            &config,
+            0.1f,
+            0.5f,
+            replay_rounding_step),
+        "positive square Wdown replay perturbation succeeds");
+    const std::vector<float> advanced =
+        batched_copy_from_device(buffers.master, elements);
+    std::vector<float> expected_advanced = master;
+    for (float& value : expected_advanced) {
+        value -= 0.1f;
+    }
+    BATCHED_CHECK(
+        batched_max_abs_difference(
+            advanced, expected_advanced) < 1.0e-6f,
+        "replay applies the requested extra LR multiple to Q times row scale");
+    const std::vector<floatX> replay_advanced =
+        batched_copy_from_device(buffers.parameter, elements);
+    BATCHED_CHECK(
+        std::memcmp(
+            replay_center.data(),
+            replay_advanced.data(),
+            elements * sizeof(floatX)) != 0,
+        "common-random replay exposes a BF16-resolved perturbation");
+
+    BATCHED_CHECK(
+        llmc_normuon_batch_replay_set_square_wdown(
+            &runtime,
+            main_stream,
+            buffers.parameter,
+            buffers.master,
+            snapshot,
+            &parameter_type,
+            &config,
+            0.1f,
+            0.0f,
+            17U),
+        "zero-offset replay restore succeeds");
+    const std::vector<float> restored =
+        batched_copy_from_device(buffers.master, elements);
+    BATCHED_CHECK(
+        batched_max_abs_difference(restored, master) == 0.0f,
+        "batch replay restores committed FP32 Wdown masters exactly");
+    const std::vector<floatX> parameter_restored =
+        batched_copy_from_device(buffers.parameter, elements);
+    BATCHED_CHECK(
+        std::memcmp(
+            parameter_before.data(),
+            parameter_restored.data(),
+            elements * sizeof(floatX)) == 0,
+        "batch replay restores committed BF16 Wdown parameters bit-exactly");
+
+    cudaCheck(cudaFree(snapshot));
+    llmc_normuon_runtime_free(&runtime);
+}
+
+static void run_rectangular_batched_update(int family_id, bool fresh_gns) {
     constexpr int width = 3;
     constexpr int layers = 2;
     constexpr size_t matrix_elements = 4U * width * width;
@@ -494,6 +832,9 @@ static void run_rectangular_batched_update(int family_id) {
     config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
     config.execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
     config.orthogonalization_mode = LLMC_NORMUON_ORTHO_RECTANGULAR_MUON;
+    config.refresh_policy = fresh_gns
+        ? LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS
+        : LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC;
     config.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
     llmc_normuon_resolve_schedules(&config);
     LlmcOptimizerPlan plan = batched_plan(width, layers);
@@ -531,6 +872,12 @@ static void run_rectangular_batched_update(int family_id) {
     BATCHED_CHECK(
         llmc_normuon_runtime_allocate(&runtime, &plan, &config),
         "rectangular batched runtime allocates");
+    BATCHED_CHECK(
+        (fresh_gns && runtime.cache_small[0] != nullptr &&
+         runtime.cache_small[LLMC_CACHEMUON_SMALL_PANEL_COUNT - 1U] != nullptr &&
+         runtime.cache_residuals == nullptr && runtime.tracked_q == nullptr) ||
+            (!fresh_gns && runtime.cache_small[0] == nullptr),
+        "rectangular scratch FreshGNS owns compact solver panels but no cache state");
     BatchedBuffers buffers(tensor_elements);
     buffers.load(master, gradient, momentum, second);
     BATCHED_CHECK(
@@ -557,8 +904,10 @@ static void run_rectangular_batched_update(int family_id) {
 }
 
 static void test_rectangular_batched_update() {
-    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WUP);
-    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WUP, false);
+    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, false);
+    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WUP, true);
+    run_rectangular_batched_update(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN, true);
 }
 
 static void run_rectangular_batched_tracker(int family_id) {
@@ -931,7 +1280,25 @@ static void test_execution_mode_and_workspace() {
         llmc_parse_normuon_approximation_policy(
             "cache_muon_gram_gns", &approximation) &&
             approximation == LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS,
-        "CacheMuon FreshGNS policy parses explicitly");
+        "FreshGNS policy parses explicitly");
+
+    LlmcNormuonConfig fresh_scratch = config;
+    fresh_scratch.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    fresh_scratch.orthogonalization_mode = LLMC_NORMUON_ORTHO_RECTANGULAR_MUON;
+    fresh_scratch.refresh_policy = LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS;
+    fresh_scratch.retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+    char config_error[256];
+    BATCHED_CHECK(
+        llmc_normuon_validate_config(
+            &fresh_scratch, config_error, sizeof(config_error)),
+        "rectangular scratch accepts FreshGNS as an every-step solver");
+    LlmcNormuonConfig invalid_fresh_scratch = fresh_scratch;
+    invalid_fresh_scratch.orthogonalization_mode =
+        LLMC_NORMUON_ORTHO_NEWTON_SCHULZ;
+    BATCHED_CHECK(
+        !llmc_normuon_validate_config(
+            &invalid_fresh_scratch, config_error, sizeof(config_error)),
+        "square scratch rejects the rectangular FreshGNS solver policy");
 
     LlmcNormuonTrackerRetractionMode retraction =
         LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
@@ -981,7 +1348,6 @@ static void test_execution_mode_and_workspace() {
         LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER;
     commuted.retraction_mode =
         LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
-    char config_error[256];
     BATCHED_CHECK(
         llmc_normuon_validate_config(
             &commuted, config_error, sizeof(config_error)),
@@ -1881,6 +2247,252 @@ static void test_polynomial_factor_override_preserves_packed_q() {
     llmc_normuon_runtime_free(&runtime);
 }
 
+static void test_batched_adaptive_tracker_refresh() {
+    constexpr int width = 8;
+    constexpr int layers = 1;
+    constexpr float learning_rate = 0.01f;
+    constexpr int family_id = LLMC_OPTIMIZER_FAMILY_MLP_WUP;
+    const size_t matrix_elements = static_cast<size_t>(width) * width;
+    const size_t matrix_count =
+        static_cast<size_t>(layers) * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+    const size_t tensor_elements = matrix_count * matrix_elements;
+
+    LlmcNormuonConfig config;
+    llmc_normuon_config_defaults(&config);
+    config.optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config.execution_mode = LLMC_NORMUON_EXECUTION_BF16_BATCHED;
+    config.orthogonalization_mode = LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q;
+    config.tracker_refresh_mode =
+        LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW;
+    config.refresh_interval = 3U;
+    config.tracker_max_refresh_age = 9U;
+    config.tracker_wup_skew_threshold = 1.0e6f;
+    config.tracker_wdown_skew_threshold = 1.0e6f;
+    config.refresh_policy = LLMC_NORMUON_APPROX_STOCK_NORMUON_QUINTIC;
+    config.correction_policy = LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
+    config.correction_iterations = 2U;
+    config.retraction_mode =
+        LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2;
+    char config_error[256];
+    BATCHED_CHECK(
+        llmc_normuon_validate_config(
+            &config, config_error, sizeof(config_error)),
+        "adaptive square-tracker configuration validates");
+
+    LlmcOptimizerPlan plan = batched_plan(width, layers);
+    LlmcOptimizerParameterType parameter_type =
+        batched_parameter_type(family_id, width, layers);
+    std::vector<float> master_logical(tensor_elements);
+    std::vector<float> momentum_logical(tensor_elements, 0.0f);
+    std::vector<float> second_physical(tensor_elements, 0.01f);
+    for (size_t index = 0; index < tensor_elements; ++index) {
+        master_logical[index] =
+            0.12f - 0.0005f * static_cast<float>(index % 127U);
+    }
+    const std::vector<float> master_physical =
+        pack_logical_tensor(master_logical, family_id, width);
+    const std::vector<float> momentum_physical =
+        pack_logical_tensor(momentum_logical, family_id, width);
+
+    {
+        BatchedBuffers buffers(tensor_elements);
+        buffers.load(
+            master_physical,
+            pack_logical_tensor(
+                tracker_logical_gradient(width, layers, 0), family_id, width),
+            momentum_physical,
+            second_physical);
+        LlmcNormuonRuntime runtime;
+        llmc_normuon_runtime_reset(&runtime);
+        BATCHED_CHECK(
+            llmc_normuon_runtime_allocate(&runtime, &plan, &config),
+            "adaptive tracker runtime allocates its scalar decision staging");
+        for (uint64_t step = 0U; step <= 9U; ++step) {
+            const std::vector<float> gradient =
+                tracker_logical_gradient(width, layers, static_cast<int>(step));
+            batched_copy_to_device(
+                buffers.gradient,
+                quantize_floatx(
+                    pack_logical_tensor(gradient, family_id, width)));
+            BATCHED_CHECK(
+                llmc_normuon_update_parameter_type_batched_bf16(
+                    &runtime,
+                    cublas_handle,
+                    main_stream,
+                    buffers.parameter,
+                    buffers.gradient,
+                    buffers.momentum,
+                    buffers.second_moment,
+                    buffers.master,
+                    &parameter_type,
+                    &config,
+                    learning_rate,
+                    1.0f,
+                    step),
+                "adaptive tracker high-threshold step succeeds");
+        }
+        cudaCheck(cudaStreamSynchronize(main_stream));
+        BATCHED_CHECK(
+            runtime.tracker_adaptive_initial_refresh_count[0] == 1U &&
+                runtime.tracker_adaptive_check_count[0] == 8U &&
+                runtime.tracker_adaptive_threshold_refresh_count[0] == 0U &&
+                runtime.tracker_adaptive_forced_refresh_count[0] == 1U,
+            "adaptive tracker checks every stale step then forces age nine");
+        for (int view = 0; view < LLMC_NORMUON_VIEWS_PER_MLP_MATRIX; ++view) {
+            const size_t q_index = static_cast<size_t>(view);
+            BATCHED_CHECK(
+                runtime.q_valid[q_index] == 1U &&
+                    runtime.refresh_count[q_index] == 2U &&
+                    runtime.last_refresh_step[q_index] == 9,
+                "adaptive hard ceiling refreshes every family view together");
+        }
+        const char* adaptive_path =
+            "build/test_normuon_batched_adaptive_v8.bin";
+        BATCHED_CHECK(
+            llmc_normuon_save_companion(
+                adaptive_path,
+                10,
+                1,
+                0,
+                &plan,
+                &config,
+                &runtime,
+                main_stream),
+            "adaptive tracker companion saves");
+        LlmcNormuonCompanionInfo adaptive_info;
+        BATCHED_CHECK(
+            llmc_normuon_read_companion_info(
+                adaptive_path, &adaptive_info) &&
+                adaptive_info.config.tracker_refresh_mode ==
+                    LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW &&
+                adaptive_info.config.tracker_max_refresh_age == 9U &&
+                adaptive_info.config.tracker_wup_skew_threshold == 1.0e6f &&
+                !adaptive_info.tracker_adaptive_refresh_due[0],
+            "v8 companion records adaptive state and contract exactly");
+        remove(adaptive_path);
+        llmc_normuon_runtime_free(&runtime);
+    }
+
+    {
+        LlmcNormuonConfig threshold_config = config;
+        threshold_config.tracker_wup_skew_threshold = 1.0e-8f;
+        BatchedBuffers buffers(tensor_elements);
+        buffers.load(
+            master_physical,
+            pack_logical_tensor(
+                tracker_logical_gradient(width, layers, 0), family_id, width),
+            momentum_physical,
+            second_physical);
+        LlmcNormuonRuntime runtime;
+        llmc_normuon_runtime_reset(&runtime);
+        BATCHED_CHECK(
+            llmc_normuon_runtime_allocate(
+                &runtime, &plan, &threshold_config),
+            "adaptive threshold tracker runtime allocates");
+        for (uint64_t step = 0U; step <= 1U; ++step) {
+            const std::vector<float> gradient =
+                tracker_logical_gradient(width, layers, static_cast<int>(step));
+            batched_copy_to_device(
+                buffers.gradient,
+                quantize_floatx(
+                    pack_logical_tensor(gradient, family_id, width)));
+            BATCHED_CHECK(
+                llmc_normuon_update_parameter_type_batched_bf16(
+                    &runtime,
+                    cublas_handle,
+                    main_stream,
+                    buffers.parameter,
+                    buffers.gradient,
+                    buffers.momentum,
+                    buffers.second_moment,
+                    buffers.master,
+                    &parameter_type,
+                    &threshold_config,
+                    learning_rate,
+                    1.0f,
+                    step),
+                "adaptive tracker threshold-crossing step succeeds");
+        }
+        cudaCheck(cudaStreamSynchronize(main_stream));
+        BATCHED_CHECK(
+            runtime.tracker_adaptive_check_count[0] == 1U &&
+                runtime.tracker_adaptive_threshold_refresh_count[0] == 0U &&
+                runtime.tracker_adaptive_refresh_due[0],
+            "every-step skew crossing schedules the next-step refresh");
+
+        const char* pending_path =
+            "build/test_normuon_batched_adaptive_pending_v8.bin";
+        BATCHED_CHECK(
+            llmc_normuon_save_companion(
+                pending_path,
+                2,
+                1,
+                0,
+                &plan,
+                &threshold_config,
+                &runtime,
+                main_stream),
+            "adaptive tracker pending decision saves");
+        LlmcNormuonRuntime resumed_runtime;
+        llmc_normuon_runtime_reset(&resumed_runtime);
+        BATCHED_CHECK(
+            llmc_normuon_runtime_allocate(
+                &resumed_runtime, &plan, &threshold_config) &&
+                llmc_normuon_load_companion(
+                    pending_path,
+                    2,
+                    1,
+                    0,
+                    &plan,
+                    &threshold_config,
+                    &resumed_runtime,
+                    main_stream) &&
+                resumed_runtime.tracker_adaptive_refresh_due[0],
+            "v8 resume preserves a pending adaptive refresh exactly");
+        remove(pending_path);
+        llmc_normuon_runtime_free(&resumed_runtime);
+
+        const uint64_t step = 2U;
+        const std::vector<float> gradient =
+            tracker_logical_gradient(width, layers, static_cast<int>(step));
+        batched_copy_to_device(
+            buffers.gradient,
+            quantize_floatx(
+                pack_logical_tensor(gradient, family_id, width)));
+        BATCHED_CHECK(
+            llmc_normuon_update_parameter_type_batched_bf16(
+                &runtime,
+                cublas_handle,
+                main_stream,
+                buffers.parameter,
+                buffers.gradient,
+                buffers.momentum,
+                buffers.second_moment,
+                buffers.master,
+                &parameter_type,
+                &threshold_config,
+                learning_rate,
+                1.0f,
+                step),
+            "pending adaptive refresh executes on the next step");
+        cudaCheck(cudaStreamSynchronize(main_stream));
+        BATCHED_CHECK(
+            runtime.tracker_adaptive_check_count[0] == 1U &&
+                runtime.tracker_adaptive_threshold_refresh_count[0] == 1U &&
+                runtime.tracker_adaptive_forced_refresh_count[0] == 0U &&
+                !runtime.tracker_adaptive_refresh_due[0],
+            "family-mean skew crossing refreshes one step after measurement");
+        for (int view = 0; view < LLMC_NORMUON_VIEWS_PER_MLP_MATRIX; ++view) {
+            const size_t q_index = static_cast<size_t>(view);
+            BATCHED_CHECK(
+                runtime.refresh_count[q_index] == 2U &&
+                    runtime.last_refresh_step[q_index] == 2,
+                "threshold crossing refreshes all family views atomically");
+        }
+        llmc_normuon_runtime_free(&runtime);
+    }
+}
+
 int main() {
     char server_ip[2] = "";
     char filesystem_path[2] = "";
@@ -1890,12 +2502,16 @@ int main() {
     set_zero_configs(&multi_gpu_config, 0, 1);
     common_start(false, false);
 
+    test_lr_dither_schedule();
+    test_tracker_h_stability_kernel();
+    test_square_wdown_batch_replay_restore();
     test_rectangular_batched_update();
     test_rectangular_batched_tracker();
     test_rectangular_batched_cachemuon();
     test_execution_mode_and_workspace();
     test_batched_layout_scratch_and_guard();
     test_batched_tracker_and_checkpoint();
+    test_batched_adaptive_tracker_refresh();
     test_polynomial_factor_override_preserves_packed_q();
     test_batched_commuted_tracker(
         LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS);
