@@ -71,6 +71,58 @@ static std::vector<float> matrix_multiply(
     return output;
 }
 
+static float spectral_norm_power_reference(
+    const std::vector<float>& matrix,
+    int width,
+    size_t matrix_index = 0U) {
+    if (width <= 1) {
+        return 0.0f;
+    }
+    std::vector<float> x(static_cast<size_t>(width), 0.0f);
+    std::vector<float> y(static_cast<size_t>(width), 0.0f);
+    const float initial_scale =
+        1.0f / std::sqrt(static_cast<float>(width));
+    for (int index = 0; index < width; ++index) {
+        const uint32_t hash = static_cast<uint32_t>(
+            matrix_index * 0x9e3779b9U + static_cast<size_t>(index)) +
+            0x7f4a7c15U;
+        x[index] = (hash & 1U) != 0U ? initial_scale : -initial_scale;
+    }
+    float estimate = 0.0f;
+    for (uint32_t iteration = 0U;
+         iteration < LLMC_NORMUON_TRACKER_SPECTRAL_POWER_ITERATIONS;
+         ++iteration) {
+        float y_norm_squared = 0.0f;
+        for (int row = 0; row < width; ++row) {
+            float value = 0.0f;
+            for (int column = 0; column < width; ++column) {
+                value += matrix[static_cast<size_t>(row) * width + column] *
+                    x[column];
+            }
+            y[row] = value;
+            y_norm_squared += value * value;
+        }
+        estimate = std::sqrt(std::max(y_norm_squared, 0.0f));
+
+        float x_norm_squared = 0.0f;
+        for (int column = 0; column < width; ++column) {
+            float value = 0.0f;
+            for (int row = 0; row < width; ++row) {
+                value += matrix[static_cast<size_t>(row) * width + column] *
+                    y[row];
+            }
+            x[column] = value;
+            x_norm_squared += value * value;
+        }
+        const float denominator =
+            std::sqrt(std::max(x_norm_squared, 1.0e-20f));
+        for (float& value : x) {
+            value /= denominator;
+        }
+    }
+    return estimate;
+}
+
 static void apply_polynomial_reference(
     std::vector<float>* matrix,
     int width,
@@ -188,6 +240,7 @@ static std::vector<float> tracker_correction_reference(
             tracked_q, true, normalized_momentum, false, width);
     std::vector<float> skew(phase.size(), 0.0f);
     double symmetric_norm_squared = 0.0;
+    double phase_trace = 0.0;
     for (int row = 0; row < width; ++row) {
         for (int column = 0; column < width; ++column) {
             const size_t index =
@@ -198,6 +251,9 @@ static std::vector<float> tracker_correction_reference(
             skew[index] = 0.5f * (phase[index] - transpose);
             symmetric_norm_squared +=
                 static_cast<double>(symmetric) * symmetric;
+            if (row == column) {
+                phase_trace += phase[index];
+            }
         }
     }
     const float denominator =
@@ -205,7 +261,48 @@ static std::vector<float> tracker_correction_reference(
         config.epsilon;
     std::vector<float> correction(phase.size(), 0.0f);
     float diagonal_scale = 1.0f;
+    float basis_free_scale = 1.0f;
     if (config.correction_mode ==
+        LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER) {
+        const std::vector<float> phase_squared =
+            matrix_multiply(phase, false, phase, false, width);
+        const float symmetric_rms =
+            std::sqrt(std::max(
+                static_cast<float>(symmetric_norm_squared), 0.0f) /
+                static_cast<float>(width));
+        const float alpha = std::max(
+            std::max(
+                static_cast<float>(phase_trace) / static_cast<float>(width),
+                LLMC_NORMUON_TRACKER_DAMPING_ETA * symmetric_rms),
+            config.epsilon);
+        const float inverse_alpha = 1.0f / alpha;
+        const float inverse_two_alpha_squared =
+            0.5f * inverse_alpha * inverse_alpha;
+        for (int row = 0; row < width; ++row) {
+            for (int column = 0; column < width; ++column) {
+                const size_t index =
+                    static_cast<size_t>(row) * width + column;
+                const size_t transpose =
+                    static_cast<size_t>(column) * width + row;
+                const float skew_squared =
+                    0.5f * (phase_squared[index] - phase_squared[transpose]);
+                correction[index] = config.correction_gain * (
+                    2.0f * inverse_alpha * skew[index] -
+                    inverse_two_alpha_squared * skew_squared);
+            }
+        }
+        const float spectral_norm =
+            spectral_norm_power_reference(correction, width);
+        const float spectral_limit = std::sqrt(std::max(
+            config.tracker_spectral_pmax *
+                    config.tracker_spectral_pmax -
+                1.0f,
+            0.0f));
+        basis_free_scale = std::min(
+            1.0f,
+            spectral_limit /
+                (std::max(spectral_norm, 0.0f) + config.epsilon));
+    } else if (config.correction_mode ==
         LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
         const float symmetric_scale =
             std::sqrt(std::max(static_cast<float>(symmetric_norm_squared), 0.0f)) /
@@ -246,6 +343,13 @@ static std::vector<float> tracker_correction_reference(
                 static_cast<size_t>(row) * width + column;
             float correction_denominator = denominator;
             float correction_numerator = skew[index];
+            if (config.correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER) {
+                correction[index] =
+                    (row == column ? 1.0f : 0.0f) +
+                    basis_free_scale * correction[index];
+                continue;
+            }
             if (config.correction_mode ==
                 LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
                 correction[index] =
@@ -1124,7 +1228,9 @@ static bool run_tracker_step(
 }
 
 static void test_tracker_reference_and_resume(
-    LlmcNormuonTrackerCorrectionMode correction_mode) {
+    LlmcNormuonTrackerCorrectionMode correction_mode,
+    float tracker_spectral_pmax =
+        LLMC_NORMUON_TRACKER_SPECTRAL_RHO_MAX) {
     constexpr int width = 5;
     constexpr float learning_rate = 0.01f;
     const size_t elements = static_cast<size_t>(width) * width;
@@ -1142,6 +1248,7 @@ static void test_tracker_reference_and_resume(
         LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC;
     config.correction_iterations = 2U;
     config.correction_gain = 1.0f;
+    config.tracker_spectral_pmax = tracker_spectral_pmax;
     config.correction_mode = correction_mode;
     config.retraction_mode =
         LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ;
@@ -1288,7 +1395,11 @@ static void test_tracker_reference_and_resume(
     TEST_CHECK(all_finite(q_gpu), "tracked Q is finite");
 
     const char* companion_path =
-        correction_mode == LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER
+        correction_mode ==
+                LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER
+            ? "build/test_normuon_companion_basis_free.bin"
+            : correction_mode ==
+                      LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER
             ? "build/test_normuon_companion_diagonal.bin"
             : "build/test_normuon_companion.bin";
     TEST_CHECK(
@@ -1653,6 +1764,11 @@ int main() {
         LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS);
     test_tracker_reference_and_resume(
         LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER);
+    test_tracker_reference_and_resume(
+        LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER);
+    test_tracker_reference_and_resume(
+        LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER,
+        1.40f);
     test_init_from_master_only_no_mutation();
 
     GPT2 unused_model = {};

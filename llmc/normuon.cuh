@@ -37,8 +37,10 @@ constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_WDOWN_LR_MULTIPLIER = 5U;
 constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_CACHE_MUON = 6U;
 constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_ADAPTIVE_TRACKER = 7U;
 constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_ADAPTIVE_PENDING = 8U;
+constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_TRACKER_SPECTRAL_PMAX = 9U;
+constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION_CACHE_INVERSE_ROOT_TRACKER = 10U;
 constexpr uint32_t LLMC_NORMUON_COMPANION_VERSION =
-    LLMC_NORMUON_COMPANION_VERSION_ADAPTIVE_PENDING;
+    LLMC_NORMUON_COMPANION_VERSION_CACHE_INVERSE_ROOT_TRACKER;
 constexpr int LLMC_NORMUON_COMPANION_HEADER_INTS = 256;
 constexpr int LLMC_NORMUON_BLOCK_SIZE = 256;
 constexpr size_t LLMC_NORMUON_BATCH_STATS_STRIDE = 4U;
@@ -52,6 +54,7 @@ constexpr int LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT = 2;
 constexpr float LLMC_NORMUON_TRACKER_DAMPING_ETA = 0.05f;
 constexpr float LLMC_NORMUON_TRACKER_CORRECTION_CAP = 0.25f;
 constexpr float LLMC_NORMUON_TRACKER_SPECTRAL_RHO_MAX = 1.20f;
+constexpr float LLMC_NORMUON_TRACKER_SPECTRAL_PMAX_MAX = 1.50f;
 constexpr uint32_t LLMC_NORMUON_TRACKER_SPECTRAL_POWER_ITERATIONS = 4U;
 // Rectangular tracker retraction defaults.  The horizontal component is
 // capped to the trust-region slack below the unit singular-value target;
@@ -68,6 +71,11 @@ constexpr float LLMC_NORMUON_RECTANGULAR_RETRACTION_PMAX =
 constexpr float LLMC_CACHEMUON_EPSILON = 1.0e-7f;
 constexpr float LLMC_CACHEMUON_DEFAULT_RESIDUAL_THRESHOLD = 5.0f;
 constexpr uint32_t LLMC_CACHEMUON_RESTART_STAGE = 2U;
+constexpr float LLMC_CACHEMUON_TRACKER_DEFAULT_MOTION_THRESHOLD = 0.15f;
+constexpr float LLMC_CACHEMUON_TRACKER_DEFAULT_SOLVE_RELATIVE_THRESHOLD = 0.25f;
+constexpr float LLMC_CACHEMUON_TRACKER_DEFAULT_SPD_TRUST_THRESHOLD = 0.50f;
+constexpr uint32_t LLMC_CACHEMUON_TRACKER_DEFAULT_CG_ITERATIONS = 2U;
+constexpr uint32_t LLMC_CACHEMUON_TRACKER_MAX_CG_ITERATIONS = 16U;
 constexpr float LLMC_NORMUON_TRACKER_DEFAULT_WUP_SKEW_THRESHOLD = 0.52f;
 constexpr float LLMC_NORMUON_TRACKER_DEFAULT_WDOWN_SKEW_THRESHOLD = 0.57f;
 constexpr uint32_t LLMC_NORMUON_TRACKER_DEFAULT_MAX_REFRESH_AGE = 9U;
@@ -120,6 +128,11 @@ enum LlmcNormuonOrthogonalizationMode {
     // caches the smaller-side FreshGNS transform and probes Q_cache X on every
     // later step.  Only residual-gate misses run a fresh solve.
     LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON = 5,
+    // CacheMuon hit direction with a lagged update of the complete dense
+    // smaller-side inverse-root transform.  The old candidate is always the
+    // optimizer direction; the tracked transform is committed for the next
+    // step only after all residual/trust gates pass.
+    LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER = 6,
 };
 
 enum LlmcNormuonApproximationPolicy {
@@ -137,6 +150,11 @@ enum LlmcNormuonExecutionMode {
 enum LlmcNormuonTrackerCorrectionMode {
     LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS = 0,
     LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER = 1,
+    // First Neumann correction to the Sylvester inverse without choosing an
+    // eigenbasis.  For S = H + K and scalar center alpha,
+    //   Omega = 2 K / alpha - skew(S^2) / (2 alpha^2).
+    // This mode is intentionally square-tracker-only.
+    LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER = 2,
 };
 
 enum LlmcNormuonTrackerRefreshMode {
@@ -168,12 +186,22 @@ inline bool llmc_normuon_is_rectangular_mode(
            mode == LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q ||
            mode == LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON ||
            mode ==
+               LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER ||
+           mode ==
                LLMC_NORMUON_ORTHO_SPLIT_WUP_SQUARE_TRACKER_WDOWN_RECTANGULAR_MUON;
 }
 
 inline bool llmc_normuon_is_cache_mode(
     LlmcNormuonOrthogonalizationMode mode) {
-    return mode == LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON;
+    return mode == LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON ||
+           mode ==
+               LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER;
+}
+
+inline bool llmc_normuon_is_cache_inverse_root_tracker_mode(
+    LlmcNormuonOrthogonalizationMode mode) {
+    return mode ==
+           LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER;
 }
 
 inline bool llmc_normuon_is_tracker_mode(
@@ -299,7 +327,14 @@ struct LlmcNormuonConfig {
     float tracker_wdown_skew_threshold;
     uint32_t correction_iterations;
     float correction_gain;
+    // Square-tracker trust-region bound for sigma_max(I + Omega).  This is
+    // intentionally separate from the fixed rectangular retraction constants.
+    float tracker_spectral_pmax;
     float cache_residual_threshold;
+    float cache_tracker_motion_threshold;
+    float cache_tracker_solve_relative_threshold;
+    float cache_tracker_spd_trust_threshold;
+    uint32_t cache_tracker_cg_iterations;
     LlmcNormuonTrackerCorrectionMode correction_mode;
     LlmcNormuonTrackerRetractionMode retraction_mode;
     LlmcNormuonPolynomialStep refresh_schedule[LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT];
@@ -392,6 +427,15 @@ struct LlmcNormuonTrackerFamilyDiagnostics {
     float dimension_normalized_skew_max;
     float correction_frobenius_mean;
     float correction_frobenius_max;
+    uint64_t correction_guard_probe_count;
+    float correction_raw_frobenius_mean;
+    float correction_raw_frobenius_max;
+    float correction_spectral_norm_estimate_mean;
+    float correction_spectral_norm_estimate_max;
+    float correction_guard_scale_mean;
+    float correction_guard_scale_min;
+    uint64_t correction_guard_clipped_count;
+    float correction_guard_clipped_fraction;
     uint64_t refresh_comparison_count;
     float refresh_cosine_mean;
     float refresh_cosine_min;
@@ -429,6 +473,11 @@ struct LlmcNormuonTrackerViewDiagnostics {
     float skew_ratio;
     float dimension_normalized_skew;
     float correction_frobenius;
+    bool correction_guard_probed;
+    float correction_raw_frobenius;
+    float correction_spectral_norm_estimate;
+    float correction_guard_scale;
+    bool correction_guard_clipped;
     float refresh_cosine;
     float refresh_relative_error;
     bool lr_dither_response_probed;
@@ -448,6 +497,117 @@ struct LlmcNormuonTrackerViewDiagnostics {
     float h_cosine;
     float h_norm_ratio;
 };
+
+enum LlmcCacheMuonTrackerRefreshReason : uint32_t {
+    LLMC_CACHEMUON_TRACKER_REFRESH_NONE = 0U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_INVALID = 1U << 0U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_NONFINITE = 1U << 1U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_R_Q = 1U << 2U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_MALFORMED_SOLVE = 1U << 3U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_SOLVE_RELATIVE = 1U << 4U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_RELATIVE_MOTION = 1U << 5U,
+    LLMC_CACHEMUON_TRACKER_REFRESH_SPD_TRUST = 1U << 6U,
+};
+
+struct LlmcCacheMuonTrackerDiagnostics {
+    uint64_t probe_count;
+    uint64_t refresh_count;
+    uint64_t r_q_valid_count;
+    double r_q_sum;
+    float r_q_max;
+    uint64_t relative_motion_valid_count;
+    double relative_motion_sum;
+    float relative_motion_max;
+    uint64_t solve_relative_residual_valid_count;
+    double solve_relative_residual_sum;
+    float solve_relative_residual_max;
+    uint64_t spd_trust_valid_count;
+    double spd_trust_sum;
+    float spd_trust_max;
+    uint64_t antisymmetry_valid_count;
+    double antisymmetry_sum;
+    float antisymmetry_max;
+    uint64_t refresh_reason_invalid_count;
+    uint64_t refresh_reason_nonfinite_count;
+    uint64_t refresh_reason_r_q_count;
+    uint64_t refresh_reason_malformed_solve_count;
+    uint64_t refresh_reason_solve_relative_count;
+    uint64_t refresh_reason_relative_motion_count;
+    uint64_t refresh_reason_spd_trust_count;
+};
+
+struct LlmcCacheMuonTrackerViewDiagnostics {
+    bool valid;
+    bool refreshed;
+    int family_id;
+    int matrix_index;
+    uint32_t refresh_reason_mask;
+    uint32_t metric_valid_mask;
+    float r_q;
+    float relative_motion;
+    float solve_relative_residual;
+    float spd_trust;
+    float antisymmetry;
+};
+
+enum LlmcCacheMuonTrackerMetric : uint32_t {
+    LLMC_CACHEMUON_TRACKER_METRIC_R_Q = 1U << 0U,
+    LLMC_CACHEMUON_TRACKER_METRIC_RELATIVE_MOTION = 1U << 1U,
+    LLMC_CACHEMUON_TRACKER_METRIC_SOLVE_RELATIVE_RESIDUAL = 1U << 2U,
+    LLMC_CACHEMUON_TRACKER_METRIC_SPD_TRUST = 1U << 3U,
+    LLMC_CACHEMUON_TRACKER_METRIC_ANTISYMMETRY = 1U << 4U,
+};
+
+inline void llmc_cachemuon_tracker_accumulate(
+    LlmcCacheMuonTrackerDiagnostics* diagnostics,
+    const LlmcCacheMuonTrackerViewDiagnostics* view) {
+    if (diagnostics == nullptr || view == nullptr || !view->valid) return;
+    diagnostics->probe_count++;
+    diagnostics->refresh_count += view->refreshed ? 1U : 0U;
+#define LLMC_CACHEMUON_ACCUMULATE_METRIC(name, mask)                            \
+    do {                                                                        \
+        if ((view->metric_valid_mask & (mask)) != 0U && isfinite(view->name)) { \
+            diagnostics->name##_valid_count++;                                 \
+            diagnostics->name##_sum += static_cast<double>(view->name);         \
+            diagnostics->name##_max = fmaxf(diagnostics->name##_max, view->name); \
+        }                                                                       \
+    } while (0)
+    LLMC_CACHEMUON_ACCUMULATE_METRIC(
+        r_q, LLMC_CACHEMUON_TRACKER_METRIC_R_Q);
+    LLMC_CACHEMUON_ACCUMULATE_METRIC(
+        relative_motion, LLMC_CACHEMUON_TRACKER_METRIC_RELATIVE_MOTION);
+    LLMC_CACHEMUON_ACCUMULATE_METRIC(
+        solve_relative_residual,
+        LLMC_CACHEMUON_TRACKER_METRIC_SOLVE_RELATIVE_RESIDUAL);
+    LLMC_CACHEMUON_ACCUMULATE_METRIC(
+        spd_trust, LLMC_CACHEMUON_TRACKER_METRIC_SPD_TRUST);
+    LLMC_CACHEMUON_ACCUMULATE_METRIC(
+        antisymmetry, LLMC_CACHEMUON_TRACKER_METRIC_ANTISYMMETRY);
+#undef LLMC_CACHEMUON_ACCUMULATE_METRIC
+    const uint32_t reason = view->refresh_reason_mask;
+    diagnostics->refresh_reason_invalid_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_INVALID) != 0U;
+    diagnostics->refresh_reason_nonfinite_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_NONFINITE) != 0U;
+    diagnostics->refresh_reason_r_q_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_R_Q) != 0U;
+    diagnostics->refresh_reason_malformed_solve_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_MALFORMED_SOLVE) != 0U;
+    diagnostics->refresh_reason_solve_relative_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_SOLVE_RELATIVE) != 0U;
+    diagnostics->refresh_reason_relative_motion_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_RELATIVE_MOTION) != 0U;
+    diagnostics->refresh_reason_spd_trust_count +=
+        (reason & LLMC_CACHEMUON_TRACKER_REFRESH_SPD_TRUST) != 0U;
+}
+
+inline double llmc_cachemuon_tracker_metric_mean(
+    double sum,
+    uint64_t valid_count) {
+    return valid_count > 0U
+        ? sum / static_cast<double>(valid_count)
+        : 0.0;
+}
 
 struct LlmcNormuonRuntime {
     void* workspace_allocation;
@@ -476,6 +636,7 @@ struct LlmcNormuonRuntime {
     float* cache_small[LLMC_CACHEMUON_SMALL_PANEL_COUNT];
     float* cache_residuals;
     int* cache_miss_indices;
+    float* cache_tracker_stats;
     float* cache_host_residuals;
     int* cache_host_miss_indices;
     uint64_t cache_step_probe_count;
@@ -486,6 +647,14 @@ struct LlmcNormuonRuntime {
     uint64_t cache_total_miss_count;
     double cache_total_residual_sum;
     float cache_total_residual_max;
+    float* cache_tracker_host_stats;
+    LlmcCacheMuonTrackerViewDiagnostics* cache_tracker_step_view_diagnostics;
+    size_t cache_tracker_step_view_diagnostic_capacity;
+    LlmcCacheMuonTrackerDiagnostics* cache_tracker_total_view_diagnostics;
+    LlmcCacheMuonTrackerDiagnostics cache_tracker_step_diagnostics[
+        LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT];
+    LlmcCacheMuonTrackerDiagnostics cache_tracker_total_diagnostics[
+        LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT];
     float* tracker_adaptive_host_mean_skew_ratio;
     uint64_t tracker_adaptive_check_count[
         LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT];
@@ -501,8 +670,10 @@ struct LlmcNormuonRuntime {
     bool tracker_diagnostics_active_step;
     bool tracker_phase_stats_pending;
     bool tracker_refresh_stats_pending;
+    bool tracker_correction_guard_stats_pending;
     float* tracker_host_phase_stats;
     float* tracker_host_refresh_stats;
+    float* tracker_host_correction_guard_stats;
     float* tracker_host_metric_scratch;
     LlmcNormuonTrackerViewDiagnostics* tracker_step_view_diagnostics;
     size_t tracker_step_view_diagnostic_capacity;
@@ -585,6 +756,8 @@ inline const char* llmc_normuon_orthogonalization_mode_name(
             return "split_wup_square_tracker_wdown_rectangular_muon";
         case LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON:
             return "rectangular_cache_muon";
+        case LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER:
+            return "rectangular_cache_muon_inverse_root_tracker";
         default: return "invalid";
     }
 }
@@ -640,6 +813,8 @@ inline const char* llmc_normuon_tracker_correction_mode_name(
             return "global_frobenius";
         case LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER:
             return "diagonal_sylvester";
+        case LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER:
+            return "basis_free_first_order";
         default:
             return "invalid";
     }
@@ -705,6 +880,11 @@ inline bool llmc_parse_normuon_orthogonalization_mode(
         *mode = LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON;
         return true;
     }
+    if (strcmp(value, "rectangular_cache_muon_inverse_root_tracker") == 0) {
+        *mode =
+            LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER;
+        return true;
+    }
     return false;
 }
 
@@ -764,6 +944,11 @@ inline bool llmc_parse_normuon_tracker_correction_mode(
     }
     if (strcmp(value, "1") == 0 || strcmp(value, "diagonal_sylvester") == 0) {
         *mode = LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER;
+        return true;
+    }
+    if (strcmp(value, "2") == 0 ||
+        strcmp(value, "basis_free_first_order") == 0) {
+        *mode = LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER;
         return true;
     }
     return false;
@@ -912,8 +1097,18 @@ inline void llmc_normuon_config_defaults(LlmcNormuonConfig* config) {
         LLMC_NORMUON_TRACKER_DEFAULT_WDOWN_SKEW_THRESHOLD;
     config->correction_iterations = 2U;
     config->correction_gain = 1.0f;
+    config->tracker_spectral_pmax =
+        LLMC_NORMUON_TRACKER_SPECTRAL_RHO_MAX;
     config->cache_residual_threshold =
         LLMC_CACHEMUON_DEFAULT_RESIDUAL_THRESHOLD;
+    config->cache_tracker_motion_threshold =
+        LLMC_CACHEMUON_TRACKER_DEFAULT_MOTION_THRESHOLD;
+    config->cache_tracker_solve_relative_threshold =
+        LLMC_CACHEMUON_TRACKER_DEFAULT_SOLVE_RELATIVE_THRESHOLD;
+    config->cache_tracker_spd_trust_threshold =
+        LLMC_CACHEMUON_TRACKER_DEFAULT_SPD_TRUST_THRESHOLD;
+    config->cache_tracker_cg_iterations =
+        LLMC_CACHEMUON_TRACKER_DEFAULT_CG_ITERATIONS;
     config->correction_mode =
         LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS;
     config->retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_NEWTON_SCHULZ;
@@ -937,7 +1132,11 @@ inline bool llmc_normuon_validate_config(
         isfinite(config->update_scale) &&
         isfinite(config->wdown_learning_rate_multiplier) &&
         isfinite(config->correction_gain) &&
+        isfinite(config->tracker_spectral_pmax) &&
         isfinite(config->cache_residual_threshold) &&
+        isfinite(config->cache_tracker_motion_threshold) &&
+        isfinite(config->cache_tracker_solve_relative_threshold) &&
+        isfinite(config->cache_tracker_spd_trust_threshold) &&
         isfinite(config->tracker_wup_skew_threshold) &&
         isfinite(config->tracker_wdown_skew_threshold);
     bool valid =
@@ -953,7 +1152,9 @@ inline bool llmc_normuon_validate_config(
          config->orthogonalization_mode ==
              LLMC_NORMUON_ORTHO_SPLIT_WUP_SQUARE_TRACKER_WDOWN_RECTANGULAR_MUON ||
          config->orthogonalization_mode ==
-             LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON) &&
+             LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON ||
+         config->orthogonalization_mode ==
+             LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER) &&
         finite_hyperparameters &&
         config->learning_rate > 0.0f &&
         config->weight_decay >= 0.0f &&
@@ -963,7 +1164,17 @@ inline bool llmc_normuon_validate_config(
         config->update_scale >= 0.0f &&
         config->wdown_learning_rate_multiplier > 0.0f &&
         config->correction_gain >= 0.0f &&
+        config->tracker_spectral_pmax > 1.0f &&
+        config->tracker_spectral_pmax <=
+            LLMC_NORMUON_TRACKER_SPECTRAL_PMAX_MAX &&
         config->cache_residual_threshold > 0.0f &&
+        config->cache_tracker_motion_threshold > 0.0f &&
+        config->cache_tracker_solve_relative_threshold > 0.0f &&
+        config->cache_tracker_spd_trust_threshold > 0.0f &&
+        config->cache_tracker_spd_trust_threshold < 1.0f &&
+        config->cache_tracker_cg_iterations > 0U &&
+        config->cache_tracker_cg_iterations <=
+            LLMC_CACHEMUON_TRACKER_MAX_CG_ITERATIONS &&
         config->tracker_wup_skew_threshold > 0.0f &&
         config->tracker_wdown_skew_threshold > 0.0f &&
         (config->tracker_refresh_mode ==
@@ -973,7 +1184,9 @@ inline bool llmc_normuon_validate_config(
         (config->correction_mode ==
              LLMC_NORMUON_TRACKER_CORRECTION_GLOBAL_FROBENIUS ||
          config->correction_mode ==
-             LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) &&
+             LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER ||
+         config->correction_mode ==
+             LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER) &&
         config->refresh_interval > 0U &&
         config->tracker_max_refresh_age > 0U &&
         config->correction_iterations > 0U &&
@@ -1005,6 +1218,48 @@ inline bool llmc_normuon_validate_config(
         }
         return false;
     }
+    if (llmc_normuon_is_cache_inverse_root_tracker_mode(
+            config->orthogonalization_mode) &&
+        config->execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED) {
+        if (error != nullptr && error_capacity != 0U) {
+            snprintf(
+                error,
+                error_capacity,
+                "rectangular_cache_muon_inverse_root_tracker currently "
+                "requires bf16_batched execution");
+        }
+        return false;
+    }
+    if (llmc_normuon_is_cache_inverse_root_tracker_mode(
+            config->orthogonalization_mode) &&
+        config->correction_gain != 1.0f) {
+        if (error != nullptr && error_capacity != 0U) {
+            snprintf(
+                error,
+                error_capacity,
+                "rectangular_cache_muon_inverse_root_tracker requires "
+                "correction_gain exactly 1");
+        }
+        return false;
+    }
+    if (config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
+        config->correction_mode ==
+            LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER &&
+        !llmc_normuon_is_cache_inverse_root_tracker_mode(
+            config->orthogonalization_mode) &&
+        config->orthogonalization_mode !=
+            LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q &&
+        config->orthogonalization_mode !=
+            LLMC_NORMUON_ORTHO_SPLIT_WUP_SQUARE_TRACKER_WDOWN_RECTANGULAR_MUON) {
+        if (error != nullptr && error_capacity != 0U) {
+            snprintf(
+                error,
+                error_capacity,
+                "basis_free_first_order requires square skew_polar_track_q "
+                "views (directly or in split Wup mode)");
+        }
+        return false;
+    }
     if (config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
         config->targeted_family_mask != llmc_normuon_required_target_mask()) {
         valid = false;
@@ -1021,6 +1276,8 @@ inline bool llmc_normuon_validate_config(
              LLMC_NORMUON_TRACKER_RETRACTION_COMMUTED_CANONICAL_STAGE2 ||
          config->retraction_mode ==
              LLMC_NORMUON_TRACKER_RETRACTION_THIN_CANONICAL_STAGE2) &&
+        !llmc_normuon_is_cache_inverse_root_tracker_mode(
+            config->orthogonalization_mode) &&
         (!llmc_normuon_is_tracker_mode(config->orthogonalization_mode) ||
          config->correction_policy !=
              LLMC_NORMUON_APPROX_CANONICAL_TAYLOR_QUINTIC ||
@@ -1036,6 +1293,8 @@ inline bool llmc_normuon_validate_config(
     }
     if (config->retraction_mode ==
             LLMC_NORMUON_TRACKER_RETRACTION_THIN_CANONICAL_STAGE2 &&
+        !llmc_normuon_is_cache_inverse_root_tracker_mode(
+            config->orthogonalization_mode) &&
         config->execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED) {
         if (error != nullptr && error_capacity != 0U) {
             snprintf(
@@ -1064,7 +1323,8 @@ inline bool llmc_normuon_validate_config(
         }
         return false;
     }
-    if (llmc_normuon_is_cache_mode(config->orthogonalization_mode) &&
+    if (config->orthogonalization_mode ==
+            LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON &&
         config->retraction_mode != LLMC_NORMUON_TRACKER_RETRACTION_DISABLED) {
         if (error != nullptr && error_capacity != 0U) {
             snprintf(
@@ -1597,6 +1857,113 @@ __global__ void llmc_normuon_build_correction_kernel(
     }
 }
 
+__global__ void llmc_normuon_trace_kernel(
+    const float* matrix,
+    float* trace,
+    int* nonfinite,
+    size_t width) {
+    __shared__ float local[LLMC_NORMUON_BLOCK_SIZE];
+    float sum = 0.0f;
+    for (size_t index = threadIdx.x; index < width; index += blockDim.x) {
+        const float value = matrix[index * width + index];
+        if (!isfinite(value)) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        sum += value;
+    }
+    local[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local[threadIdx.x] += local[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        *trace = local[0];
+    }
+}
+
+// Basis-free first-order inverse of H*Omega + Omega*H = 2K.  Expanding the
+// Sylvester operator about alpha*I gives
+//   Omega_1 = 2K/alpha - (HK + KH)/(2 alpha^2).
+// Since S = H + K, skew(S^2) = HK + KH, so the correction needs only one
+// additional square product and never chooses a basis.  The trace is the
+// Frobenius-optimal scalar center; a small RMS floor keeps the expansion
+// finite when the tracked Q has left the positive-phase basin.
+__global__ void llmc_normuon_build_basis_free_first_order_correction_kernel(
+    const float* phase,
+    const float* phase_squared,
+    float* correction,
+    const float* symmetric_norm_squared,
+    const float* phase_trace,
+    int* nonfinite,
+    size_t width,
+    float gain,
+    float epsilon) {
+    const float dimension = static_cast<float>(width);
+    const float symmetric_rms =
+        sqrtf(fmaxf(*symmetric_norm_squared, 0.0f) / dimension);
+    const float trace_center = *phase_trace / dimension;
+    const float alpha = fmaxf(
+        fmaxf(trace_center, LLMC_NORMUON_TRACKER_DAMPING_ETA * symmetric_rms),
+        epsilon);
+    const float inverse_alpha = 1.0f / alpha;
+    const float inverse_two_alpha_squared =
+        0.5f * inverse_alpha * inverse_alpha;
+    const size_t element_count = width * width;
+    size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    for (; index < element_count; index += stride) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const size_t transpose = column * width + row;
+        const float skew = 0.5f * (phase[index] - phase[transpose]);
+        const float skew_squared =
+            0.5f * (phase_squared[index] - phase_squared[transpose]);
+        const float omega = gain * (
+            2.0f * inverse_alpha * skew -
+            inverse_two_alpha_squared * skew_squared);
+        if (!isfinite(omega)) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        correction[index] = omega;
+    }
+}
+
+// For skew Omega, singular values of I+Omega are sqrt(1+sigma(Omega)^2).
+// Keep that factor inside the configured square-tracker pmax trust basin, but
+// do not apply the old Frobenius cap: that cap would suppress the
+// dimension-normalized correction this mode is intended to test.
+__global__ void llmc_normuon_finalize_basis_free_first_order_correction_kernel(
+    float* correction,
+    const float* spectral_norm,
+    int* nonfinite,
+    size_t width,
+    float spectral_pmax,
+    float epsilon) {
+    const float spectral_limit = sqrtf(fmaxf(
+        spectral_pmax * spectral_pmax -
+            1.0f,
+        0.0f));
+    const float scale = fminf(
+        1.0f,
+        spectral_limit / (fmaxf(*spectral_norm, 0.0f) + epsilon));
+    const size_t element_count = width * width;
+    size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    for (; index < element_count; index += stride) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const float value =
+            (row == column ? 1.0f : 0.0f) + scale * correction[index];
+        if (!isfinite(value)) {
+            llmc_normuon_mark_nonfinite(nonfinite);
+        }
+        correction[index] = value;
+    }
+}
+
 __global__ void llmc_cachemuon_identity_kernel(
     float* matrices,
     size_t matrix_count,
@@ -1679,6 +2046,219 @@ __global__ void llmc_cachemuon_residual_kernel(
     if (threadIdx.x == 0U) {
         residuals[matrix_index] =
             sqrtf(fmaxf(local[0], 0.0f) / static_cast<float>(width));
+    }
+}
+
+// CacheMuon inverse-root tracker scalar slots (per matrix): rQ, ||P||^2,
+// ||E||^2, current ||R||^2, solve-status, ||Rfinal||^2, ||dP||^2, tr(K dP),
+// ||Pnext-Pnext^T||^2, ||Pnext||^2.  The batched path uses the same layout.
+constexpr size_t LLMC_CACHEMUON_TRACKER_STATS_STRIDE = 10U;
+
+__global__ void llmc_cachemuon_tracker_initialize_kernel(
+    const float* transform,
+    const float* gram,
+    float* residual,
+    float* solution,
+    float* search,
+    float* tracker_stats,
+    const int* active_flags,
+    size_t matrix_count,
+    size_t matrix_elements,
+    size_t panel_stride,
+    size_t width,
+    int family_id) {
+    const size_t matrix_index = blockIdx.x;
+    if (matrix_index >= matrix_count) return;
+    const bool active = active_flags[matrix_index] != 0;
+    __shared__ float local_p[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_e[LLMC_NORMUON_BLOCK_SIZE];
+    float p_sum = 0.0f;
+    float e_sum = 0.0f;
+    const size_t base = matrix_index * panel_stride;
+    for (size_t index = threadIdx.x; index < matrix_elements; index += blockDim.x) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const size_t transform_index =
+            (matrix_index * LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER +
+             (family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 0U : 1U)) *
+                matrix_elements +
+            index;
+        const float p = transform[transform_index];
+        const float e = gram[base + index] - (row == column ? 1.0f : 0.0f);
+        const bool finite = active && isfinite(p) && isfinite(e);
+        const float rhs = finite ? -e : 0.0f;
+        residual[base + index] = rhs;
+        search[base + index] = rhs;
+        solution[base + index] = 0.0f;
+        p_sum += finite ? p * p : (active ? NAN : 0.0f);
+        e_sum += finite ? e * e : (active ? NAN : 0.0f);
+    }
+    local_p[threadIdx.x] = p_sum;
+    local_e[threadIdx.x] = e_sum;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local_p[threadIdx.x] += local_p[threadIdx.x + offset];
+            local_e[threadIdx.x] += local_e[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        float* stats = tracker_stats +
+            matrix_index * LLMC_CACHEMUON_TRACKER_STATS_STRIDE;
+        stats[1] = local_p[0];
+        stats[2] = local_e[0];
+        stats[3] = local_e[0];
+        stats[4] = active ? 1.0f : NAN;
+        stats[5] = local_e[0];
+        stats[6] = 0.0f;
+        stats[7] = 0.0f;
+        stats[8] = 0.0f;
+        stats[9] = 0.0f;
+    }
+}
+
+// One CG iteration for L_P(K)=PK+KP. `search_times_p` is the single square
+// GEMM T=search*P; symmetry of P/search gives L_P(search)=T+T^T.
+__global__ void llmc_cachemuon_tracker_cg_iteration_kernel(
+    float* solution,
+    float* residual,
+    float* search,
+    const float* search_times_p,
+    float* tracker_stats,
+    int* nonfinite,
+    size_t matrix_count,
+    size_t matrix_elements,
+    size_t panel_stride,
+    size_t width,
+    float epsilon) {
+    const size_t matrix_index = blockIdx.x;
+    if (matrix_index >= matrix_count) return;
+    __shared__ float local_den[LLMC_NORMUON_BLOCK_SIZE];
+    float denominator = 0.0f;
+    const size_t base = matrix_index * panel_stride;
+    for (size_t index = threadIdx.x; index < matrix_elements; index += blockDim.x) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const float ap = search_times_p[base + index] +
+                         search_times_p[base + column * width + row];
+        denominator += search[base + index] * ap;
+    }
+    local_den[threadIdx.x] = denominator;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) local_den[threadIdx.x] += local_den[threadIdx.x + offset];
+        __syncthreads();
+    }
+    __shared__ float alpha;
+    if (threadIdx.x == 0U) {
+        float* stats = tracker_stats + matrix_index * LLMC_CACHEMUON_TRACKER_STATS_STRIDE;
+        const float rr = stats[3];
+        const bool converged = isfinite(rr) && rr <= epsilon;
+        const bool valid = converged ||
+            (isfinite(local_den[0]) && local_den[0] > epsilon &&
+             isfinite(rr) && rr >= 0.0f);
+        alpha = valid && !converged ? rr / local_den[0] : 0.0f;
+        if (!valid) stats[4] = NAN;
+    }
+    __syncthreads();
+    float next_rr = 0.0f;
+    for (size_t index = threadIdx.x; index < matrix_elements; index += blockDim.x) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const float ap = search_times_p[base + index] +
+                         search_times_p[base + column * width + row];
+        const float next_solution = solution[base + index] + alpha * search[base + index];
+        const float next_residual = residual[base + index] - alpha * ap;
+        solution[base + index] = next_solution;
+        residual[base + index] = next_residual;
+        next_rr += next_residual * next_residual;
+    }
+    local_den[threadIdx.x] = next_rr;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) local_den[threadIdx.x] += local_den[threadIdx.x + offset];
+        __syncthreads();
+    }
+    __shared__ float beta;
+    if (threadIdx.x == 0U) {
+        float* stats = tracker_stats + matrix_index * LLMC_CACHEMUON_TRACKER_STATS_STRIDE;
+        const float old_rr = stats[3];
+        beta = (isfinite(old_rr) && old_rr > epsilon && isfinite(local_den[0]))
+                   ? local_den[0] / old_rr : 0.0f;
+        stats[3] = local_den[0];
+        stats[5] = local_den[0];
+    }
+    __syncthreads();
+    for (size_t index = threadIdx.x; index < matrix_elements; index += blockDim.x) {
+        const float value = residual[base + index] + beta * search[base + index];
+        search[base + index] = value;
+    }
+}
+
+__global__ void llmc_cachemuon_tracker_finalize_kernel(
+    const float* transform,
+    const float* solution,
+    const float* delta,
+    float* next_transform,
+    float* tracker_stats,
+    int* nonfinite,
+    size_t matrix_count,
+    size_t matrix_elements,
+    size_t panel_stride,
+    size_t width,
+    int family_id) {
+    const size_t matrix_index = blockIdx.x;
+    if (matrix_index >= matrix_count) return;
+    __shared__ float local_motion[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_spd[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_anti[LLMC_NORMUON_BLOCK_SIZE];
+    __shared__ float local_next[LLMC_NORMUON_BLOCK_SIZE];
+    float motion = 0.0f, spd = 0.0f, anti = 0.0f, next_norm = 0.0f;
+    const size_t base = matrix_index * panel_stride;
+    for (size_t index = threadIdx.x; index < matrix_elements; index += blockDim.x) {
+        const size_t row = index / width;
+        const size_t column = index - row * width;
+        const float d = delta[base + index];
+        const float k = solution[base + index];
+        const size_t transform_base =
+            (matrix_index * LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER +
+             (family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP ? 0U : 1U)) *
+            matrix_elements;
+        const size_t transform_index = transform_base + index;
+        const size_t transform_transpose =
+            transform_base + column * width + row;
+        const float next = transform[transform_index] + d;
+        const float next_t = transform[transform_transpose] +
+                             delta[base + column * width + row];
+        next_transform[base + index] =
+            (isfinite(next) && isfinite(next_t)) ? 0.5f * (next + next_t) : 0.0f;
+        motion += d * d;
+        spd += k * d;
+        const float a = next - next_t;
+        anti += a * a;
+        next_norm += next * next;
+    }
+    local_motion[threadIdx.x] = motion;
+    local_spd[threadIdx.x] = spd;
+    local_anti[threadIdx.x] = anti;
+    local_next[threadIdx.x] = next_norm;
+    __syncthreads();
+    for (uint32_t offset = blockDim.x >> 1U; offset > 0U; offset >>= 1U) {
+        if (threadIdx.x < offset) {
+            local_motion[threadIdx.x] += local_motion[threadIdx.x + offset];
+            local_spd[threadIdx.x] += local_spd[threadIdx.x + offset];
+            local_anti[threadIdx.x] += local_anti[threadIdx.x + offset];
+            local_next[threadIdx.x] += local_next[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+        float* stats = tracker_stats + matrix_index * LLMC_CACHEMUON_TRACKER_STATS_STRIDE;
+        stats[6] = local_motion[0];
+        stats[7] = local_spd[0];
+        stats[8] = local_anti[0];
+        stats[9] = local_next[0];
     }
 }
 
@@ -1849,6 +2429,7 @@ __global__ void llmc_normuon_finalize_damped_diagonal_correction_kernel(
     const float* spectral_norm,
     int* nonfinite,
     size_t width,
+    float spectral_pmax,
     float epsilon) {
     const float raw_norm =
         sqrtf(fmaxf(*correction_norm_squared, 0.0f));
@@ -1857,8 +2438,7 @@ __global__ void llmc_normuon_finalize_damped_diagonal_correction_kernel(
     const float frobenius_scale =
         fminf(1.0f, target_norm / (raw_norm + epsilon));
     const float spectral_limit = sqrtf(fmaxf(
-        LLMC_NORMUON_TRACKER_SPECTRAL_RHO_MAX *
-                LLMC_NORMUON_TRACKER_SPECTRAL_RHO_MAX -
+        spectral_pmax * spectral_pmax -
             1.0f,
         0.0f));
     const float spectral_scale = fminf(
@@ -2532,6 +3112,13 @@ inline bool llmc_normuon_rectangular_tracker_direction(
         direction_out == nullptr || rows <= 0 || columns <= 0) {
         return false;
     }
+    if (config->correction_mode ==
+        LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER) {
+        // The rectangular tangent path additionally approximates H^{-1} in
+        // the horizontal residual; treating only the rotational Sylvester
+        // solve as basis-free would be a silent compound approximation.
+        return false;
+    }
     const int side = rows < columns ? rows : columns;
     const bool tall = rows >= columns;
     const size_t matrix_elements = static_cast<size_t>(rows) * columns;
@@ -2618,6 +3205,7 @@ inline bool llmc_normuon_rectangular_tracker_direction(
             runtime->stats + 4,
             nonfinite,
             side,
+            LLMC_NORMUON_RECTANGULAR_RETRACTION_PMAX,
             config->epsilon);
         cudaCheck(cudaGetLastError());
     } else {
@@ -2787,11 +3375,19 @@ inline void llmc_normuon_runtime_free(LlmcNormuonRuntime* runtime) {
     free(runtime->last_refresh_step);
     free(runtime->cache_host_residuals);
     free(runtime->cache_host_miss_indices);
+    free(runtime->cache_tracker_step_view_diagnostics);
+    free(runtime->cache_tracker_total_view_diagnostics);
     if (runtime->tracker_host_phase_stats != nullptr) {
         cudaCheck(cudaFreeHost(runtime->tracker_host_phase_stats));
     }
     if (runtime->tracker_host_refresh_stats != nullptr) {
         cudaCheck(cudaFreeHost(runtime->tracker_host_refresh_stats));
+    }
+    if (runtime->cache_tracker_host_stats != nullptr) {
+        cudaCheck(cudaFreeHost(runtime->cache_tracker_host_stats));
+    }
+    if (runtime->tracker_host_correction_guard_stats != nullptr) {
+        cudaCheck(cudaFreeHost(runtime->tracker_host_correction_guard_stats));
     }
     if (runtime->tracker_h_stability_host_stats != nullptr) {
         cudaCheck(cudaFreeHost(runtime->tracker_h_stability_host_stats));
@@ -2817,6 +3413,7 @@ inline bool llmc_normuon_enable_tracker_diagnostics(
         runtime->batch_matrix_capacity == 0U ||
         runtime->tracker_host_phase_stats != nullptr ||
         runtime->tracker_host_refresh_stats != nullptr ||
+        runtime->tracker_host_correction_guard_stats != nullptr ||
         runtime->tracker_host_metric_scratch != nullptr) {
         return false;
     }
@@ -2828,6 +3425,10 @@ inline bool llmc_normuon_enable_tracker_diagnostics(
     cudaCheck(cudaMallocHost(
         reinterpret_cast<void**>(&runtime->tracker_host_refresh_stats),
         stats_elements * sizeof(float)));
+    cudaCheck(cudaMallocHost(
+        reinterpret_cast<void**>(
+            &runtime->tracker_host_correction_guard_stats),
+        stats_elements * sizeof(float)));
     runtime->tracker_host_metric_scratch = static_cast<float*>(
         malloc(runtime->batch_matrix_capacity * sizeof(float)));
     if (runtime->batch_matrix_capacity > SIZE_MAX /
@@ -2837,8 +3438,10 @@ inline bool llmc_normuon_enable_tracker_diagnostics(
             SIZE_MAX / sizeof(LlmcNormuonTrackerViewDiagnostics)) {
         cudaCheck(cudaFreeHost(runtime->tracker_host_phase_stats));
         cudaCheck(cudaFreeHost(runtime->tracker_host_refresh_stats));
+        cudaCheck(cudaFreeHost(runtime->tracker_host_correction_guard_stats));
         runtime->tracker_host_phase_stats = nullptr;
         runtime->tracker_host_refresh_stats = nullptr;
+        runtime->tracker_host_correction_guard_stats = nullptr;
         free(runtime->tracker_host_metric_scratch);
         runtime->tracker_host_metric_scratch = nullptr;
         return false;
@@ -2854,8 +3457,10 @@ inline bool llmc_normuon_enable_tracker_diagnostics(
         runtime->tracker_step_view_diagnostics == nullptr) {
         cudaCheck(cudaFreeHost(runtime->tracker_host_phase_stats));
         cudaCheck(cudaFreeHost(runtime->tracker_host_refresh_stats));
+        cudaCheck(cudaFreeHost(runtime->tracker_host_correction_guard_stats));
         runtime->tracker_host_phase_stats = nullptr;
         runtime->tracker_host_refresh_stats = nullptr;
+        runtime->tracker_host_correction_guard_stats = nullptr;
         free(runtime->tracker_host_metric_scratch);
         runtime->tracker_host_metric_scratch = nullptr;
         free(runtime->tracker_step_view_diagnostics);
@@ -2869,6 +3474,10 @@ inline bool llmc_normuon_enable_tracker_diagnostics(
         stats_elements * sizeof(float));
     memset(
         runtime->tracker_host_refresh_stats,
+        0,
+        stats_elements * sizeof(float));
+    memset(
+        runtime->tracker_host_correction_guard_stats,
         0,
         stats_elements * sizeof(float));
     runtime->tracker_diagnostics_every = every;
@@ -3195,6 +3804,7 @@ inline void llmc_normuon_tracker_diagnostics_begin_step(
     runtime->tracker_diagnostics_global_step = global_step;
     runtime->tracker_phase_stats_pending = false;
     runtime->tracker_refresh_stats_pending = false;
+    runtime->tracker_correction_guard_stats_pending = false;
     runtime->tracker_h_stability_pending = false;
     runtime->tracker_h_stability_pending_compared = false;
     memset(
@@ -3227,6 +3837,7 @@ inline bool llmc_normuon_runtime_layout_workspace(
     }
     runtime->cache_residuals = nullptr;
     runtime->cache_miss_indices = nullptr;
+    runtime->cache_tracker_stats = nullptr;
     float* cursor = static_cast<float*>(runtime->workspace);
     for (size_t index = 0; index < runtime->batch_float_matrix_count; ++index) {
         runtime->matrix[index] = cursor;
@@ -3250,6 +3861,12 @@ inline bool llmc_normuon_runtime_layout_workspace(
         cursor += runtime->batch_matrix_capacity;
         runtime->cache_miss_indices = reinterpret_cast<int*>(cursor);
         cursor += runtime->batch_matrix_capacity;
+        if (llmc_normuon_is_cache_inverse_root_tracker_mode(
+                config->orthogonalization_mode)) {
+            runtime->cache_tracker_stats = cursor;
+            cursor += runtime->batch_matrix_capacity *
+                      LLMC_CACHEMUON_TRACKER_STATS_STRIDE;
+        }
     }
     runtime->axis_stats = cursor;
     cursor += runtime->axis_stats_elements;
@@ -3341,20 +3958,28 @@ inline bool llmc_normuon_runtime_allocate(
         fresh_gns_workspace
             ? batch_matrix_capacity * square_elements
             : 0U;
-    if (llmc_normuon_is_cache_mode(config->orthogonalization_mode) &&
-        batch_matrix_capacity > SIZE_MAX / 2U) {
+    const size_t cache_tail_per_matrix =
+        llmc_normuon_is_cache_mode(config->orthogonalization_mode)
+            ? 2U +
+                  (llmc_normuon_is_cache_inverse_root_tracker_mode(
+                       config->orthogonalization_mode)
+                       ? LLMC_CACHEMUON_TRACKER_STATS_STRIDE
+                       : 0U)
+            : 0U;
+    if (cache_tail_per_matrix != 0U &&
+        batch_matrix_capacity > SIZE_MAX / cache_tail_per_matrix) {
         return false;
     }
+    const size_t cache_tail_elements =
+        cache_tail_per_matrix * batch_matrix_capacity;
     if (cache_small_total_elements >
-        (SIZE_MAX - 2U * batch_matrix_capacity) /
+        (SIZE_MAX - cache_tail_elements) /
             LLMC_CACHEMUON_SMALL_PANEL_COUNT) {
         return false;
     }
     const size_t cache_elements =
         LLMC_CACHEMUON_SMALL_PANEL_COUNT * cache_small_total_elements +
-        (llmc_normuon_is_cache_mode(config->orthogonalization_mode)
-             ? 2U * batch_matrix_capacity
-             : 0U);
+        cache_tail_elements;
     if (cache_elements >
         SIZE_MAX - axis_stats_elements - batch_stats_elements - 16U) {
         return false;
@@ -3437,12 +4062,35 @@ inline bool llmc_normuon_runtime_allocate(
                 malloc(batch_matrix_capacity * sizeof(float)));
             runtime->cache_host_miss_indices = static_cast<int*>(
                 malloc(batch_matrix_capacity * sizeof(int)));
+            if (llmc_normuon_is_cache_inverse_root_tracker_mode(
+                    config->orthogonalization_mode)) {
+                cudaCheck(cudaMallocHost(
+                    reinterpret_cast<void**>(&runtime->cache_tracker_host_stats),
+                    batch_matrix_capacity *
+                        LLMC_CACHEMUON_TRACKER_STATS_STRIDE * sizeof(float)));
+                runtime->cache_tracker_step_view_diagnostic_capacity =
+                    batch_matrix_capacity *
+                    LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT;
+                runtime->cache_tracker_step_view_diagnostics =
+                    static_cast<LlmcCacheMuonTrackerViewDiagnostics*>(calloc(
+                        runtime->cache_tracker_step_view_diagnostic_capacity,
+                        sizeof(LlmcCacheMuonTrackerViewDiagnostics)));
+                runtime->cache_tracker_total_view_diagnostics =
+                    static_cast<LlmcCacheMuonTrackerDiagnostics*>(calloc(
+                        runtime->cache_tracker_step_view_diagnostic_capacity,
+                        sizeof(LlmcCacheMuonTrackerDiagnostics)));
+            }
         }
         if (runtime->q_valid == nullptr || runtime->refresh_count == nullptr ||
             runtime->last_refresh_step == nullptr ||
             (llmc_normuon_is_cache_mode(config->orthogonalization_mode) &&
              (runtime->cache_host_residuals == nullptr ||
-              runtime->cache_host_miss_indices == nullptr))) {
+              runtime->cache_host_miss_indices == nullptr ||
+              (llmc_normuon_is_cache_inverse_root_tracker_mode(
+                   config->orthogonalization_mode) &&
+               (runtime->cache_tracker_host_stats == nullptr ||
+                runtime->cache_tracker_step_view_diagnostics == nullptr ||
+                runtime->cache_tracker_total_view_diagnostics == nullptr))))) {
             llmc_normuon_runtime_free(runtime);
             return false;
         }
@@ -3865,7 +4513,55 @@ inline bool llmc_normuon_update_view(
                 runtime->matrix[4], runtime->stats + 2, grid);
             cudaCheck(cudaGetLastError());
             if (config->correction_mode ==
-                LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
+                LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER) {
+                llmc_normuon_trace_kernel<<<
+                    1U, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+                    runtime->matrix[1],
+                    runtime->stats + 5,
+                    runtime->nonfinite_flag,
+                    view->rows);
+                cudaCheck(cudaGetLastError());
+                llmc_normuon_row_major_gemm(
+                    handle,
+                    stream,
+                    runtime->matrix[1],
+                    false,
+                    runtime->matrix[1],
+                    false,
+                    runtime->matrix[4],
+                    rows);
+                llmc_normuon_build_basis_free_first_order_correction_kernel<<<
+                    grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+                    runtime->matrix[1],
+                    runtime->matrix[4],
+                    runtime->matrix[2],
+                    runtime->stats + 2,
+                    runtime->stats + 5,
+                    runtime->nonfinite_flag,
+                    view->rows,
+                    config->correction_gain,
+                    config->epsilon);
+                cudaCheck(cudaGetLastError());
+                llmc_normuon_power_iteration_kernel<<<
+                    1U, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+                    runtime->matrix[2],
+                    runtime->matrix[3],
+                    runtime->stats + 4,
+                    runtime->nonfinite_flag,
+                    view->rows,
+                    LLMC_NORMUON_TRACKER_SPECTRAL_POWER_ITERATIONS);
+                cudaCheck(cudaGetLastError());
+                llmc_normuon_finalize_basis_free_first_order_correction_kernel<<<
+                    grid, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
+                    runtime->matrix[2],
+                    runtime->stats + 4,
+                    runtime->nonfinite_flag,
+                    view->rows,
+                    config->tracker_spectral_pmax,
+                    config->epsilon);
+                cudaCheck(cudaGetLastError());
+            } else if (config->correction_mode ==
+                       LLMC_NORMUON_TRACKER_CORRECTION_DIAGONAL_SYLVESTER) {
                 llmc_normuon_build_damped_diagonal_correction_kernel<<<
                     1U, LLMC_NORMUON_BLOCK_SIZE, 0, stream>>>(
                     runtime->matrix[1],
@@ -3893,6 +4589,7 @@ inline bool llmc_normuon_update_view(
                     runtime->stats + 4,
                     runtime->nonfinite_flag,
                     view->rows,
+                    config->tracker_spectral_pmax,
                     config->epsilon);
                 cudaCheck(cudaGetLastError());
             } else {
@@ -4113,6 +4810,15 @@ inline void llmc_normuon_encode_config(
         header, 37, config->tracker_wup_skew_threshold);
     llmc_normuon_header_write_float(
         header, 38, config->tracker_wdown_skew_threshold);
+    llmc_normuon_header_write_float(
+        header, 39, config->tracker_spectral_pmax);
+    llmc_normuon_header_write_float(
+        header, 40, config->cache_tracker_motion_threshold);
+    llmc_normuon_header_write_float(
+        header, 41, config->cache_tracker_solve_relative_threshold);
+    llmc_normuon_header_write_float(
+        header, 42, config->cache_tracker_spd_trust_threshold);
+    header[43] = static_cast<int>(config->cache_tracker_cg_iterations);
     header[31] = static_cast<int>(config->execution_mode);
     header[32] = static_cast<int>(config->correction_mode);
     int cursor = 64;
@@ -4174,6 +4880,22 @@ inline bool llmc_normuon_decode_config(
             llmc_normuon_header_read_float(header, 37);
         config->tracker_wdown_skew_threshold =
             llmc_normuon_header_read_float(header, 38);
+    }
+    if (version >=
+        LLMC_NORMUON_COMPANION_VERSION_TRACKER_SPECTRAL_PMAX) {
+        config->tracker_spectral_pmax =
+            llmc_normuon_header_read_float(header, 39);
+    }
+    if (version >=
+        LLMC_NORMUON_COMPANION_VERSION_CACHE_INVERSE_ROOT_TRACKER) {
+        config->cache_tracker_motion_threshold =
+            llmc_normuon_header_read_float(header, 40);
+        config->cache_tracker_solve_relative_threshold =
+            llmc_normuon_header_read_float(header, 41);
+        config->cache_tracker_spd_trust_threshold =
+            llmc_normuon_header_read_float(header, 42);
+        config->cache_tracker_cg_iterations =
+            static_cast<uint32_t>(header[43]);
     }
     config->execution_mode =
         version >= LLMC_NORMUON_COMPANION_VERSION_EXECUTION_MODE
