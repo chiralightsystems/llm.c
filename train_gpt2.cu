@@ -2,6 +2,8 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 #include <unistd.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -641,9 +643,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
-    int depth = atoi(depth_str);
-    assert(depth > 0); // atoi returns 0 if not a number
+bool gpt2_set_hyperparameters(GPT2Config* config, int depth, int max_seq_len) {
     int channels, num_heads;
     if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
     else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
@@ -653,11 +653,63 @@ void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
     else if (depth == 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
     else if (depth == 72) { channels = 2880; num_heads = 30; } // (unofficial) 7.3B
     else if (depth == 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
-    else { fprintf(stderr, "Unsupported GPT-2 depth: %d\n", depth); exit(EXIT_FAILURE); }
+    else { return false; }
     config->num_layers = depth;
     config->channels = channels;
     config->num_heads = num_heads;
-    config->max_seq_len = 1024;
+    config->max_seq_len = max_seq_len;
+    return true;
+}
+
+static bool parse_positive_int_(const char* text, const char** end, int* value) {
+    if (text == NULL || *text == '\0') {
+        return false;
+    }
+    errno = 0;
+    char* parsed_end = NULL;
+    long parsed = strtol(text, &parsed_end, 10);
+    if (parsed_end == text || errno == ERANGE || parsed <= 0 || parsed > INT_MAX) {
+        return false;
+    }
+    *end = parsed_end;
+    *value = (int)parsed;
+    return true;
+}
+
+bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
+    // Preserve the historical dX and gpt2:dX forms at maxT=1024, while
+    // allowing an explicit context override as gpt2:dX:tY.
+    if (config == NULL || descriptor == NULL) {
+        return false;
+    }
+    const char* depth_text = NULL;
+    bool explicit_gpt2 = false;
+    if (descriptor[0] == 'd') {
+        depth_text = descriptor + 1;
+    } else if (strncmp(descriptor, "gpt2:d", 6) == 0) {
+        depth_text = descriptor + 6;
+        explicit_gpt2 = true;
+    } else {
+        return false;
+    }
+
+    const char* depth_end = NULL;
+    int depth = 0;
+    if (!parse_positive_int_(depth_text, &depth_end, &depth)) {
+        return false;
+    }
+
+    int max_seq_len = 1024;
+    if (*depth_end != '\0') {
+        if (!explicit_gpt2 || strncmp(depth_end, ":t", 2) != 0) {
+            return false;
+        }
+        const char* seq_end = NULL;
+        if (!parse_positive_int_(depth_end + 2, &seq_end, &max_seq_len) || *seq_end != '\0') {
+            return false;
+        }
+    }
+    return gpt2_set_hyperparameters(config, depth, max_seq_len);
 }
 
 void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
@@ -687,16 +739,14 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
 void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
-    // - new explicit format "gpt2:dX", same as above, e.g. "gpt2:d48" for GPT-2 with 48 layers.
+    // - explicit "gpt2:dX", or "gpt2:dX:tY" to override max context length.
     // - "gpt3:cX", where X is now the channel count, e.g. "gpt3:c768" is the smallest GPT-3 model.
 
     // check the valid prexies and dispatch to the right setup function
     assert(descriptor != NULL);
     size_t len = strlen(descriptor);
-    if (len > 1 && descriptor[0] == 'd') {
-        gpt2_set_hyperparameters(&model->config, descriptor + 1); // pass along the depth str without the 'd'
-    } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
-        gpt2_set_hyperparameters(&model->config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
+    if (gpt2_config_from_descriptor(&model->config, descriptor)) {
+        // configured above
     } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
         gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
     } else {
@@ -2149,6 +2199,8 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
     dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
+    printf0("| train_data_format     | %-50s |\n", dataloader_token_format_name(train_loader.token_format));
+    printf0("| val_data_format       | %-50s |\n", dataloader_token_format_name(val_loader.token_format));
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {

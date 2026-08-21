@@ -445,6 +445,64 @@ static LlmcOptimizerMatrixView rectangular_view(int width, bool wup) {
     return view;
 }
 
+static void test_gpt2_context_descriptor() {
+    GPT2Config legacy = {};
+    GPT2Config explicit_legacy = {};
+    GPT2Config extended = {};
+    TEST_CHECK(
+        gpt2_config_from_descriptor(&legacy, "d48"),
+        "legacy GPT-2 XL descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(&explicit_legacy, "gpt2:d48"),
+        "explicit GPT-2 XL descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(&extended, "gpt2:d48:t2048"),
+        "explicit GPT-2 XL 2048-context descriptor parses");
+    TEST_CHECK(
+        legacy.num_layers == 48 && legacy.channels == 1600 &&
+            legacy.num_heads == 25 && legacy.max_seq_len == 1024,
+        "legacy GPT-2 XL shape is unchanged");
+    TEST_CHECK(
+        explicit_legacy.num_layers == 48 && explicit_legacy.channels == 1600 &&
+            explicit_legacy.num_heads == 25 && explicit_legacy.max_seq_len == 1024,
+        "explicit GPT-2 XL default context is unchanged");
+    TEST_CHECK(
+        extended.num_layers == 48 && extended.channels == 1600 &&
+            extended.num_heads == 25 && extended.max_seq_len == 2048,
+        "GPT-2 XL context override changes maxT only");
+
+    const char* malformed[] = {
+        "gpt2:d48:t", "gpt2:d48:t0", "gpt2:d48:t2048junk",
+        "gpt2:d48:x2048", "gpt2:d:t2048", "gpt2:d999:t2048",
+    };
+    for (const char* descriptor : malformed) {
+        GPT2Config rejected = {};
+        TEST_CHECK(
+            !gpt2_config_from_descriptor(&rejected, descriptor),
+            "malformed GPT-2 context descriptor is rejected");
+    }
+
+    explicit_legacy.vocab_size = extended.vocab_size = 50257;
+    explicit_legacy.padded_vocab_size = extended.padded_vocab_size = 50304;
+    size_t legacy_elements[NUM_PARAMETER_TENSORS];
+    size_t legacy_sizeof[NUM_PARAMETER_TENSORS];
+    size_t extended_elements[NUM_PARAMETER_TENSORS];
+    size_t extended_sizeof[NUM_PARAMETER_TENSORS];
+    fill_in_parameter_sizes(legacy_elements, legacy_sizeof, explicit_legacy);
+    fill_in_parameter_sizes(extended_elements, extended_sizeof, extended);
+    size_t legacy_total = 0;
+    size_t extended_total = 0;
+    for (int tensor = 0; tensor < NUM_PARAMETER_TENSORS; ++tensor) {
+        legacy_total += legacy_elements[tensor];
+        extended_total += extended_elements[tensor];
+    }
+    TEST_CHECK(legacy_total == 1557686400ULL, "GPT-2 XL padded parameter count is stable");
+    TEST_CHECK(extended_total == 1559324800ULL, "GPT-2 XL 2048-context parameter count is correct");
+    TEST_CHECK(
+        extended_total - legacy_total == 1024ULL * 1600ULL,
+        "context extension only adds positional embeddings");
+}
+
 static std::vector<floatX> quantize_to_floatx(
     const std::vector<float>& values) {
     std::vector<floatX> output(values.size());
@@ -1644,6 +1702,7 @@ int main() {
     set_zero_configs(&multi_gpu_config, 0, 1);
     common_start(false, false);
 
+    test_gpt2_context_descriptor();
     test_parameter_plan_and_views();
     test_rectangular_scratch_update();
     test_rectangular_tracker_smoke();

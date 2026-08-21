@@ -10,8 +10,11 @@ Implements:
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <errno.h>
 #include <assert.h>
 #include <string.h>
+#include <sys/types.h>
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
 // defines: mallocCheck
 #include "utils.h"
@@ -25,6 +28,19 @@ Implements:
 // ----------------------------------------------------------------------------
 // Distributed Data Loader
 #define HEADER_SIZE 256
+
+typedef enum {
+    DATALOADER_TOKEN_FORMAT_LLMC_UINT16 = 0,
+    DATALOADER_TOKEN_FORMAT_NUMPY_UINT32 = 1,
+} DataLoaderTokenFormat;
+
+static const char* dataloader_token_format_name(DataLoaderTokenFormat format) {
+    switch (format) {
+        case DATALOADER_TOKEN_FORMAT_LLMC_UINT16: return "llmc_uint16";
+        case DATALOADER_TOKEN_FORMAT_NUMPY_UINT32: return "numpy_uint32";
+        default: return "unknown";
+    }
+}
 
 typedef struct {
     // variables related to distributed training
@@ -44,6 +60,7 @@ typedef struct {
     FILE* tokens_file;
     // data buffers
     uint16_t* buffer; // we fread data from file into this buffer
+    uint32_t* buffer_u32; // direct NumPy uint32 input_ids path
     int* inputs;  // input tokens into transformer
     int* targets; // target tokens for the transformer
     // random shuffle related variables
@@ -55,8 +72,187 @@ typedef struct {
     size_t total_batch_size_bytes;  // total across all processes
     size_t local_batch_offset_bytes;  // inner-sample offset for this process
     size_t header_bytes;  // header size in bytes
+    size_t token_size_bytes;
     int64_t file_size_bytes;
+    DataLoaderTokenFormat token_format;
 } DataLoader;
+
+static void dataloader_seek_(FILE* file, int64_t offset, int whence) {
+#ifdef _WIN32
+    int status = _fseeki64(file, offset, whence);
+#else
+    int status = fseeko(file, (off_t)offset, whence);
+#endif
+    if (status != 0) {
+        fprintf(stderr, "Error: failed to seek to byte offset %lld in token data\n",
+                (long long)offset);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static int64_t dataloader_tell_(FILE* file) {
+#ifdef _WIN32
+    __int64 offset = _ftelli64(file);
+#else
+    off_t offset = ftello(file);
+#endif
+    if (offset < 0) {
+        fprintf(stderr, "Error: failed to query token data file position\n");
+        exit(EXIT_FAILURE);
+    }
+    return (int64_t)offset;
+}
+
+static uint32_t dataloader_u32_le_(const unsigned char* bytes) {
+    return ((uint32_t)bytes[0]) |
+           ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
+}
+
+static const char* dataloader_numpy_dict_value_(const char* header, const char* key) {
+    char single_quoted[64];
+    char double_quoted[64];
+    snprintf(single_quoted, sizeof(single_quoted), "'%s'", key);
+    snprintf(double_quoted, sizeof(double_quoted), "\"%s\"", key);
+    const char* entry = strstr(header, single_quoted);
+    if (entry == NULL) {
+        entry = strstr(header, double_quoted);
+    }
+    if (entry == NULL) {
+        return NULL;
+    }
+    const char* value = strchr(entry, ':');
+    if (value == NULL) {
+        return NULL;
+    }
+    ++value;
+    while (isspace((unsigned char)*value)) {
+        ++value;
+    }
+    return value;
+}
+
+static int dataloader_numpy_shape_2d_(
+        const char* header,
+        uint64_t* rows,
+        uint64_t* columns) {
+    const char* cursor = dataloader_numpy_dict_value_(header, "shape");
+    if (cursor == NULL || *cursor != '(') {
+        return 0;
+    }
+    ++cursor;
+    while (isspace((unsigned char)*cursor)) {
+        ++cursor;
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long long parsed_rows = strtoull(cursor, &end, 10);
+    if (end == cursor || errno == ERANGE || parsed_rows == 0) {
+        return 0;
+    }
+    cursor = end;
+    while (isspace((unsigned char)*cursor)) {
+        ++cursor;
+    }
+    if (*cursor++ != ',') {
+        return 0;
+    }
+    while (isspace((unsigned char)*cursor)) {
+        ++cursor;
+    }
+    errno = 0;
+    unsigned long long parsed_columns = strtoull(cursor, &end, 10);
+    if (end == cursor || errno == ERANGE || parsed_columns == 0) {
+        return 0;
+    }
+    cursor = end;
+    while (isspace((unsigned char)*cursor)) {
+        ++cursor;
+    }
+    if (*cursor == ',') {
+        ++cursor;
+        while (isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+    }
+    if (*cursor != ')') {
+        return 0;
+    }
+    *rows = (uint64_t)parsed_rows;
+    *columns = (uint64_t)parsed_columns;
+    return 1;
+}
+
+static int64_t dataloader_load_numpy_uint32_(
+        DataLoader* loader,
+        const unsigned char prefix[12],
+        const char* filename) {
+    int major = (int)prefix[6];
+    size_t preamble_bytes;
+    uint32_t header_length;
+    int minor = (int)prefix[7];
+    if (major == 1 && minor == 0) {
+        preamble_bytes = 10;
+        header_length = (uint32_t)prefix[8] | ((uint32_t)prefix[9] << 8);
+    } else if (major == 2 && minor == 0) {
+        preamble_bytes = 12;
+        header_length = dataloader_u32_le_(prefix + 8);
+    } else {
+        fprintf(stderr, "Error: unsupported NumPy format version %d.%d in %s\n",
+                major, minor, filename);
+        exit(EXIT_FAILURE);
+    }
+    if (header_length == 0 || header_length > 1024U * 1024U) {
+        fprintf(stderr, "Error: invalid NumPy header length %u in %s\n",
+                header_length, filename);
+        exit(EXIT_FAILURE);
+    }
+
+    char* header = (char*)mallocCheck((size_t)header_length + 1);
+    dataloader_seek_(loader->tokens_file, (int64_t)preamble_bytes, SEEK_SET);
+    freadCheck(header, 1, header_length, loader->tokens_file);
+    header[header_length] = '\0';
+    const char* dtype = dataloader_numpy_dict_value_(header, "descr");
+    int has_uint32_le = dtype != NULL &&
+        ((*dtype == '\'' && strncmp(dtype, "'<u4'", 5) == 0) ||
+         (*dtype == '"' && strncmp(dtype, "\"<u4\"", 5) == 0));
+    const char* fortran_order = dataloader_numpy_dict_value_(header, "fortran_order");
+    int has_c_order = fortran_order != NULL && strncmp(fortran_order, "False", 5) == 0;
+    uint64_t rows = 0;
+    uint64_t columns = 0;
+    int has_2d_shape = dataloader_numpy_shape_2d_(header, &rows, &columns);
+    if (!has_uint32_le || !has_c_order || !has_2d_shape) {
+        fprintf(stderr,
+                "Error: NumPy token data must be a C-contiguous 2-D little-endian uint32 array: %s\n",
+                filename);
+        free(header);
+        exit(EXIT_FAILURE);
+    }
+    free(header);
+
+    loader->header_bytes = preamble_bytes + (size_t)header_length;
+    loader->token_size_bytes = sizeof(uint32_t);
+    loader->token_format = DATALOADER_TOKEN_FORMAT_NUMPY_UINT32;
+    dataloader_seek_(loader->tokens_file, 0, SEEK_END);
+    loader->file_size_bytes = dataloader_tell_(loader->tokens_file);
+    if (rows > UINT64_MAX / columns) {
+        fprintf(stderr, "Error: NumPy token shape overflows: %s\n", filename);
+        exit(EXIT_FAILURE);
+    }
+    uint64_t token_count = rows * columns;
+    if (token_count > ((uint64_t)INT64_MAX - loader->header_bytes) / sizeof(uint32_t)) {
+        fprintf(stderr, "Error: NumPy token payload is too large: %s\n", filename);
+        exit(EXIT_FAILURE);
+    }
+    int64_t expected_file_size =
+        (int64_t)loader->header_bytes + (int64_t)(token_count * sizeof(uint32_t));
+    if (loader->file_size_bytes != expected_file_size) {
+        fprintf(stderr, "Error: NumPy token shape does not match file size: %s\n", filename);
+        exit(EXIT_FAILURE);
+    }
+    return (int64_t)token_count;
+}
 
 int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     if (loader->should_shuffle) {
@@ -69,30 +265,44 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
         fcloseCheck(loader->tokens_file);
     }
     loader->tokens_file = fopenCheck(filename, "rb");
-    // validate the header
-    int header[HEADER_SIZE];
-    freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
-    if (header[0] != 20240520) {
-        printf("Bad magic in the data file\n");
-        printf("---> HINT: Are you passing in a correct file?\n");
-        printf("---> HINT: The data encoding may have changed, re-run data prepro or refer again to README.\n");
-        exit(EXIT_FAILURE);
+    unsigned char prefix[12];
+    freadCheck(prefix, 1, sizeof(prefix), loader->tokens_file);
+    dataloader_seek_(loader->tokens_file, 0, SEEK_SET);
+    int64_t ntok;
+    const unsigned char numpy_magic[6] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
+    if (memcmp(prefix, numpy_magic, sizeof(numpy_magic)) == 0) {
+        ntok = dataloader_load_numpy_uint32_(loader, prefix, filename);
+    } else {
+        // validate the legacy llm.c uint16 shard header
+        int header[HEADER_SIZE];
+        freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
+        if (header[0] != 20240520) {
+            printf("Bad magic in the data file\n");
+            printf("---> HINT: expected an llm.c uint16 shard or NumPy uint32 input_ids array.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
+        ntok = header[2];
+        loader->header_bytes = HEADER_SIZE * sizeof(int);
+        loader->token_size_bytes = sizeof(uint16_t);
+        loader->token_format = DATALOADER_TOKEN_FORMAT_LLMC_UINT16;
+        dataloader_seek_(loader->tokens_file, 0, SEEK_END);
+        loader->file_size_bytes = dataloader_tell_(loader->tokens_file);
+        int64_t expected_file_size =
+            (int64_t)loader->header_bytes + ntok * (int64_t)sizeof(uint16_t);
+        if (loader->file_size_bytes != expected_file_size) {
+            printf("Error: file size is not as expected\n");
+            exit(EXIT_FAILURE);
+        }
     }
-    if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
-    int64_t ntok = header[2]; // number of tokens in the file
     assert(ntok > 0); // we expect some tokens in the file. this should never trip, right?
-    // determine the file size and make sure it is consistent with the number of tokens
-    fseekCheck(loader->tokens_file, 0, SEEK_END); // seek to end of file
-    loader->file_size_bytes = ftell(loader->tokens_file); // read the offset, i.e. file size
-    fseekCheck(loader->tokens_file, 0, SEEK_SET); // seek back to the beginning
-    // we expect ntok in the file to be consistent with filesize, assert that is the case
-    int64_t expected_file_size = HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
-    if (loader->file_size_bytes != expected_file_size) {
-        printf("Error: file size is not as expected\n");
-        exit(EXIT_FAILURE);
-    }
-    // -1 uint16_t due to us taking B*T+1 tokens but moving by B*T tokens
-    loader->shard_num_samples = (ntok * sizeof(uint16_t) - sizeof(uint16_t)) / loader->total_batch_size_bytes;
+    loader->total_batch_size_bytes =
+        (loader->num_processes * (loader->B * loader->T)) * loader->token_size_bytes;
+    loader->local_batch_offset_bytes =
+        loader->process_rank * loader->B * loader->T * loader->token_size_bytes;
+    // -1 token due to taking B*T+1 tokens while moving by B*T tokens.
+    loader->shard_num_samples =
+        (size_t)(ntok - 1) / (loader->num_processes * loader->B * loader->T);
     return ntok;
 }
 
@@ -152,9 +362,6 @@ void dataloader_init(DataLoader *loader,
     loader->T = T;
     loader->tokens_file = NULL;
     loader->should_shuffle = should_shuffle;
-    loader->header_bytes = HEADER_SIZE * sizeof(int);
-    loader->total_batch_size_bytes = ((loader->num_processes * (loader->B * loader->T)) * sizeof(uint16_t));
-    loader->local_batch_offset_bytes = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
 
     // glob to get the list of files matching the pattern, these are our data shards
     int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
@@ -192,6 +399,7 @@ void dataloader_init(DataLoader *loader,
 
     // allocate all the space we'll need
     loader->buffer = (uint16_t*)mallocCheck((B * T + 1) * sizeof(uint16_t));
+    loader->buffer_u32 = (uint32_t*)mallocCheck((B * T + 1) * sizeof(uint32_t));
     loader->inputs = (int*)mallocCheck(B * T * sizeof(int));
     loader->targets = (int*)mallocCheck(B * T * sizeof(int));
     loader->num_tokens = ntok_total;
@@ -209,13 +417,23 @@ void dataloader_load_batch(DataLoader* loader) {
 
     size_t B = loader->B;
     size_t T = loader->T;
-    // read B*T+1 uint16_t tokens from the file into buffer
-    fseekCheck(loader->tokens_file, (int) current_offset, SEEK_SET);
-    freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
-    // decode the buffer into inputs and targets (cast to int)
-    for (int i = 0; i < B*T; i++) {
-        loader->inputs[i] = (int)loader->buffer[i];
-        loader->targets[i] = (int)loader->buffer[i+1];
+    dataloader_seek_(loader->tokens_file, current_offset, SEEK_SET);
+    if (loader->token_format == DATALOADER_TOKEN_FORMAT_NUMPY_UINT32) {
+        freadCheck(loader->buffer_u32, sizeof(uint32_t), B*T+1, loader->tokens_file);
+        for (size_t i = 0; i < B*T; i++) {
+            if (loader->buffer_u32[i] > INT32_MAX || loader->buffer_u32[i + 1] > INT32_MAX) {
+                fprintf(stderr, "Error: uint32 token id exceeds the signed int runtime range\n");
+                exit(EXIT_FAILURE);
+            }
+            loader->inputs[i] = (int)loader->buffer_u32[i];
+            loader->targets[i] = (int)loader->buffer_u32[i+1];
+        }
+    } else {
+        freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
+        for (size_t i = 0; i < B*T; i++) {
+            loader->inputs[i] = (int)loader->buffer[i];
+            loader->targets[i] = (int)loader->buffer[i+1];
+        }
     }
 }
 
@@ -238,6 +456,7 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t curr
 
 void dataloader_free(DataLoader *loader) {
     free(loader->buffer);
+    free(loader->buffer_u32);
     free(loader->inputs);
     free(loader->targets);
     if (loader->should_shuffle) {

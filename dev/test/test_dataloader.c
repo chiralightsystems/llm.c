@@ -266,6 +266,70 @@ void test_multiprocess_shuffled(void) {
     printf("OK\n");
 }
 
+void write_numpy_uint32(
+        const char *filename,
+        int major_version,
+        uint32_t *tokens,
+        size_t rows,
+        size_t columns) {
+    assert(major_version == 1 || major_version == 2);
+    const size_t count = rows * columns;
+    const uint32_t header_length = major_version == 1 ? 118 : 116;
+    const size_t preamble_bytes = major_version == 1 ? 10 : 12;
+    unsigned char preamble[12] = {
+        0x93, 'N', 'U', 'M', 'P', 'Y', (unsigned char)major_version, 0,
+        (unsigned char)(header_length & 0xff),
+        (unsigned char)((header_length >> 8) & 0xff),
+        (unsigned char)((header_length >> 16) & 0xff),
+        (unsigned char)((header_length >> 24) & 0xff),
+    };
+    char dictionary[96];
+    int dictionary_length = snprintf(
+        dictionary,
+        sizeof(dictionary),
+        "{'descr': '<u4', 'fortran_order': False, 'shape': (%zu, %zu), }",
+        rows,
+        columns);
+    assert(dictionary_length > 0 && (uint32_t)dictionary_length < header_length);
+    char header[118];
+    memset(header, ' ', sizeof(header));
+    memcpy(header, dictionary, (size_t)dictionary_length);
+    header[header_length - 1] = '\n';
+
+    FILE *file = fopenCheck(filename, "wb");
+    fwriteCheck(preamble, 1, preamble_bytes, file);
+    fwriteCheck(header, 1, header_length, file);
+    fwriteCheck(tokens, sizeof(uint32_t), count, file);
+    fcloseCheck(file);
+}
+
+void test_numpy_uint32(void) {
+    printf("test_numpy_uint32... ");
+    uint32_t tokens[num_tokens];
+    for (int i = 0; i < num_tokens; ++i) {
+        tokens[i] = 70000U + (uint32_t)i;
+    }
+    for (int major_version = 1; major_version <= 2; ++major_version) {
+        const char *filename = major_version == 1 ? "direct_uint32_v1.npy" : "direct_uint32_v2.npy";
+        write_numpy_uint32(filename, major_version, tokens, 20, 7);
+
+        DataLoader loader;
+        dataloader_init(&loader, filename, 4, 8, 0, 1, 0);
+        assert(loader.token_format == DATALOADER_TOKEN_FORMAT_NUMPY_UINT32);
+        assert(loader.header_bytes == 128);
+        assert(loader.file_size_bytes == 128 + (int64_t)num_tokens * 4);
+        assert(loader.num_tokens == num_tokens);
+        for (int batch = 0; batch < 4; ++batch) {
+            dataloader_next_batch(&loader);
+            checkRange(loader.inputs, 70000 + batch * 32, 70032 + batch * 32);
+            checkRange(loader.targets, 70001 + batch * 32, 70033 + batch * 32);
+        }
+        dataloader_free(&loader);
+        remove(filename);
+    }
+    printf("OK\n");
+}
+
 int main(void) {
 
     // generate a few dummy shards of data with incrementing tokens
@@ -293,6 +357,7 @@ int main(void) {
     test_multiprocess_simple();
     test_shuffled();
     test_multiprocess_shuffled();
+    test_numpy_uint32();
 
     // clean up the shards
     for (int shard_id = 0; shard_id < num_shards; shard_id++) {
