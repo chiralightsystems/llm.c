@@ -818,7 +818,13 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
 
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
-void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
+void gpt2_forward(
+    GPT2 *model,
+    const int* inputs,
+    size_t B,
+    size_t T,
+    int validation_attention_blackout_width = 0,
+    bool validation_attention_disabled = false) {
     NVTX_RANGE_FN();
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
@@ -892,9 +898,36 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        if (!validation_attention_disabled) {
+            matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+            if (validation_attention_blackout_width > 0) {
+                attention_forward_cudnn_recent_blackout(
+                    l_atty,
+                    l_qkvr,
+                    B,
+                    T,
+                    NH,
+                    C,
+                    validation_attention_blackout_width,
+                    main_stream);
+            } else {
+                attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+            }
+            matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        } else {
+            // Exact attention-off ablation: remove the full residual branch,
+            // including the learned attention output-projection bias.
+            cudaCheck(cudaMemsetAsync(
+                scratch,
+                0,
+                B * T * C * sizeof(floatX),
+                main_stream));
+        }
         #else
+        if (validation_attention_blackout_width != 0 || validation_attention_disabled) {
+            fprintf(stderr, "validation attention ablations require the cuDNN backend\n");
+            exit(EXIT_FAILURE);
+        }
         floatX* l_att = acts.att + l * B * NH * T * T;
         if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
@@ -903,9 +936,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
-        #endif
-
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        #endif
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
@@ -939,10 +971,25 @@ float gpt2_validate(
     const int* targets,
     size_t B,
     size_t T,
-    bool mask_sequence_final_target = false) {
+    bool mask_sequence_final_target = false,
+    int validation_attention_blackout_width = 0,
+    bool validation_attention_disabled = false,
+    int validation_loss_ignore_prefix = 0) {
     assert(targets != NULL);
+    assert(validation_attention_blackout_width >= 0);
+    assert(validation_attention_blackout_width < (int)T);
+    assert(validation_loss_ignore_prefix >= 0);
+    assert((size_t)validation_loss_ignore_prefix +
+               (mask_sequence_final_target ? 1U : 0U) <
+           T);
     // forward the model itself
-    gpt2_forward(model, inputs, B, T);
+    gpt2_forward(
+        model,
+        inputs,
+        B,
+        T,
+        validation_attention_blackout_width,
+        validation_attention_disabled);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
@@ -950,8 +997,10 @@ float gpt2_validate(
     NvtxRange classifier_and_loss_range("classifier_and_loss");
     ActivationTensors acts = model->acts;
     float mean_loss = 0.0f;
-    const size_t supervised_targets = llmc_supervised_target_count(
-        B, T, mask_sequence_final_target);
+    const size_t supervised_targets_per_row =
+        T - (mask_sequence_final_target ? 1U : 0U) -
+        (size_t)validation_loss_ignore_prefix;
+    const size_t supervised_targets = B * supervised_targets_per_row;
     // fused classifier: does the forward pass and first part of the backward pass
     const float dloss = 1.0f / supervised_targets;
     // note: we don't need to generate dlogits here
@@ -971,8 +1020,14 @@ float gpt2_validate(
         main_stream,
         mask_sequence_final_target);
     cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B*T; i++) {
-        mean_loss += model->cpu_losses[i];
+    const size_t final_position_exclusive =
+        T - (mask_sequence_final_target ? 1U : 0U);
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t t = (size_t)validation_loss_ignore_prefix;
+             t < final_position_exclusive;
+             ++t) {
+            mean_loss += model->cpu_losses[b * T + t];
+        }
     }
     mean_loss /= supervised_targets;
     cudaCheck(cudaDeviceSynchronize());
@@ -1586,6 +1641,10 @@ void error_usage() {
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -vb <int>   validation recent-key blackout width, including current key (default = 0)\n");
+    fprintf(stderr, "  -vd <int>   validation attention disabled, full residual branch removed (0/1, default = 0)\n");
+    fprintf(stderr, "  -vp <int>   validation leading query positions excluded from loss (default = 0)\n");
+    fprintf(stderr, "  -vl <int>   print each validation batch loss and target count (0/1, default = 0)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -gs <uint64> sample RNG seed (default = 1337)\n");
@@ -1642,6 +1701,10 @@ int main(int argc, char *argv[]) {
     float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
+    int validation_attention_blackout_width = 0;
+    int validation_attention_disabled = 0;
+    int validation_loss_ignore_prefix = 0;
+    int validation_print_batch_losses = 0;
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     unsigned long long sample_rng_seed = 1337ULL;
@@ -1684,6 +1747,24 @@ int main(int argc, char *argv[]) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
+        // Keep evaluation-only controls outside the already very deep legacy
+        // else-if parser so MSVC does not exceed its nested-block limit.
+        if (strcmp(argv[i], "-vb") == 0) {
+            validation_attention_blackout_width = atoi(argv[i+1]);
+            continue;
+        }
+        if (strcmp(argv[i], "-vd") == 0) {
+            validation_attention_disabled = atoi(argv[i+1]);
+            continue;
+        }
+        if (strcmp(argv[i], "-vp") == 0) {
+            validation_loss_ignore_prefix = atoi(argv[i+1]);
+            continue;
+        }
+        if (strcmp(argv[i], "-vl") == 0) {
+            validation_print_batch_losses = atoi(argv[i+1]);
+            continue;
+        }
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
@@ -1970,6 +2051,38 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "-bp row_reset requires sequence length T >= 2\n");
         exit(EXIT_FAILURE);
     }
+    if (validation_attention_blackout_width < 0 ||
+        validation_attention_blackout_width >= T) {
+        fprintf(stderr, "-vb must be in [0,T)\n");
+        exit(EXIT_FAILURE);
+    }
+    if (validation_attention_disabled < 0 || validation_attention_disabled > 1) {
+        fprintf(stderr, "-vd must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (validation_attention_disabled != 0 &&
+        validation_attention_blackout_width != 0) {
+        fprintf(stderr, "-vd 1 and positive -vb are separate ablations\n");
+        exit(EXIT_FAILURE);
+    }
+    if (validation_loss_ignore_prefix < 0 ||
+        validation_loss_ignore_prefix +
+                (mask_sequence_final_target ? 1 : 0) >=
+            T) {
+        fprintf(stderr, "-vp must leave at least one supervised validation target per row\n");
+        exit(EXIT_FAILURE);
+    }
+    if (validation_print_batch_losses < 0 || validation_print_batch_losses > 1) {
+        fprintf(stderr, "-vl must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    #ifndef ENABLE_CUDNN
+    if (validation_attention_blackout_width != 0 ||
+        validation_attention_disabled != 0) {
+        fprintf(stderr, "-vb and -vd require an ENABLE_CUDNN build\n");
+        exit(EXIT_FAILURE);
+    }
+    #endif
     if (!llmc_normuon_validate_config(
             &optimizer_config,
             optimizer_config_error,
@@ -1988,6 +2101,10 @@ int main(int argc, char *argv[]) {
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     int supervised_targets_per_fwdbwd =
         B * (T - (mask_sequence_final_target ? 1 : 0)) *
+        multi_gpu_config.num_processes;
+    int validation_supervised_targets_per_batch =
+        B * (T - (mask_sequence_final_target ? 1 : 0) -
+             validation_loss_ignore_prefix) *
         multi_gpu_config.num_processes;
     // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
@@ -2019,6 +2136,16 @@ int main(int argc, char *argv[]) {
             llmc_sequence_boundary_policy_name(sequence_boundary_policy));
     printf0("| supervised targets    | %-50d |\n",
             supervised_targets_per_fwdbwd);
+    printf0("| val attention blackout | %-49d |\n",
+            validation_attention_blackout_width);
+    printf0("| val attention disabled | %-49d |\n",
+            validation_attention_disabled);
+    printf0("| val loss ignore prefix | %-49d |\n",
+            validation_loss_ignore_prefix);
+    printf0("| val supervised targets | %-49d |\n",
+            validation_supervised_targets_per_batch);
+    printf0("| val batch loss logging | %-49d |\n",
+            validation_print_batch_losses);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
@@ -2652,13 +2779,25 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                val_loss += gpt2_validate(
+                float val_batch_loss = gpt2_validate(
                     &model,
                     val_loader.inputs,
                     val_loader.targets,
                     B,
                     T,
-                    mask_sequence_final_target);
+                    mask_sequence_final_target,
+                    validation_attention_blackout_width,
+                    validation_attention_disabled != 0,
+                    validation_loss_ignore_prefix);
+                val_loss += val_batch_loss;
+                if (validation_print_batch_losses != 0) {
+                    printf0(
+                        "val batch %d/%d loss %.9f targets %d\n",
+                        i + 1,
+                        val_num_batches,
+                        val_batch_loss,
+                        validation_supervised_targets_per_batch);
+                }
             }
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;

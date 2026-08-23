@@ -53,15 +53,25 @@ enum UIDs {
 };
 
 // Need a cache because graph->build_operation_graph() is slow but everything else seems fast
-using cache_type_fwd = std::map<std::tuple<int,int,int,int, int>, std::shared_ptr<fe::graph::Graph>>;
+using cache_type_fwd = std::map<std::tuple<int,int,int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
 using cache_type_bwd = std::map<std::tuple<int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
 
 // Loosely based on cuDNN frontend samples functions and massively simplified
-auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_only) {
+auto lookup_cache_or_build_graph_fwd(
+    int B,
+    int H,
+    int T,
+    int HS,
+    int is_inference_only,
+    int physical_T = -1) {
 
     static cache_type_fwd user_maintained_cache_fwd;
 
-    auto key = std::make_tuple(B, H, T, HS, is_inference_only);
+    if (physical_T < 0) {
+        physical_T = T;
+    }
+    assert(T > 0 && physical_T >= T);
+    auto key = std::make_tuple(B, H, T, physical_T, HS, is_inference_only);
 
     auto it = user_maintained_cache_fwd.find(key);
     if (it != user_maintained_cache_fwd.end()) {
@@ -77,15 +87,15 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
     auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
                                .set_dim({B, H, T, HS})
                                .set_uid(Q_UID)
-                               .set_stride({3 * H * HS * T,  HS, 3 * H * HS, 1}));
+                               .set_stride({3 * H * HS * physical_T,  HS, 3 * H * HS, 1}));
     auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
                                .set_dim({B, H, T, HS})
                                .set_uid(K_UID)
-                               .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
+                               .set_stride({3 * H * HS * physical_T, HS, 3 * H * HS, 1}));
     auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
                                .set_dim({B, H, T, HS})
                                .set_uid(V_UID)
-                               .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
+                               .set_stride({3 * H * HS * physical_T, HS, 3 * H * HS, 1}));
     auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
                                .set_dim({1, 1, 1, 1})
                                .set_stride({1, 1, 1, 1})
@@ -102,13 +112,13 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
     auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
 
     // Output is (B, T, NH, HS) BF16/FP16 and stats for backward pass is (B, NH, T) FP32
-    O->set_output(true).set_dim({B, H, T, HS}).set_stride({H * HS * T, HS, H * HS, 1}).set_uid(O_UID);
+    O->set_output(true).set_dim({B, H, T, HS}).set_stride({H * HS * physical_T, HS, H * HS, 1}).set_uid(O_UID);
 
     assert(stats == nullptr || is_inference_only == false);
     if (is_inference_only == false) {
         stats->set_output(true).set_data_type(fe::DataType_t::FLOAT)
                                .set_dim({B, H, T, 1})
-                               .set_stride({H * T, T, 1, 1})
+                               .set_stride({H * physical_T, physical_T, 1, 1})
                                .set_uid(Stats_UID);
     }
 
@@ -249,6 +259,46 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     }
 
     // Execute graph
+    checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
+    cudaCheck(cudaGetLastError());
+}
+
+void attention_forward_cudnn_recent_blackout(
+    floatX* out,
+    floatX* inp,
+    int B,
+    int T,
+    int NH,
+    int C,
+    int blackout_width,
+    cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    assert(blackout_width > 0 && blackout_width < T);
+
+    const int HS = C / NH;
+    const int visible_T = T - blackout_width;
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
+
+    // Query t may see exactly keys k <= t-blackout_width. Relabeling query
+    // rows blackout_width..T-1 and key/value rows 0..T-blackout_width-1 onto
+    // 0..visible_T-1 turns this into ordinary top-left causal attention.
+    // Physical strides retain T so each batch stays in its original buffer.
+    cudaCheck(cudaMemsetAsync(out, 0, (size_t)B * T * C * sizeof(floatX), stream));
+    auto graph = lookup_cache_or_build_graph_fwd(
+        B, NH, visible_T, HS, true, T);
+
+    void* devPtrQ = inp + (size_t)blackout_width * 3 * C;
+    void* devPtrK = inp + C;
+    void* devPtrV = inp + 2 * C;
+    void* devPtrO = out + (size_t)blackout_width * C;
+    float attn_scale_cpu = 1.0f / sqrtf(HS);
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {Q_UID, devPtrQ},
+        {K_UID, devPtrK},
+        {V_UID, devPtrV},
+        {Attn_scale_UID, &attn_scale_cpu},
+        {O_UID, devPtrO},
+    };
     checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
     cudaCheck(cudaGetLastError());
 }
