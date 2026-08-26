@@ -2,6 +2,8 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 #include <unistd.h>
+#include <cmath>
+#include <cstdint>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -42,6 +44,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // Packed128, f128, x128
 // warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel, cudaMallocConditionallyManaged
 #include "llmc/cuda_utils.cuh"
+// defines: LlmcRopeCache, llmc_rope_cache_*, llmc_rope_apply_qk_*
+#include "llmc/rope.cuh"
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
 #include "llmc/cublas_common.h"
@@ -131,6 +135,26 @@ size_t llmc_supervised_target_count(
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
+enum LlmcPositionEncoding {
+    LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE = 0,
+    LLMC_POSITION_ENCODING_ROPE = 1,
+};
+
+constexpr float LLMC_GPT2_INITIALIZER_STD = 0.02f;
+constexpr float LLMC_ROPE_THETA_DEFAULT = 10000.0f;
+constexpr int LLMC_MODEL_VERSION_FP32_ABSOLUTE = 3;
+constexpr int LLMC_MODEL_VERSION_BF16_ABSOLUTE = 5;
+constexpr int LLMC_MODEL_VERSION_FP32_ROPE = 6;
+constexpr int LLMC_MODEL_VERSION_BF16_ROPE = 7;
+
+const char* llmc_position_encoding_name(int position_encoding) {
+    switch (position_encoding) {
+        case LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE: return "learned_absolute";
+        case LLMC_POSITION_ENCODING_ROPE: return "rope";
+        default: return "unknown";
+    }
+}
+
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
@@ -138,7 +162,43 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    int position_encoding; // LlmcPositionEncoding
+    int rope_rotary_dim; // rotated dimensions per head; 0 for learned absolute
+    float rope_theta; // RoPE frequency base; 0 for learned absolute
+    float initializer_std; // std for token/QKV/MLP input projections
+    float residual_projection_std; // std for attention/MLP residual projections
 } GPT2Config;
+
+void gpt2_set_initializer_defaults(GPT2Config* config) {
+    config->initializer_std = LLMC_GPT2_INITIALIZER_STD;
+    const float residual_scale =
+        1.0f / sqrtf(2.0f * config->num_layers);
+    // Preserve the historical operation order so legacy descriptor
+    // initialization remains bit-identical.
+    config->residual_projection_std =
+        LLMC_GPT2_INITIALIZER_STD * residual_scale;
+}
+
+bool gpt2_validate_position_config(const GPT2Config* config) {
+    if (config == nullptr || config->num_heads <= 0 || config->channels <= 0 ||
+        config->channels % config->num_heads != 0 ||
+        !std::isfinite(config->initializer_std) || config->initializer_std <= 0.0f ||
+        !std::isfinite(config->residual_projection_std) ||
+        config->residual_projection_std <= 0.0f) {
+        return false;
+    }
+    if (config->position_encoding == LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
+        return config->rope_rotary_dim == 0 && config->rope_theta == 0.0f;
+    }
+    if (config->position_encoding != LLMC_POSITION_ENCODING_ROPE) {
+        return false;
+    }
+    const int head_dim = config->channels / config->num_heads;
+    return config->rope_rotary_dim > 0 &&
+           config->rope_rotary_dim <= head_dim &&
+           config->rope_rotary_dim % 2 == 0 &&
+           std::isfinite(config->rope_theta) && config->rope_theta > 0.0f;
+}
 
 // the parameters of the model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
@@ -168,7 +228,9 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
     param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
+    param_sizes[1] = config.position_encoding == LLMC_POSITION_ENCODING_ROPE
+        ? 0
+        : maxT * C; // wpe is absent for RoPE models
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
     param_sizes[4] = L * (3 * C) * C; // qkvw
@@ -208,7 +270,9 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = (floatX*)params_memory_iterator;
+        *(ptrs[i]) = param_elements[i] == 0
+            ? nullptr
+            : (floatX*)params_memory_iterator;
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
     return params_memory;
@@ -341,6 +405,7 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
 
 typedef struct {
     GPT2Config config;
+    LlmcRopeCache rope_cache;
     // the weights of the model, and their sizes
     ParameterTensors params;
     size_t param_elements[NUM_PARAMETER_TENSORS];
@@ -413,6 +478,7 @@ void gpt2_init_common(GPT2 *model) {
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
     model->params_memory = NULL;
+    llmc_rope_cache_reset(&model->rope_cache);
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
@@ -450,6 +516,20 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
     assert(model->grads_memory == nullptr);
     model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+
+    if (model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE) {
+        if (!llmc_rope_cache_allocate(
+                &model->rope_cache,
+                model->config.max_seq_len,
+                model->config.rope_rotary_dim,
+                model->config.rope_theta,
+                main_stream)) {
+            fprintf(stderr, "Failed to allocate the RoPE phase cache\n");
+            exit(EXIT_FAILURE);
+        }
+        printf0("allocating %zu KiB for the shared RoPE phase cache\n",
+                llmc_rope_cache_bytes(&model->rope_cache) >> 10);
+    }
 
     // record the current B,T as well
     model->batch_size = B;
@@ -554,6 +634,39 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
 }
 
+static int llmc_checkpoint_float_word(float value) {
+    static_assert(sizeof(int) == sizeof(float), "checkpoint header word size mismatch");
+    int word = 0;
+    memcpy(&word, &value, sizeof(word));
+    return word;
+}
+
+static float llmc_checkpoint_word_float(int word) {
+    float value = 0.0f;
+    memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
+static void llmc_checkpoint_store_u64(int* header, int word_index, uint64_t value) {
+    memcpy(header + word_index, &value, sizeof(value));
+}
+
+static uint64_t llmc_checkpoint_load_u64(const int* header, int word_index) {
+    uint64_t value = 0U;
+    memcpy(&value, header + word_index, sizeof(value));
+    return value;
+}
+
+static bool llmc_model_version_is_rope(int version) {
+    return version == LLMC_MODEL_VERSION_FP32_ROPE ||
+           version == LLMC_MODEL_VERSION_BF16_ROPE;
+}
+
+static bool llmc_model_version_is_bf16(int version) {
+    return version == LLMC_MODEL_VERSION_BF16_ABSOLUTE ||
+           version == LLMC_MODEL_VERSION_BF16_ROPE;
+}
+
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // write the model to a checkpoint file
     printf0("Writing model to %s\n", checkpoint_path);
@@ -563,13 +676,29 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     memset(model_header, 0, sizeof(model_header));
     model_header[0] = 20240326; // magic number
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
-    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
+    const bool use_rope =
+        model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE;
+    model_header[1] = PRECISION_MODE == PRECISION_FP32
+        ? (use_rope ? LLMC_MODEL_VERSION_FP32_ROPE
+                    : LLMC_MODEL_VERSION_FP32_ABSOLUTE)
+        : (use_rope ? LLMC_MODEL_VERSION_BF16_ROPE
+                    : LLMC_MODEL_VERSION_BF16_ABSOLUTE);
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
+    if (use_rope) {
+        // Versions 6/7 use the formerly unused header words to make the
+        // position and initialization contracts self-describing.
+        model_header[8] = model->config.position_encoding;
+        model_header[9] = model->config.rope_rotary_dim;
+        model_header[10] = llmc_checkpoint_float_word(model->config.rope_theta);
+        model_header[11] = llmc_checkpoint_float_word(model->config.initializer_std);
+        model_header[12] = llmc_checkpoint_float_word(
+            model->config.residual_projection_std);
+    }
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
@@ -598,7 +727,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
-    if (!(version == 3 || version == 5)) {
+    if (!(version == LLMC_MODEL_VERSION_FP32_ABSOLUTE ||
+          version == LLMC_MODEL_VERSION_BF16_ABSOLUTE ||
+          version == LLMC_MODEL_VERSION_FP32_ROPE ||
+          version == LLMC_MODEL_VERSION_BF16_ROPE)) {
         // 3 = fp32, padded vocab
         // 5 = bf16, padded vocab, layernorms also in bf16
         fprintf(stderr, "Bad version in model file\n");
@@ -608,12 +740,12 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     // check if the precision mode of the checkpoing matches the model precision
     if (weight_init) {
-        if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
+        if (PRECISION_MODE == PRECISION_BF16 && !llmc_model_version_is_bf16(version)) {
             fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
             exit(EXIT_FAILURE);
         }
-        if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
+        if (PRECISION_MODE == PRECISION_FP32 && llmc_model_version_is_bf16(version)) {
             fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
             fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
@@ -628,6 +760,27 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
+    if (llmc_model_version_is_rope(version)) {
+        model->config.position_encoding = model_header[8];
+        model->config.rope_rotary_dim = model_header[9];
+        model->config.rope_theta = llmc_checkpoint_word_float(model_header[10]);
+        model->config.initializer_std = llmc_checkpoint_word_float(model_header[11]);
+        model->config.residual_projection_std =
+            llmc_checkpoint_word_float(model_header[12]);
+        if (model->config.position_encoding != LLMC_POSITION_ENCODING_ROPE) {
+            fprintf(stderr, "RoPE model checkpoint has inconsistent position metadata\n");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        model->config.position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
+        model->config.rope_rotary_dim = 0;
+        model->config.rope_theta = 0.0f;
+        gpt2_set_initializer_defaults(&model->config);
+    }
+    if (!gpt2_validate_position_config(&model->config)) {
+        fprintf(stderr, "Invalid position encoding or initializer metadata in model checkpoint\n");
+        exit(EXIT_FAILURE);
+    }
 
     // allocate memory for the model parameters
     gpt2_allocate_weights(model);
@@ -648,6 +801,7 @@ bool gpt2_set_hyperparameters(GPT2Config* config, int depth, int max_seq_len) {
     if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
     else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
     else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 30) { channels = 1152; num_heads = 18; } // (unofficial) gpt2-medium/large midpoint (537M)
     else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
     else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
     else if (depth == 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
@@ -658,6 +812,10 @@ bool gpt2_set_hyperparameters(GPT2Config* config, int depth, int max_seq_len) {
     config->channels = channels;
     config->num_heads = num_heads;
     config->max_seq_len = max_seq_len;
+    config->position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
+    config->rope_rotary_dim = 0;
+    config->rope_theta = 0.0f;
+    gpt2_set_initializer_defaults(config);
     return true;
 }
 
@@ -678,17 +836,23 @@ static bool parse_positive_int_(const char* text, const char** end, int* value) 
 
 bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
     // Preserve the historical dX and gpt2:dX forms at maxT=1024, while
-    // allowing an explicit context override as gpt2:dX:tY.
+    // allowing an explicit context override as gpt2:dX:tY. RoPE is opt-in as
+    // gpt2:rope:dX[:tY], keeping old experiment commands architecture-stable.
     if (config == NULL || descriptor == NULL) {
         return false;
     }
     const char* depth_text = NULL;
     bool explicit_gpt2 = false;
+    bool use_rope = false;
     if (descriptor[0] == 'd') {
         depth_text = descriptor + 1;
     } else if (strncmp(descriptor, "gpt2:d", 6) == 0) {
         depth_text = descriptor + 6;
         explicit_gpt2 = true;
+    } else if (strncmp(descriptor, "gpt2:rope:d", 11) == 0) {
+        depth_text = descriptor + 11;
+        explicit_gpt2 = true;
+        use_rope = true;
     } else {
         return false;
     }
@@ -709,7 +873,15 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
             return false;
         }
     }
-    return gpt2_set_hyperparameters(config, depth, max_seq_len);
+    if (!gpt2_set_hyperparameters(config, depth, max_seq_len)) {
+        return false;
+    }
+    if (use_rope) {
+        config->position_encoding = LLMC_POSITION_ENCODING_ROPE;
+        config->rope_rotary_dim = config->channels / config->num_heads;
+        config->rope_theta = LLMC_ROPE_THETA_DEFAULT;
+    }
+    return gpt2_validate_position_config(config);
 }
 
 void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
@@ -734,12 +906,17 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     config->channels = channels;
     config->num_heads = channels / head_size;
     config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
+    config->position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
+    config->rope_rotary_dim = 0;
+    config->rope_theta = 0.0f;
+    gpt2_set_initializer_defaults(config);
 }
 
 void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
     // - explicit "gpt2:dX", or "gpt2:dX:tY" to override max context length.
+    // - "gpt2:rope:dX", or "gpt2:rope:dX:tY", for token-only input plus RoPE attention.
     // - "gpt3:cX", where X is now the channel count, e.g. "gpt3:c768" is the smallest GPT-3 model.
 
     // check the valid prexies and dispatch to the right setup function
@@ -751,6 +928,10 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
         gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
     } else {
         fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
+    }
+    if (!gpt2_validate_position_config(&model->config)) {
+        fprintf(stderr, "Invalid position encoding or initializer configuration for descriptor: %s\n", descriptor);
+        exit(EXIT_FAILURE);
     }
 
     // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
@@ -766,8 +947,6 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     manual_seed(&init_rng, 42);
     floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
     memset(params_memory_cpu, 0, model->num_parameters_bytes);
-    // fill in all the weights with random values
-    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
     // we have to init all these tensors exactly in the order that PyTorch initializes them
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
@@ -798,8 +977,14 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 }
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
-                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                float scale = (i == 6 || i == 12)
+                    ? model->config.residual_projection_std
+                    : model->config.initializer_std;
                 // okay let's draw the random numbers and write them
+                if (n == 0) {
+                    offset += model->param_elements[i];
+                    continue;
+                }
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
                 for (size_t j = 0; j < n; j++) {
@@ -814,6 +999,30 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // copy them to GPU
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
+}
+
+void gpt2_apply_rope_or_exit(
+        GPT2* model,
+        floatX* qkv,
+        size_t B,
+        size_t T,
+        size_t C,
+        size_t NH,
+        bool backward) {
+    if (model->config.position_encoding != LLMC_POSITION_ENCODING_ROPE) {
+        return;
+    }
+    const bool ok = backward
+        ? llmc_rope_apply_qk_backward(
+              qkv, &model->rope_cache, (int)B, (int)T, (int)C, (int)NH,
+              main_stream)
+        : llmc_rope_apply_qk(
+              qkv, &model->rope_cache, (int)B, (int)T, (int)C, (int)NH,
+              main_stream);
+    if (!ok) {
+        fprintf(stderr, "Invalid RoPE runtime shape or uninitialized phase cache\n");
+        exit(EXIT_FAILURE);
+    }
 }
 
 // propagate inputs through the network to produce logits.
@@ -900,6 +1109,7 @@ void gpt2_forward(
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         if (!validation_attention_disabled) {
             matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+            gpt2_apply_rope_or_exit(model, l_qkvr, B, T, C, NH, false);
             if (validation_attention_blackout_width > 0) {
                 attention_forward_cudnn_recent_blackout(
                     l_atty,
@@ -935,6 +1145,7 @@ void gpt2_forward(
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        gpt2_apply_rope_or_exit(model, scratch, B, T, C, NH, false);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         #endif
@@ -1185,6 +1396,7 @@ void gpt2_backward_and_reduce(
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
+        gpt2_apply_rope_or_exit(model, dl_bt4c, B, T, C, NH, true);
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
         }
@@ -1227,9 +1439,18 @@ void gpt2_backward_and_reduce(
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-        const size_t nelem[] = {Vp * C, T * C, C, C};
-        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        if (model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE) {
+            floatX* const pointers[] = {grads.wte, grads.lnfw, grads.lnfb};
+            const size_t nelem[] = {Vp * C, C, C};
+            multi_gpu_async_reduce_gradient(
+                pointers, nelem, &multi_gpu_config, main_stream);
+        } else {
+            floatX* const pointers[] = {
+                grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+            const size_t nelem[] = {Vp * C, T * C, C, C};
+            multi_gpu_async_reduce_gradient(
+                pointers, nelem, &multi_gpu_config, main_stream);
+        }
     }
 
     cudaCheck(cudaDeviceSynchronize());
@@ -1257,6 +1478,43 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
     return {offset, size};
 }
 
+bool gpt2_zero_stage_one_parameter_shapes_compatible(
+        const GPT2* model,
+        size_t sequence_length,
+        int num_processes,
+        int* incompatible_tensor_id = nullptr) {
+    if (model == nullptr || num_processes <= 0) {
+        return false;
+    }
+    for (int tensor_id = 0; tensor_id < NUM_PARAMETER_TENSORS; ++tensor_id) {
+        size_t elements = model->param_elements[tensor_id];
+        if (elements == 0) {
+            continue;
+        }
+        if (2 <= tensor_id && tensor_id <= 13) {
+            elements /= (size_t)model->config.num_layers;
+        }
+        if (elements % (size_t)num_processes != 0) {
+            if (incompatible_tensor_id != nullptr) {
+                *incompatible_tensor_id = tensor_id;
+            }
+            return false;
+        }
+    }
+    // Learned WPE reduces only the active T rows, not the entire maxT table.
+    if (model->config.position_encoding ==
+            LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE &&
+        sequence_length * (size_t)model->config.channels %
+                (size_t)num_processes !=
+            0) {
+        if (incompatible_tensor_id != nullptr) {
+            *incompatible_tensor_id = 1;
+        }
+        return false;
+    }
+    return true;
+}
+
 float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     floatX* grads_memory = (floatX*)model->grads_memory;
@@ -1273,6 +1531,9 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+            if (tensor.size == 0) {
+                continue;
+            }
             ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
             ptrdiff_t offset = tensor.offset + shard.offset;
             bool is_first_pass = (i == 0);
@@ -1332,6 +1593,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 
 void gpt2_free(GPT2 *model) {
     llmc_normuon_runtime_free(&model->normuon_runtime);
+    llmc_rope_cache_free(&model->rope_cache);
     cudaFreeCheck(&model->params_memory);
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
@@ -1394,11 +1656,26 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     memset(state_header, 0, sizeof(state_header));
     // basic identifying information
     state_header[0] = 20240527; // magic number
-    state_header[1] = 1; // version number
+    const bool use_rope =
+        model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE;
+    state_header[1] = use_rope ? 2 : 1; // v2 binds state to the RoPE schema
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
     state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
+    if (use_rope) {
+        state_header[6] = model->config.position_encoding;
+        state_header[7] = model->config.rope_rotary_dim;
+        state_header[8] = llmc_checkpoint_float_word(model->config.rope_theta);
+        state_header[9] = llmc_checkpoint_float_word(model->config.initializer_std);
+        state_header[12] = llmc_checkpoint_float_word(
+            model->config.residual_projection_std);
+        llmc_checkpoint_store_u64(
+            state_header, 34, (uint64_t)model->num_parameters);
+        llmc_checkpoint_store_u64(
+            state_header, 36,
+            (uint64_t)multi_gpu_config.shard_num_parameters);
+    }
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
     // model rng state, start at 20 to leave some padding
@@ -1433,7 +1710,34 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
     assert(state_header[0] == 20240527); // magic number
-    assert(state_header[1] == 1); // version number
+    const int state_version = state_header[1];
+    if (!(state_version == 1 || state_version == 2)) {
+        fprintf(stderr, "Unsupported optimizer-state version: %d\n", state_version);
+        exit(EXIT_FAILURE);
+    }
+    if (state_version == 1 &&
+        model->config.position_encoding != LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
+        fprintf(stderr, "Legacy optimizer state cannot be loaded into a RoPE model\n");
+        exit(EXIT_FAILURE);
+    }
+    if (state_version == 2) {
+        const bool metadata_matches =
+            model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            state_header[6] == model->config.position_encoding &&
+            state_header[7] == model->config.rope_rotary_dim &&
+            state_header[8] == llmc_checkpoint_float_word(model->config.rope_theta) &&
+            state_header[9] == llmc_checkpoint_float_word(model->config.initializer_std) &&
+            state_header[12] == llmc_checkpoint_float_word(
+                model->config.residual_projection_std) &&
+            llmc_checkpoint_load_u64(state_header, 34) ==
+                (uint64_t)model->num_parameters &&
+            llmc_checkpoint_load_u64(state_header, 36) ==
+                (uint64_t)multi_gpu_config.shard_num_parameters;
+        if (!metadata_matches) {
+            fprintf(stderr, "Optimizer state does not match the RoPE model schema\n");
+            exit(EXIT_FAILURE);
+        }
+    }
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     int use_master_weights = state_header[4];  // whether we're using fp32 master weights
@@ -1580,6 +1884,7 @@ void error_usage() {
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "              RoPE example: gpt2:rope:d30:t2048 (theta=10000, full head dimension)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
     fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
     fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
@@ -2318,6 +2623,13 @@ int main(int argc, char *argv[]) {
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf0("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf0("| channels C            | %-50d |\n", model.config.channels);
+    printf0("| position encoding     | %-50s |\n",
+            llmc_position_encoding_name(model.config.position_encoding));
+    printf0("| RoPE rotary dim       | %-50d |\n", model.config.rope_rotary_dim);
+    printf0("| RoPE theta            | %-50g |\n", model.config.rope_theta);
+    printf0("| initializer std       | %-50g |\n", model.config.initializer_std);
+    printf0("| residual proj. std    | %-50g |\n",
+            model.config.residual_projection_std);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -2360,7 +2672,20 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
-    set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
+    int effective_zero_stage = zero_stage;
+    int incompatible_zero_tensor_id = -1;
+    if (zero_stage == 1 &&
+        !gpt2_zero_stage_one_parameter_shapes_compatible(
+            &model,
+            (size_t)T,
+            multi_gpu_config.num_processes,
+            &incompatible_zero_tensor_id)) {
+        printf0("| Zero Optimization is disabled, tensor %-2d cannot be equally partitioned     |\n",
+                incompatible_zero_tensor_id);
+        effective_zero_stage = 0;
+    }
+    set_zero_configs(
+        &multi_gpu_config, effective_zero_stage, model.num_parameters);
     if (model.optimizer_config.optimizer_selection ==
         LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) {
         if (multi_gpu_config.num_processes != 1) {
@@ -2734,7 +3059,9 @@ int main(int argc, char *argv[]) {
 
     // do some checks here before we kick off training
     // cross-check the desired sequence length T with the model's max sequence length
-    if (T < model.config.max_seq_len) {
+    if (T < model.config.max_seq_len &&
+        model.config.position_encoding ==
+            LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
         printf0("!!!!!!!!\n");
         printf0("WARNING:\n");
         printf0("- The training sequence length is: T=%d (set with -t)\n", T);
@@ -2746,7 +3073,7 @@ int main(int argc, char *argv[]) {
         printf0("---> HINT: If you're training GPT-2 use -t 1024. If GPT-3, use -t 2048.\n");
         printf0("!!!!!!!!\n");
     }
-    // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
+    // Both learned WPE and the RoPE cache are provisioned to max_seq_len.
     assert(T <= model.config.max_seq_len);
 
     // train

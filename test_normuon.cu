@@ -449,6 +449,9 @@ static void test_gpt2_context_descriptor() {
     GPT2Config legacy = {};
     GPT2Config explicit_legacy = {};
     GPT2Config extended = {};
+    GPT2Config midpoint = {};
+    GPT2Config rope_midpoint = {};
+    GPT2Config rope_xl = {};
     TEST_CHECK(
         gpt2_config_from_descriptor(&legacy, "d48"),
         "legacy GPT-2 XL descriptor parses");
@@ -458,6 +461,16 @@ static void test_gpt2_context_descriptor() {
     TEST_CHECK(
         gpt2_config_from_descriptor(&extended, "gpt2:d48:t2048"),
         "explicit GPT-2 XL 2048-context descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(&midpoint, "gpt2:d30:t2048"),
+        "explicit GPT-2 midpoint 2048-context descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(
+            &rope_midpoint, "gpt2:rope:d30:t2048"),
+        "RoPE GPT-2 midpoint descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(&rope_xl, "gpt2:rope:d48:t2048"),
+        "RoPE GPT-2 XL descriptor parses");
     TEST_CHECK(
         legacy.num_layers == 48 && legacy.channels == 1600 &&
             legacy.num_heads == 25 && legacy.max_seq_len == 1024,
@@ -470,10 +483,44 @@ static void test_gpt2_context_descriptor() {
         extended.num_layers == 48 && extended.channels == 1600 &&
             extended.num_heads == 25 && extended.max_seq_len == 2048,
         "GPT-2 XL context override changes maxT only");
+    TEST_CHECK(
+        midpoint.num_layers == 30 && midpoint.channels == 1152 &&
+            midpoint.num_heads == 18 && midpoint.max_seq_len == 2048,
+        "GPT-2 midpoint descriptor selects the requested shape");
+    TEST_CHECK(
+        rope_midpoint.num_layers == 30 && rope_midpoint.channels == 1152 &&
+            rope_midpoint.num_heads == 18 &&
+            rope_midpoint.max_seq_len == 2048 &&
+            rope_midpoint.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            rope_midpoint.rope_rotary_dim == 64 &&
+            rope_midpoint.rope_theta == 10000.0f,
+        "RoPE midpoint uses full-head canonical rotary parameters");
+    TEST_CHECK(
+        explicit_legacy.position_encoding ==
+                LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE &&
+            explicit_legacy.rope_rotary_dim == 0 &&
+            explicit_legacy.rope_theta == 0.0f,
+        "legacy descriptors retain learned absolute positions");
+    TEST_CHECK(
+        std::fabs(rope_midpoint.initializer_std - 0.02f) < 1.0e-8f &&
+            std::fabs(
+                rope_midpoint.residual_projection_std -
+                0.02f / std::sqrt(60.0f)) < 1.0e-8f,
+        "RoPE midpoint records GPT-2 residual-scaled initialization");
+    const float legacy_residual_scale = 1.0f / std::sqrt(60.0f);
+    const float legacy_residual_std = 0.02f * legacy_residual_scale;
+    TEST_CHECK(
+        std::memcmp(
+            &rope_midpoint.residual_projection_std,
+            &legacy_residual_std,
+            sizeof(float)) == 0,
+        "initializer preserves the legacy residual-scale operation order");
 
     const char* malformed[] = {
         "gpt2:d48:t", "gpt2:d48:t0", "gpt2:d48:t2048junk",
         "gpt2:d48:x2048", "gpt2:d:t2048", "gpt2:d999:t2048",
+        "gpt2:rope:d48:t", "gpt2:rope:d48:t0",
+        "gpt2:rope:d48:t2048junk", "gpt2:rope:d999:t2048",
     };
     for (const char* descriptor : malformed) {
         GPT2Config rejected = {};
@@ -501,6 +548,63 @@ static void test_gpt2_context_descriptor() {
     TEST_CHECK(
         extended_total - legacy_total == 1024ULL * 1600ULL,
         "context extension only adds positional embeddings");
+
+    midpoint.vocab_size = 50257;
+    midpoint.padded_vocab_size = 50304;
+    size_t midpoint_elements[NUM_PARAMETER_TENSORS];
+    size_t midpoint_sizeof[NUM_PARAMETER_TENSORS];
+    fill_in_parameter_sizes(midpoint_elements, midpoint_sizeof, midpoint);
+    size_t midpoint_total = 0;
+    for (int tensor = 0; tensor < NUM_PARAMETER_TENSORS; ++tensor) {
+        midpoint_total += midpoint_elements[tensor];
+    }
+    TEST_CHECK(
+        midpoint_total == 538518528ULL,
+        "GPT-2 midpoint 2048-context padded parameter count is correct");
+
+    rope_midpoint.vocab_size = 50257;
+    rope_midpoint.padded_vocab_size = 50304;
+    rope_xl.vocab_size = 50257;
+    rope_xl.padded_vocab_size = 50304;
+    size_t rope_midpoint_elements[NUM_PARAMETER_TENSORS];
+    size_t rope_midpoint_sizeof[NUM_PARAMETER_TENSORS];
+    size_t rope_xl_elements[NUM_PARAMETER_TENSORS];
+    size_t rope_xl_sizeof[NUM_PARAMETER_TENSORS];
+    fill_in_parameter_sizes(
+        rope_midpoint_elements, rope_midpoint_sizeof, rope_midpoint);
+    fill_in_parameter_sizes(rope_xl_elements, rope_xl_sizeof, rope_xl);
+    size_t rope_midpoint_total = 0;
+    size_t rope_xl_total = 0;
+    for (int tensor = 0; tensor < NUM_PARAMETER_TENSORS; ++tensor) {
+        rope_midpoint_total += rope_midpoint_elements[tensor];
+        rope_xl_total += rope_xl_elements[tensor];
+    }
+    TEST_CHECK(
+        rope_midpoint_elements[1] == 0 && rope_xl_elements[1] == 0,
+        "RoPE reserves tensor id 1 but allocates no WPE parameters");
+    TEST_CHECK(
+        rope_midpoint_total == 536159232ULL,
+        "RoPE midpoint parameter count excludes learned WPE");
+    TEST_CHECK(
+        rope_xl_total == 1556048000ULL,
+        "RoPE GPT-2 XL parameter count excludes learned WPE");
+
+    GPT2 rope_model = {};
+    rope_model.config = rope_midpoint;
+    std::memcpy(
+        rope_model.param_elements,
+        rope_midpoint_elements,
+        sizeof(rope_midpoint_elements));
+    TEST_CHECK(
+        gpt2_zero_stage_one_parameter_shapes_compatible(
+            &rope_model, 2048, 8),
+        "RoPE midpoint tensor shapes permit eight-way ZeRO-1 sharding");
+    int incompatible_tensor_id = -1;
+    TEST_CHECK(
+        !gpt2_zero_stage_one_parameter_shapes_compatible(
+            &rope_model, 2048, 7, &incompatible_tensor_id) &&
+            incompatible_tensor_id >= 0,
+        "ZeRO-1 preflight rejects rank counts that only divide the flat total");
 }
 
 static std::vector<floatX> quantize_to_floatx(
@@ -519,6 +623,293 @@ static std::vector<float> dequantize_floatx(
         output[index] = static_cast<float>(values[index]);
     }
     return output;
+}
+
+static bool floatx_bits_equal(floatX lhs, floatX rhs) {
+    return std::memcmp(&lhs, &rhs, sizeof(floatX)) == 0;
+}
+
+static void test_encoder_without_wpe() {
+    constexpr int batch_size = 1;
+    constexpr int sequence_length = 2;
+    constexpr int channels = 128;
+    constexpr int vocab_size = 4;
+    const size_t embedding_elements =
+        static_cast<size_t>(vocab_size) * channels;
+    const size_t output_elements =
+        static_cast<size_t>(batch_size) * sequence_length * channels;
+    std::vector<floatX> embeddings(embedding_elements);
+    for (size_t index = 0; index < embeddings.size(); ++index) {
+        embeddings[index] = static_cast<floatX>(
+            0.001f * static_cast<float>(index) - 0.2f);
+    }
+    const int inputs[] = {1, 3};
+    floatX* device_embeddings = nullptr;
+    floatX* device_output = nullptr;
+    int* device_inputs = nullptr;
+    cudaCheck(cudaMalloc(
+        reinterpret_cast<void**>(&device_embeddings),
+        embedding_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(
+        reinterpret_cast<void**>(&device_output),
+        output_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(
+        reinterpret_cast<void**>(&device_inputs), sizeof(inputs)));
+    cudaCheck(cudaMemcpy(
+        device_embeddings,
+        embeddings.data(),
+        embedding_elements * sizeof(floatX),
+        cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(
+        device_inputs, inputs, sizeof(inputs), cudaMemcpyHostToDevice));
+    encoder_forward(
+        device_output,
+        device_inputs,
+        device_embeddings,
+        nullptr,
+        batch_size,
+        sequence_length,
+        channels,
+        main_stream);
+    cudaCheck(cudaDeviceSynchronize());
+    std::vector<floatX> output(output_elements);
+    cudaCheck(cudaMemcpy(
+        output.data(),
+        device_output,
+        output_elements * sizeof(floatX),
+        cudaMemcpyDeviceToHost));
+    bool token_only = true;
+    for (int token = 0; token < sequence_length; ++token) {
+        for (int channel = 0; channel < channels; ++channel) {
+            token_only = token_only && floatx_bits_equal(
+                output[static_cast<size_t>(token) * channels + channel],
+                embeddings[static_cast<size_t>(inputs[token]) * channels +
+                           channel]);
+        }
+    }
+    TEST_CHECK(
+        token_only,
+        "null WPE makes the encoder output the token embedding exactly");
+    cudaCheck(cudaFree(device_embeddings));
+    cudaCheck(cudaFree(device_output));
+    cudaCheck(cudaFree(device_inputs));
+}
+
+static void test_rope_shape(int head_dim) {
+    constexpr int batch_size = 1;
+    constexpr int sequence_length = 2048;
+    constexpr int num_heads = 2;
+    constexpr float theta = 10000.0f;
+    const int channels = num_heads * head_dim;
+    const int rotary_dim = head_dim;
+    const int rotary_pairs = rotary_dim / 2;
+    const size_t elements =
+        static_cast<size_t>(batch_size) * sequence_length * 3 * channels;
+
+    TEST_CHECK(
+        llmc_rope_validate_config(
+            sequence_length, channels, num_heads, rotary_dim, theta),
+        "valid full-head RoPE configuration is accepted");
+    TEST_CHECK(
+        !llmc_rope_validate_config(
+            sequence_length, channels, num_heads, rotary_dim - 1, theta),
+        "odd rotary dimension is rejected");
+    TEST_CHECK(
+        !llmc_rope_validate_config(
+            sequence_length, channels, num_heads, rotary_dim + 2, theta),
+        "rotary dimension wider than a head is rejected");
+
+    std::vector<floatX> input(elements);
+    for (size_t index = 0; index < elements; ++index) {
+        const float value =
+            0.45f * std::sin(0.013f * static_cast<float>(index % 997U)) +
+            0.20f * std::cos(0.007f * static_cast<float>(index % 577U));
+        input[index] = static_cast<floatX>(value);
+    }
+
+    floatX* device_qkv = nullptr;
+    cudaCheck(cudaMalloc(
+        reinterpret_cast<void**>(&device_qkv), elements * sizeof(floatX)));
+    cudaCheck(cudaMemcpy(
+        device_qkv,
+        input.data(),
+        elements * sizeof(floatX),
+        cudaMemcpyHostToDevice));
+
+    LlmcRopeCache cache;
+    llmc_rope_cache_reset(&cache);
+    TEST_CHECK(
+        llmc_rope_cache_allocate(
+            &cache, sequence_length, rotary_dim, theta, main_stream),
+        "RoPE phase cache allocation succeeds");
+    cudaStream_t other_stream;
+    cudaCheck(cudaStreamCreate(&other_stream));
+    TEST_CHECK(
+        !llmc_rope_cache_allocate(
+            &cache, sequence_length, rotary_dim, theta, other_stream),
+        "RoPE cache rejects implicit cross-stream reuse");
+    cudaCheck(cudaStreamDestroy(other_stream));
+    TEST_CHECK(
+        llmc_rope_cache_bytes(&cache) ==
+            static_cast<size_t>(sequence_length) * rotary_pairs *
+                sizeof(float2),
+        "RoPE phase cache has the expected size");
+    TEST_CHECK(
+        llmc_rope_apply_qk(
+            device_qkv,
+            &cache,
+            batch_size,
+            sequence_length,
+            channels,
+            num_heads,
+            main_stream),
+        "RoPE Q/K forward launch succeeds");
+    cudaCheck(cudaDeviceSynchronize());
+
+    std::vector<floatX> rotated(elements);
+    cudaCheck(cudaMemcpy(
+        rotated.data(),
+        device_qkv,
+        elements * sizeof(floatX),
+        cudaMemcpyDeviceToHost));
+    std::vector<float2> phases(
+        static_cast<size_t>(sequence_length) * rotary_pairs);
+    cudaCheck(cudaMemcpy(
+        phases.data(),
+        cache.cos_sin,
+        phases.size() * sizeof(float2),
+        cudaMemcpyDeviceToHost));
+
+    bool v_unchanged = true;
+    bool position_zero_unchanged = true;
+    for (int position = 0; position < sequence_length; ++position) {
+        const size_t token_offset =
+            static_cast<size_t>(position) * 3U * channels;
+        for (int channel = 0; channel < channels; ++channel) {
+            v_unchanged = v_unchanged && floatx_bits_equal(
+                rotated[token_offset + 2U * channels + channel],
+                input[token_offset + 2U * channels + channel]);
+            if (position == 0) {
+                position_zero_unchanged = position_zero_unchanged &&
+                    floatx_bits_equal(
+                        rotated[token_offset + channel],
+                        input[token_offset + channel]) &&
+                    floatx_bits_equal(
+                        rotated[token_offset + channels + channel],
+                        input[token_offset + channels + channel]);
+            }
+        }
+    }
+    TEST_CHECK(v_unchanged, "RoPE leaves V byte-for-byte unchanged");
+    TEST_CHECK(
+        position_zero_unchanged,
+        "RoPE position zero is a bit identity for Q and K");
+
+    const int checked_positions[] = {0, 1, 2, 1023, 2047};
+    float maximum_reference_error = 0.0f;
+    float maximum_phase_error = 0.0f;
+    float maximum_pair_norm_error = 0.0f;
+    for (int position : checked_positions) {
+        for (int pair = 0; pair < rotary_pairs; ++pair) {
+            const double inverse_frequency = std::pow(
+                static_cast<double>(theta),
+                -2.0 * static_cast<double>(pair) /
+                    static_cast<double>(rotary_dim));
+            const double angle = static_cast<double>(position) * inverse_frequency;
+            const float2 phase =
+                phases[static_cast<size_t>(position) * rotary_pairs + pair];
+            maximum_phase_error = std::max(
+                maximum_phase_error,
+                std::max(
+                    std::fabs(phase.x - static_cast<float>(std::cos(angle))),
+                    std::fabs(phase.y - static_cast<float>(std::sin(angle)))));
+            for (int head = 0; head < num_heads; ++head) {
+                const size_t q_index =
+                    static_cast<size_t>(position) * 3U * channels +
+                    static_cast<size_t>(head) * head_dim + 2U * pair;
+                const size_t k_index = q_index + channels;
+                const size_t indices[] = {q_index, k_index};
+                for (size_t base : indices) {
+                    const float x0 = static_cast<float>(input[base]);
+                    const float x1 = static_cast<float>(input[base + 1U]);
+                    const float expected0 = x0 * phase.x - x1 * phase.y;
+                    const float expected1 = x0 * phase.y + x1 * phase.x;
+                    const float actual0 = static_cast<float>(rotated[base]);
+                    const float actual1 = static_cast<float>(rotated[base + 1U]);
+                    maximum_reference_error = std::max(
+                        maximum_reference_error,
+                        std::max(
+                            std::fabs(actual0 - expected0),
+                            std::fabs(actual1 - expected1)));
+                    maximum_pair_norm_error = std::max(
+                        maximum_pair_norm_error,
+                        std::fabs(
+                            (actual0 * actual0 + actual1 * actual1) -
+                            (x0 * x0 + x1 * x1)));
+                }
+            }
+        }
+    }
+    TEST_CHECK(
+        maximum_phase_error < 5.0e-4f,
+        "RoPE cache matches the canonical theta frequency schedule");
+    TEST_CHECK(
+        maximum_reference_error < 5.0e-3f,
+        "RoPE forward matches an FP32 adjacent-pair reference");
+    TEST_CHECK(
+        maximum_pair_norm_error < 1.0e-2f,
+        "RoPE approximately preserves pair norms after floatX rounding");
+
+    TEST_CHECK(
+        llmc_rope_apply_qk_backward(
+            device_qkv,
+            &cache,
+            batch_size,
+            sequence_length,
+            channels,
+            num_heads,
+            main_stream),
+        "RoPE Q/K transposed backward launch succeeds");
+    cudaCheck(cudaDeviceSynchronize());
+    std::vector<floatX> roundtrip(elements);
+    cudaCheck(cudaMemcpy(
+        roundtrip.data(),
+        device_qkv,
+        elements * sizeof(floatX),
+        cudaMemcpyDeviceToHost));
+    float maximum_roundtrip_error = 0.0f;
+    bool roundtrip_v_unchanged = true;
+    for (int position = 0; position < sequence_length; ++position) {
+        const size_t token_offset =
+            static_cast<size_t>(position) * 3U * channels;
+        for (int channel = 0; channel < 2 * channels; ++channel) {
+            maximum_roundtrip_error = std::max(
+                maximum_roundtrip_error,
+                std::fabs(
+                    static_cast<float>(roundtrip[token_offset + channel]) -
+                    static_cast<float>(input[token_offset + channel])));
+        }
+        for (int channel = 0; channel < channels; ++channel) {
+            roundtrip_v_unchanged = roundtrip_v_unchanged &&
+                floatx_bits_equal(
+                    roundtrip[token_offset + 2U * channels + channel],
+                    input[token_offset + 2U * channels + channel]);
+        }
+    }
+    TEST_CHECK(
+        maximum_roundtrip_error < 1.0e-2f,
+        "RoPE backward applies the transposed rotation");
+    TEST_CHECK(
+        roundtrip_v_unchanged,
+        "RoPE backward also leaves V byte-for-byte unchanged");
+
+    llmc_rope_cache_free(&cache);
+    cudaCheck(cudaFree(device_qkv));
+}
+
+static void test_rope_forward_backward() {
+    test_rope_shape(64);
+    test_rope_shape(96);
 }
 
 static void test_parameter_plan_and_views() {
@@ -1703,6 +2094,8 @@ int main() {
     common_start(false, false);
 
     test_gpt2_context_descriptor();
+    test_encoder_without_wpe();
+    test_rope_forward_backward();
     test_parameter_plan_and_views();
     test_rectangular_scratch_update();
     test_rectangular_tracker_smoke();
@@ -1718,9 +2111,9 @@ int main() {
     common_free(unused_model);
     multi_gpu_config_free(&multi_gpu_config);
     if (test_failures == 0) {
-        printf("All focused llm.c NorMuon tests passed.\n");
+        printf("All focused llm.c RoPE/NorMuon tests passed.\n");
         return EXIT_SUCCESS;
     }
-    fprintf(stderr, "%d focused llm.c NorMuon tests failed.\n", test_failures);
+    fprintf(stderr, "%d focused llm.c RoPE/NorMuon tests failed.\n", test_failures);
     return EXIT_FAILURE;
 }

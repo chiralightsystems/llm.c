@@ -47,7 +47,12 @@ def convert(filepath, output, push_to_hub=False, out_dtype="bfloat16"):
         exit(1)
     version = model_header[1]
     if not version in [3, 5]:
-        print("Bad version in model file")
+        print(
+            f"ERROR: unsupported llm.c checkpoint version {version}. "
+            "This exporter only supports legacy GPT-2 checkpoints with learned "
+            "absolute position embeddings (versions 3 and 5); RoPE checkpoints "
+            "cannot be represented by transformers.GPT2LMHeadModel."
+        )
         exit(1)
 
     # Load in our model parameters
@@ -81,7 +86,10 @@ def convert(filepath, output, push_to_hub=False, out_dtype="bfloat16"):
     }
 
     # Load in our weights given our parameter shapes
-    dtype = np.float32 if version == 3 else np.int16
+    dtype = {
+        3: np.float32,
+        5: np.int16,
+    }[version]
     w = {}
     for key, shape in shapes.items():
         num_elements = np.prod(shape)

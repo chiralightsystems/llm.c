@@ -17,7 +17,8 @@ inline void gpt2_initialize_master_parameter_type(
     GPT2* model,
     const LlmcOptimizerParameterType* parameter_type,
     MultiGpuConfig* multi_gpu_config) {
-    if (model->master_weights == nullptr) {
+    if (model->master_weights == nullptr ||
+        parameter_type->tensor_elements == 0) {
         return;
     }
     ShardInfo tensor =
@@ -61,6 +62,9 @@ inline void gpt2_adamw_update_parameter_type(
     unsigned int seed,
     MultiGpuConfig* multi_gpu_config,
     bool init_from_master_only) {
+    if (parameter_type->tensor_elements == 0) {
+        return;
+    }
     ShardInfo tensor =
         gpt2_get_tensor_at_layer(model, 0, parameter_type->tensor_id);
     ShardInfo shard =
