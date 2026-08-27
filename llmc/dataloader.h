@@ -66,6 +66,18 @@ typedef struct {
     // random shuffle related variables
     mt19937_state shuffle_rng;
     int should_shuffle;
+    // Canonical fixed-row traversal. This is deliberately separate from the
+    // legacy unshuffled flat-stream path: it reads complete T-token rows,
+    // wraps by row without dropping a tail batch, and derives row-local
+    // next-token targets whose final (masked) target is a valid placeholder.
+    int row_aligned_sequential;
+    size_t logical_row_count;
+    size_t numpy_rows;
+    size_t numpy_columns;
+    // Fast identity guard for exact resume. This fingerprints the ordered
+    // source paths plus their validated layout/extent; the repo launcher also
+    // binds the manifest-declared payload SHA-256 for content identity.
+    uint64_t source_fingerprint;
     int* shard_indices;
     int* intra_shard_indices;
     // sizes in bytes
@@ -108,6 +120,25 @@ static uint32_t dataloader_u32_le_(const unsigned char* bytes) {
            ((uint32_t)bytes[1] << 8) |
            ((uint32_t)bytes[2] << 16) |
            ((uint32_t)bytes[3] << 24);
+}
+
+static void dataloader_fingerprint_bytes_(
+        uint64_t* fingerprint,
+        const void* data,
+        size_t byte_count) {
+    const unsigned char* bytes = (const unsigned char*)data;
+    for (size_t index = 0; index < byte_count; ++index) {
+        *fingerprint ^= (uint64_t)bytes[index];
+        *fingerprint *= UINT64_C(1099511628211);
+    }
+}
+
+static void dataloader_fingerprint_u64_(uint64_t* fingerprint, uint64_t value) {
+    unsigned char bytes[8];
+    for (int index = 0; index < 8; ++index) {
+        bytes[index] = (unsigned char)((value >> (8 * index)) & UINT64_C(0xff));
+    }
+    dataloader_fingerprint_bytes_(fingerprint, bytes, sizeof(bytes));
 }
 
 static const char* dataloader_numpy_dict_value_(const char* header, const char* key) {
@@ -234,6 +265,8 @@ static int64_t dataloader_load_numpy_uint32_(
     loader->header_bytes = preamble_bytes + (size_t)header_length;
     loader->token_size_bytes = sizeof(uint32_t);
     loader->token_format = DATALOADER_TOKEN_FORMAT_NUMPY_UINT32;
+    loader->numpy_rows = (size_t)rows;
+    loader->numpy_columns = (size_t)columns;
     dataloader_seek_(loader->tokens_file, 0, SEEK_END);
     loader->file_size_bytes = dataloader_tell_(loader->tokens_file);
     if (rows > UINT64_MAX / columns) {
@@ -349,19 +382,36 @@ void dataloader_advance_(DataLoader *loader) {
     }
 }
 
-void dataloader_init(DataLoader *loader,
-                     const char* filename_pattern,
-                     size_t B,
-                     size_t T,
-                     int process_rank,
-                     int num_processes,
-                     int should_shuffle) {
+void dataloader_init_with_policy(DataLoader *loader,
+                                 const char* filename_pattern,
+                                 size_t B,
+                                 size_t T,
+                                 int process_rank,
+                                 int num_processes,
+                                 int should_shuffle,
+                                 int row_aligned_sequential) {
+    if (B == 0 || T == 0 || num_processes <= 0 ||
+        process_rank < 0 || process_rank >= num_processes) {
+        fprintf(stderr, "Error: invalid dataloader B, T, rank, or process count\n");
+        exit(EXIT_FAILURE);
+    }
+    if (should_shuffle && row_aligned_sequential) {
+        fprintf(stderr, "Error: row-aligned sequential loading cannot also shuffle\n");
+        exit(EXIT_FAILURE);
+    }
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
     loader->B = B;
     loader->T = T;
     loader->tokens_file = NULL;
     loader->should_shuffle = should_shuffle;
+    loader->row_aligned_sequential = row_aligned_sequential;
+    loader->logical_row_count = 0;
+    loader->numpy_rows = 0;
+    loader->numpy_columns = 0;
+    loader->source_fingerprint = UINT64_C(14695981039346656037);
+    loader->shard_indices = NULL;
+    loader->intra_shard_indices = NULL;
 
     // glob to get the list of files matching the pattern, these are our data shards
     int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
@@ -371,6 +421,12 @@ void dataloader_init(DataLoader *loader,
     }
     if (loader->glob_result.gl_pathc == 0) {
         printf("Error: no files found matching the pattern: %s\n", filename_pattern);
+        exit(EXIT_FAILURE);
+    }
+    if (row_aligned_sequential && loader->glob_result.gl_pathc != 1) {
+        fprintf(stderr,
+                "Error: canonical row-aligned sequential loading currently requires exactly one direct NumPy cache file; matched %zu files\n",
+                loader->glob_result.gl_pathc);
         exit(EXIT_FAILURE);
     }
 
@@ -387,10 +443,50 @@ void dataloader_init(DataLoader *loader,
     // if too slow / too many shards, may wish to revisit later
     int64_t ntok_total = 0;
     for (int shard_index = 0; shard_index < loader->glob_result.gl_pathc; shard_index++) {
+        const char* source_path = loader->glob_result.gl_pathv[shard_index];
+        dataloader_fingerprint_bytes_(
+            &loader->source_fingerprint,
+            source_path,
+            strlen(source_path) + 1);
         int64_t shard_ntok = dataloader_load_shard_(loader, shard_index);
-        // we need at least one batch/shard, the way things are written right now.
-        // can be relaxed a lot later.
-        assert(shard_ntok >= (int64_t) (num_processes * B * T + 1));
+        dataloader_fingerprint_u64_(
+            &loader->source_fingerprint, (uint64_t)loader->file_size_bytes);
+        dataloader_fingerprint_u64_(
+            &loader->source_fingerprint, (uint64_t)loader->header_bytes);
+        dataloader_fingerprint_u64_(
+            &loader->source_fingerprint, (uint64_t)shard_ntok);
+        dataloader_fingerprint_u64_(
+            &loader->source_fingerprint, (uint64_t)loader->token_format);
+        if (row_aligned_sequential) {
+            if (loader->token_format != DATALOADER_TOKEN_FORMAT_NUMPY_UINT32) {
+                fprintf(stderr,
+                        "Error: canonical row-aligned sequential loading requires a direct NumPy uint32 cache\n");
+                exit(EXIT_FAILURE);
+            }
+            if (loader->numpy_columns % T != 0 || (size_t)shard_ntok % T != 0) {
+                fprintf(stderr,
+                        "Error: row_reset sequential loading requires the NumPy row width (%zu) to be divisible by T (%zu)\n",
+                        loader->numpy_columns, T);
+                exit(EXIT_FAILURE);
+            }
+            loader->logical_row_count = (size_t)shard_ntok / T;
+            if (B > SIZE_MAX / (size_t)num_processes) {
+                fprintf(stderr, "Error: row-aligned global batch row count overflows size_t\n");
+                exit(EXIT_FAILURE);
+            }
+            const size_t global_batch_rows = B * (size_t)num_processes;
+            if (loader->logical_row_count < global_batch_rows) {
+                fprintf(
+                    stderr,
+                    "Error: row-aligned sequential cache has %zu logical rows but the distributed batch requires at least %zu disjoint rows\n",
+                    loader->logical_row_count,
+                    global_batch_rows);
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            // The legacy flat/shuffled path reads B*T+1 tokens per batch.
+            assert(shard_ntok >= (int64_t) (num_processes * B * T + 1));
+        }
         ntok_total += shard_ntok;
     }
     // debugging prints
@@ -406,6 +502,78 @@ void dataloader_init(DataLoader *loader,
 
     // reset the loader, to initialize it
     dataloader_reset(loader);
+}
+
+void dataloader_init(DataLoader *loader,
+                     const char* filename_pattern,
+                     size_t B,
+                     size_t T,
+                     int process_rank,
+                     int num_processes,
+                     int should_shuffle) {
+    dataloader_init_with_policy(
+        loader,
+        filename_pattern,
+        B,
+        T,
+        process_rank,
+        num_processes,
+        should_shuffle,
+        0);
+}
+
+void dataloader_load_row_aligned_batch_(DataLoader* loader) {
+    assert(loader->row_aligned_sequential);
+    assert(loader->glob_result.gl_pathc == 1);
+    assert(loader->token_format == DATALOADER_TOKEN_FORMAT_NUMPY_UINT32);
+    assert(loader->logical_row_count > 0);
+
+    const size_t B = loader->B;
+    const size_t T = loader->T;
+    const size_t token_count = loader->logical_row_count * T;
+    const size_t rank_row_offset = (size_t)loader->process_rank * B;
+    size_t token_index =
+        ((loader->current_sample_idx + rank_row_offset) % loader->logical_row_count) * T;
+    size_t remaining = B * T;
+    size_t output_offset = 0;
+    while (remaining > 0) {
+        const size_t contiguous = remaining < token_count - token_index
+            ? remaining
+            : token_count - token_index;
+        const int64_t byte_offset = (int64_t)loader->header_bytes +
+            (int64_t)(token_index * sizeof(uint32_t));
+        dataloader_seek_(loader->tokens_file, byte_offset, SEEK_SET);
+        freadCheck(
+            loader->buffer_u32 + output_offset,
+            sizeof(uint32_t),
+            contiguous,
+            loader->tokens_file);
+        output_offset += contiguous;
+        remaining -= contiguous;
+        token_index = 0;
+    }
+
+    for (size_t row = 0; row < B; row++) {
+        for (size_t column = 0; column < T; column++) {
+            const size_t index = row * T + column;
+            const uint32_t input_token = loader->buffer_u32[index];
+            if (input_token > INT32_MAX) {
+                fprintf(stderr, "Error: uint32 token id exceeds the signed int runtime range\n");
+                exit(EXIT_FAILURE);
+            }
+            loader->inputs[index] = (int)input_token;
+            // The trainer masks column T-1 under row_reset. Keep a valid,
+            // row-local placeholder there so token validation never observes
+            // a cross-row target.
+            const size_t target_index = column + 1 < T ? index + 1 : index;
+            const uint32_t target_token = loader->buffer_u32[target_index];
+            if (target_token > INT32_MAX) {
+                fprintf(stderr, "Error: uint32 token id exceeds the signed int runtime range\n");
+                exit(EXIT_FAILURE);
+            }
+            loader->targets[index] = (int)target_token;
+        }
+    }
 }
 
 void dataloader_load_batch(DataLoader* loader) {
@@ -438,6 +606,13 @@ void dataloader_load_batch(DataLoader* loader) {
 }
 
 void dataloader_next_batch(DataLoader *loader) {
+    if (loader->row_aligned_sequential) {
+        dataloader_load_row_aligned_batch_(loader);
+        const size_t global_rows = (size_t)loader->num_processes * loader->B;
+        loader->current_sample_idx =
+            (loader->current_sample_idx + global_rows) % loader->logical_row_count;
+        return;
+    }
     // if the next batch would go past the end of the file, advance the loader
     if (loader->current_sample_idx >= loader->shard_num_samples) {
         dataloader_advance_(loader);
@@ -449,6 +624,16 @@ void dataloader_next_batch(DataLoader *loader) {
 
 void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t current_sample_idx) {
     // used during model resumption (-y 1) flag
+    if (loader->row_aligned_sequential) {
+        if (current_shard_idx != 0 || current_sample_idx >= loader->logical_row_count) {
+            fprintf(stderr, "Error: invalid row-aligned sequential dataloader cursor\n");
+            exit(EXIT_FAILURE);
+        }
+        loader->current_shard_idx = 0;
+        loader->current_sample_idx = current_sample_idx;
+        dataloader_load_shard_(loader, 0);
+        return;
+    }
     loader->current_shard_idx = current_shard_idx;
     loader->current_sample_idx = current_sample_idx;
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);

@@ -120,6 +120,18 @@ bool llmc_parse_sequence_boundary_policy(
     return false;
 }
 
+bool llmc_is_exact_numpy_path(const char* path) {
+    if (path == nullptr || strpbrk(path, "*?[") != nullptr) {
+        return false;
+    }
+    const size_t length = strlen(path);
+    return length >= 4 &&
+        path[length - 4] == '.' &&
+        tolower((unsigned char)path[length - 3]) == 'n' &&
+        tolower((unsigned char)path[length - 2]) == 'p' &&
+        tolower((unsigned char)path[length - 1]) == 'y';
+}
+
 bool llmc_masks_sequence_final_target(LlmcSequenceBoundaryPolicy policy) {
     return policy == LLMC_SEQUENCE_BOUNDARY_ROW_RESET;
 }
@@ -1649,7 +1661,12 @@ void common_free(GPT2 &model) {
 }
 
 
-void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+void save_state(
+        const char* filename,
+        int step,
+        GPT2* model,
+        DataLoader* loader,
+        LlmcSequenceBoundaryPolicy sequence_boundary_policy) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
     int state_header[256];
@@ -1663,6 +1680,14 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
     state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
+    state_header[11] = loader->row_aligned_sequential;
+    state_header[13] = (int)loader->B;
+    state_header[14] = (int)loader->T;
+    state_header[15] = 1; // dataloader binding schema v1
+    state_header[16] = (int)loader->glob_result.gl_pathc;
+    state_header[17] = (int)sequence_boundary_policy;
+    llmc_checkpoint_store_u64(state_header, 38, (uint64_t)loader->num_tokens);
+    llmc_checkpoint_store_u64(state_header, 40, loader->source_fingerprint);
     if (use_rope) {
         state_header[6] = model->config.position_encoding;
         state_header[7] = model->config.rope_rotary_dim;
@@ -1705,7 +1730,13 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     fcloseCheck(state_file);
 }
 
-void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename, bool reset_dataloader = false) {
+void load_state(
+        int* step,
+        GPT2* model,
+        DataLoader* loader,
+        const char* filename,
+        LlmcSequenceBoundaryPolicy sequence_boundary_policy,
+        bool reset_dataloader = false) {
     FILE *state_file = fopenCheck(filename, "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
@@ -1742,11 +1773,41 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     int use_master_weights = state_header[4];  // whether we're using fp32 master weights
     int should_shuffle = state_header[5]; // shuffle state of the dataloader
+    int row_aligned_sequential = state_header[11];
+    int dataloader_state_version = state_header[15];
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
     model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
+    if (!(dataloader_state_version == 0 || dataloader_state_version == 1)) {
+        fprintf(stderr, "Unsupported dataloader-state version: %d\n", dataloader_state_version);
+        exit(EXIT_FAILURE);
+    }
+    if (!reset_dataloader) {
+        if (should_shuffle != loader->should_shuffle ||
+            row_aligned_sequential != loader->row_aligned_sequential) {
+            fprintf(
+                stderr,
+                "Checkpoint dataloader order does not match the requested order; use -yd 1 only for an intentional data-lineage fork\n");
+            exit(EXIT_FAILURE);
+        }
+        if (dataloader_state_version == 1 &&
+            (state_header[13] != (int)loader->B ||
+             state_header[14] != (int)loader->T ||
+             state_header[16] != (int)loader->glob_result.gl_pathc ||
+             state_header[17] != (int)sequence_boundary_policy ||
+             llmc_checkpoint_load_u64(state_header, 38) !=
+                 (uint64_t)loader->num_tokens ||
+             llmc_checkpoint_load_u64(state_header, 40) !=
+                 loader->source_fingerprint)) {
+            fprintf(
+                stderr,
+                "Checkpoint dataloader binding does not match B, T, sequence-boundary policy, source path/layout/extent, or shard count; use -yd 1 only for an intentional data-lineage fork\n");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     // read AdamW m, v, master_weights (they are all float)
     // allocate all the needed memory as necessary
@@ -1782,7 +1843,6 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     }
 
     // revive the DataLoader object and its state
-    loader->should_shuffle = should_shuffle;
     if (should_shuffle == 1) {
         // ensure the number of shards matches
         size_t glob_result_gl_pathc;
@@ -1807,7 +1867,13 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     fcloseCheck(state_file);
 }
 
-void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoader* train_loader, MultiGpuConfig* multi_gpu_config) {
+void write_checkpoint(
+        const char* output_log_dir,
+        int step,
+        GPT2* model,
+        DataLoader* train_loader,
+        MultiGpuConfig* multi_gpu_config,
+        LlmcSequenceBoundaryPolicy sequence_boundary_policy) {
     // a checkpoint contains: model weights, optimizer/dataloader state, and a DONE file
     printf0("Writing checkpoint at step %d\n", step);
     int rank = multi_gpu_config->process_rank;
@@ -1818,7 +1884,12 @@ void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoa
     }
     // all ranks write their state file
     snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, step, rank);
-    save_state(filename_buffer, step, model, train_loader);
+    save_state(
+        filename_buffer,
+        step,
+        model,
+        train_loader,
+        sequence_boundary_policy);
     if (model->optimizer_config.optimizer_selection ==
         LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON) {
         char normuon_path[512];
@@ -1898,6 +1969,7 @@ void error_usage() {
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     fprintf(stderr, "  -bp <string> sequence boundary: flat_stream|row_reset (default = flat_stream)\n");
+    fprintf(stderr, "  -sh <int>   train data shuffle: 0=sequential, 1=shuffle (raw default = 1)\n");
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     // optimization
@@ -2018,6 +2090,7 @@ int main(int argc, char *argv[]) {
     float sample_top_p = 1.0f;
     const char* sample_prompt_token_ids_csv = nullptr;
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
+    int train_shuffle = 1; // preserve upstream/raw CLI behavior; repo launchers pass this explicitly
     int max_steps = -1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
@@ -2191,6 +2264,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (strcmp(argv[i], "-sh") == 0) { train_shuffle = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 's') { sample_rng_seed = strtoull(argv[i+1], nullptr, 10); }
@@ -2220,6 +2294,10 @@ int main(int argc, char *argv[]) {
     }
 
     char optimizer_config_error[256];
+    if (train_shuffle < 0 || train_shuffle > 1) {
+        fprintf(stderr, "-sh must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
     if (resume_reset_dataloader < 0 || resume_reset_dataloader > 1) {
         fprintf(stderr, "-yd must be 0 or 1\n");
         exit(EXIT_FAILURE);
@@ -2425,6 +2503,17 @@ int main(int argc, char *argv[]) {
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
     // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
     if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
+    const int effective_train_shuffle = overfit_single_batch == 1 ? 0 : train_shuffle;
+    const int row_aligned_train_loader =
+        effective_train_shuffle == 0 &&
+        sequence_boundary_policy == LLMC_SEQUENCE_BOUNDARY_ROW_RESET &&
+        llmc_is_exact_numpy_path(train_data_pattern);
+    // Validation is always sequential, but its row traversal is selected from
+    // its own source. This keeps mixed direct-NPY/legacy-shard invocations
+    // usable while the canonical launcher requires direct NPY for both splits.
+    const int row_aligned_val_loader =
+        sequence_boundary_policy == LLMC_SEQUENCE_BOUNDARY_ROW_RESET &&
+        llmc_is_exact_numpy_path(val_data_pattern);
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2439,6 +2528,12 @@ int main(int argc, char *argv[]) {
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| sequence boundary     | %-50s |\n",
             llmc_sequence_boundary_policy_name(sequence_boundary_policy));
+    printf0("| train data order      | %-50s |\n",
+            effective_train_shuffle ? "shuffled" : "sequential");
+    printf0("| train row traversal   | %-50s |\n",
+            row_aligned_train_loader ? "cyclic logical rows" : "legacy global chunks");
+    printf0("| val row traversal     | %-50s |\n",
+            row_aligned_val_loader ? "cyclic logical rows" : "legacy global chunks");
     printf0("| supervised targets    | %-50d |\n",
             supervised_targets_per_fwdbwd);
     printf0("| val attention blackout | %-49d |\n",
@@ -2634,10 +2729,25 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
+    dataloader_init_with_policy(
+        &train_loader,
+        train_data_pattern,
+        B,
+        T,
+        multi_gpu_config.process_rank,
+        multi_gpu_config.num_processes,
+        effective_train_shuffle,
+        row_aligned_train_loader);
+    dataloader_init_with_policy(
+        &val_loader,
+        val_data_pattern,
+        B,
+        T,
+        multi_gpu_config.process_rank,
+        multi_gpu_config.num_processes,
+        0,
+        row_aligned_val_loader);
     printf0("| train_data_format     | %-50s |\n", dataloader_token_format_name(train_loader.token_format));
     printf0("| val_data_format       | %-50s |\n", dataloader_token_format_name(val_loader.token_format));
     // figure out the number of training steps we will run for
@@ -2646,7 +2756,12 @@ int main(int argc, char *argv[]) {
         // sensible default is to train for exactly one epoch
         size_t ntok = train_loader.num_tokens;
         // the number of (outer loop) steps each process should take for us to reach one epoch
-        train_num_batches = ntok / total_batch_size;
+        train_num_batches = ntok / (size_t)total_batch_size;
+        if (train_loader.row_aligned_sequential &&
+            ntok % (size_t)total_batch_size != 0) {
+            // The final logical-row batch wraps to preserve every tail row.
+            train_num_batches += 1;
+        }
     }
     // figure out the number of validation steps to run for
     int val_num_batches = val_max_steps; // passed in from command line
@@ -2655,6 +2770,9 @@ int main(int argc, char *argv[]) {
         size_t ntok = val_loader.num_tokens;
         // note that unlike the training loop, there is no gradient accumulation inner loop here
         val_num_batches = ntok / tokens_per_fwdbwd;
+        if (val_loader.row_aligned_sequential && ntok % tokens_per_fwdbwd != 0) {
+            val_num_batches += 1;
+        }
     }
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
@@ -2997,7 +3115,13 @@ int main(int argc, char *argv[]) {
     }
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
-        load_state(&step, &model, &train_loader, filename_buffer, resume_reset_dataloader != 0);
+        load_state(
+            &step,
+            &model,
+            &train_loader,
+            filename_buffer,
+            sequence_boundary_policy,
+            resume_reset_dataloader != 0);
         if (resume_has_normuon_companion &&
             !llmc_normuon_load_companion(
                 resume_normuon_path,
@@ -3278,7 +3402,13 @@ int main(int argc, char *argv[]) {
         if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
             // writes model .bin file, state .bin files, and DONE file for step
-            write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
+            write_checkpoint(
+                output_log_dir,
+                step,
+                &model,
+                &train_loader,
+                &multi_gpu_config,
+                sequence_boundary_policy);
             // we only keep checkpoints_keep checkpoints on disk to save space
             // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
             // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)

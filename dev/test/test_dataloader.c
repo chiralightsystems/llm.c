@@ -12,7 +12,7 @@ TODOs:
 
 #define SHARD_NAME_LEN 64
 char shard_name[SHARD_NAME_LEN];
-const int num_tokens = 140;
+enum { num_tokens = 140 };
 int num_shards = 4;
 
 void check_range(const int *tokens, const int start, const int end, const char *file, int line) {
@@ -205,7 +205,7 @@ void test_multiprocess_shuffled(void) {
     printf("test_multiprocess_shuffled... ");
     int B = 4;
     int T = 8;
-    const int num_processes = 2;
+    enum { num_processes = 2 };
     int should_shuffle = 0;
     snprintf(shard_name, SHARD_NAME_LEN, "shard_????.bin");
     DataLoader loaders[num_processes];
@@ -330,6 +330,138 @@ void test_numpy_uint32(void) {
     printf("OK\n");
 }
 
+void check_row_aligned_batch(
+        const DataLoader *loader,
+        const int first_row,
+        const int second_row) {
+    const int expected_rows[2] = {first_row, second_row};
+    for (int batch_row = 0; batch_row < 2; ++batch_row) {
+        const int source_row = expected_rows[batch_row];
+        for (int column = 0; column < 4; ++column) {
+            const int index = batch_row * 4 + column;
+            const int expected_input = 70000 + source_row * 100 + column;
+            const int expected_target =
+                column < 3 ? expected_input + 1 : expected_input;
+            assert(loader->inputs[index] == expected_input);
+            assert(loader->targets[index] == expected_target);
+        }
+    }
+}
+
+void test_numpy_uint32_row_aligned_sequential(void) {
+    printf("test_numpy_uint32_row_aligned_sequential... ");
+
+    for (int row_count = 4; row_count <= 5; ++row_count) {
+        uint32_t tokens[5 * 4];
+        for (int row = 0; row < row_count; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                tokens[row * 4 + column] =
+                    70000U + (uint32_t)(row * 100 + column);
+            }
+        }
+        const char *filename =
+            row_count == 4 ? "direct_rows_divisible.npy" : "direct_rows_wrap.npy";
+        write_numpy_uint32(filename, 1, tokens, (size_t)row_count, 4);
+
+        DataLoader loader;
+        dataloader_init_with_policy(&loader, filename, 2, 4, 0, 1, 0, 1);
+        assert(loader.row_aligned_sequential == 1);
+        assert(loader.logical_row_count == (size_t)row_count);
+        dataloader_next_batch(&loader);
+        check_row_aligned_batch(&loader, 0, 1);
+        dataloader_next_batch(&loader);
+        check_row_aligned_batch(&loader, 2, 3);
+        if (row_count == 4) {
+            dataloader_next_batch(&loader);
+            check_row_aligned_batch(&loader, 0, 1);
+        } else {
+            const size_t resume_cursor = loader.current_sample_idx;
+            assert(resume_cursor == 4);
+            dataloader_next_batch(&loader);
+            check_row_aligned_batch(&loader, 4, 0);
+            dataloader_next_batch(&loader);
+            check_row_aligned_batch(&loader, 1, 2);
+
+            DataLoader resumed;
+            dataloader_init_with_policy(&resumed, filename, 2, 4, 0, 1, 0, 1);
+            dataloader_resume(&resumed, 0, resume_cursor);
+            dataloader_next_batch(&resumed);
+            check_row_aligned_batch(&resumed, 4, 0);
+            dataloader_next_batch(&resumed);
+            check_row_aligned_batch(&resumed, 1, 2);
+            dataloader_free(&resumed);
+        }
+        dataloader_free(&loader);
+        remove(filename);
+    }
+    printf("OK\n");
+}
+
+void test_numpy_uint32_row_aligned_multiprocess(void) {
+    printf("test_numpy_uint32_row_aligned_multiprocess... ");
+    uint32_t tokens[5 * 4];
+    for (int row = 0; row < 5; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            tokens[row * 4 + column] =
+                70000U + (uint32_t)(row * 100 + column);
+        }
+    }
+    const char* filename = "direct_rows_multiprocess.npy";
+    write_numpy_uint32(filename, 1, tokens, 5, 4);
+
+    DataLoader rank0;
+    DataLoader rank1;
+    dataloader_init_with_policy(&rank0, filename, 2, 4, 0, 2, 0, 1);
+    dataloader_init_with_policy(&rank1, filename, 2, 4, 1, 2, 0, 1);
+    assert(rank0.source_fingerprint == rank1.source_fingerprint);
+
+    dataloader_next_batch(&rank0);
+    dataloader_next_batch(&rank1);
+    check_row_aligned_batch(&rank0, 0, 1);
+    check_row_aligned_batch(&rank1, 2, 3);
+    assert(rank0.current_sample_idx == 4);
+    assert(rank1.current_sample_idx == 4);
+
+    dataloader_next_batch(&rank0);
+    dataloader_next_batch(&rank1);
+    check_row_aligned_batch(&rank0, 4, 0);
+    check_row_aligned_batch(&rank1, 1, 2);
+
+    dataloader_free(&rank0);
+    dataloader_free(&rank1);
+    remove(filename);
+    printf("OK\n");
+}
+
+void test_numpy_uint32_row_aligned_divisor_view(void) {
+    printf("test_numpy_uint32_row_aligned_divisor_view... ");
+    uint32_t tokens[3 * 8];
+    for (int logical_row = 0; logical_row < 6; ++logical_row) {
+        for (int column = 0; column < 4; ++column) {
+            tokens[logical_row * 4 + column] =
+                70000U + (uint32_t)(logical_row * 100 + column);
+        }
+    }
+    const char* filename = "direct_rows_divisor_view.npy";
+    write_numpy_uint32(filename, 1, tokens, 3, 8);
+
+    DataLoader loader;
+    dataloader_init_with_policy(&loader, filename, 2, 4, 0, 1, 0, 1);
+    assert(loader.numpy_rows == 3);
+    assert(loader.numpy_columns == 8);
+    assert(loader.logical_row_count == 6);
+    dataloader_next_batch(&loader);
+    check_row_aligned_batch(&loader, 0, 1);
+    dataloader_next_batch(&loader);
+    check_row_aligned_batch(&loader, 2, 3);
+    dataloader_next_batch(&loader);
+    check_row_aligned_batch(&loader, 4, 5);
+
+    dataloader_free(&loader);
+    remove(filename);
+    printf("OK\n");
+}
+
 int main(void) {
 
     // generate a few dummy shards of data with incrementing tokens
@@ -358,6 +490,9 @@ int main(void) {
     test_shuffled();
     test_multiprocess_shuffled();
     test_numpy_uint32();
+    test_numpy_uint32_row_aligned_sequential();
+    test_numpy_uint32_row_aligned_multiprocess();
+    test_numpy_uint32_row_aligned_divisor_view();
 
     // clean up the shards
     for (int shard_id = 0; shard_id < num_shards; shard_id++) {
