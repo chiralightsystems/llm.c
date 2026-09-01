@@ -20,7 +20,7 @@ the single-GPU CUDA implementation. It does not depend on the FRNA host runtime.
 
 #include <string>
 
-constexpr int LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT = 16;
+constexpr int LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT = 18;
 constexpr int LLMC_OPTIMIZER_FAMILY_COUNT = 6;
 constexpr int LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT = 5;
 constexpr int LLMC_NORMUON_VIEWS_PER_LAYER = 8;
@@ -1207,6 +1207,8 @@ static constexpr LlmcOptimizerParameterTemplate kLlmcParameterTemplates[
     {"fcprojb", LLMC_OPTIMIZER_FAMILY_MLP_BIASES, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
     {"lnfw", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 0, 0, nullptr},
     {"lnfb", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 0, 0, nullptr},
+    {"lexical_downw", LLMC_OPTIMIZER_FAMILY_EMBEDDINGS, LLMC_WEIGHT_DECAY_ENABLED, 0, 0, nullptr},
+    {"lexical_upw", LLMC_OPTIMIZER_FAMILY_EMBEDDINGS, LLMC_WEIGHT_DECAY_ENABLED, 0, 0, nullptr},
 };
 
 inline void llmc_optimizer_plan_reset(LlmcOptimizerPlan* plan) {

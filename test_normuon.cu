@@ -452,6 +452,8 @@ static void test_gpt2_context_descriptor() {
     GPT2Config midpoint = {};
     GPT2Config rope_midpoint = {};
     GPT2Config rope_xl = {};
+    GPT2Config bridged_medium = {};
+    GPT2Config bridged_medium_reordered = {};
     TEST_CHECK(
         gpt2_config_from_descriptor(&legacy, "d48"),
         "legacy GPT-2 XL descriptor parses");
@@ -471,6 +473,14 @@ static void test_gpt2_context_descriptor() {
     TEST_CHECK(
         gpt2_config_from_descriptor(&rope_xl, "gpt2:rope:d48:t2048"),
         "RoPE GPT-2 XL descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(
+            &bridged_medium, "gpt2:rope:d24:t2048:e4096"),
+        "RoPE GPT-2 Medium lexical-bridge descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(
+            &bridged_medium_reordered, "gpt2:rope:d24:e4096:t2048"),
+        "lexical-width and context suffixes may be reordered");
     TEST_CHECK(
         legacy.num_layers == 48 && legacy.channels == 1600 &&
             legacy.num_heads == 25 && legacy.max_seq_len == 1024,
@@ -507,6 +517,22 @@ static void test_gpt2_context_descriptor() {
                 rope_midpoint.residual_projection_std -
                 0.02f / std::sqrt(60.0f)) < 1.0e-8f,
         "RoPE midpoint records GPT-2 residual-scaled initialization");
+    TEST_CHECK(
+        bridged_medium.num_layers == 24 &&
+            bridged_medium.channels == 1024 &&
+            bridged_medium.lexical_channels == 4096 &&
+            bridged_medium.num_heads == 16 &&
+            bridged_medium.max_seq_len == 2048 &&
+            bridged_medium.rope_rotary_dim == 64 &&
+            std::fabs(bridged_medium.bridge_projection_std - 0.015625f) <
+                1.0e-8f,
+        "bridged descriptor separates lexical and residual widths with variance-preserving init");
+    TEST_CHECK(
+        std::memcmp(
+            &bridged_medium,
+            &bridged_medium_reordered,
+            sizeof(GPT2Config)) == 0,
+        "descriptor suffix order does not alter the model schema");
     const float legacy_residual_scale = 1.0f / std::sqrt(60.0f);
     const float legacy_residual_std = 0.02f * legacy_residual_scale;
     TEST_CHECK(
@@ -521,6 +547,9 @@ static void test_gpt2_context_descriptor() {
         "gpt2:d48:x2048", "gpt2:d:t2048", "gpt2:d999:t2048",
         "gpt2:rope:d48:t", "gpt2:rope:d48:t0",
         "gpt2:rope:d48:t2048junk", "gpt2:rope:d999:t2048",
+        "gpt2:rope:d24:e", "gpt2:rope:d24:e0",
+        "gpt2:rope:d24:e4097", "gpt2:rope:d24:e4096:e2048",
+        "gpt2:rope:d24:t2048:t1024", "gpt2:d24:e4096",
     };
     for (const char* descriptor : malformed) {
         GPT2Config rejected = {};
@@ -589,6 +618,27 @@ static void test_gpt2_context_descriptor() {
         rope_xl_total == 1556048000ULL,
         "RoPE GPT-2 XL parameter count excludes learned WPE");
 
+    bridged_medium.vocab_size = 50257;
+    bridged_medium.padded_vocab_size = 50304;
+    size_t bridged_elements[NUM_PARAMETER_TENSORS];
+    size_t bridged_sizeof[NUM_PARAMETER_TENSORS];
+    fill_in_parameter_sizes(
+        bridged_elements, bridged_sizeof, bridged_medium);
+    size_t bridged_total = 0;
+    for (int tensor = 0; tensor < NUM_PARAMETER_TENSORS; ++tensor) {
+        bridged_total += bridged_elements[tensor];
+    }
+    TEST_CHECK(
+        bridged_elements[0] == 206045184ULL &&
+            bridged_elements[1] == 0ULL &&
+            bridged_elements[16] == 4194304ULL &&
+            bridged_elements[17] == 4194304ULL,
+        "bridged tied embedding and projection tensor shapes are exact");
+    TEST_CHECK(
+        bridged_total == 516745216ULL &&
+            bridged_total - bridged_elements[0] == 310700032ULL,
+        "bridged GPT-2 Medium total and non-embedding counts are exact");
+
     GPT2 rope_model = {};
     rope_model.config = rope_midpoint;
     std::memcpy(
@@ -627,6 +677,266 @@ static std::vector<float> dequantize_floatx(
 
 static bool floatx_bits_equal(floatX lhs, floatX rhs) {
     return std::memcmp(&lhs, &rhs, sizeof(floatX)) == 0;
+}
+
+static void test_bridge_inplace_matmul_backward() {
+    constexpr int B = 1;
+    constexpr int T = 64;
+    constexpr int C = 64;
+    constexpr int E = 128;
+    constexpr int V = 256;
+    const size_t btc = static_cast<size_t>(B) * T * C;
+    const size_t bte = static_cast<size_t>(B) * T * E;
+    const size_t btv = static_cast<size_t>(B) * T * V;
+    const size_t up_elements = static_cast<size_t>(E) * C;
+    const size_t wte_elements = static_cast<size_t>(V) * E;
+
+    auto patterned = [](size_t count, float scale, int modulus) {
+        std::vector<float> values(count);
+        for (size_t index = 0; index < count; ++index) {
+            values[index] = scale *
+                static_cast<float>(static_cast<int>(index % modulus) -
+                                   modulus / 2);
+        }
+        return quantize_to_floatx(values);
+    };
+    const std::vector<floatX> lnf_host = patterned(btc, 0.003f, 29);
+    const std::vector<floatX> up_host = patterned(up_elements, 0.002f, 31);
+    const std::vector<floatX> wte_host = patterned(wte_elements, 0.001f, 37);
+    const std::vector<floatX> dlogits_host = patterned(btv, 0.0005f, 41);
+
+    floatX *lnf_standard, *lnf_inplace, *up, *lm_standard, *lm_inplace;
+    floatX *wte, *dlogits, *dlexical_standard;
+    floatX *dwte_standard, *dwte_inplace, *dup_standard, *dup_inplace;
+    cudaCheck(cudaMalloc(&lnf_standard, btc * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&lnf_inplace, btc * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&up, up_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&lm_standard, bte * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&lm_inplace, bte * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&wte, wte_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&dlogits, btv * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&dlexical_standard, bte * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&dwte_standard, wte_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&dwte_inplace, wte_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&dup_standard, up_elements * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&dup_inplace, up_elements * sizeof(floatX)));
+    copy_to_device(lnf_standard, lnf_host);
+    copy_to_device(lnf_inplace, lnf_host);
+    copy_to_device(up, up_host);
+    copy_to_device(wte, wte_host);
+    copy_to_device(dlogits, dlogits_host);
+    cudaCheck(cudaMemset(dwte_standard, 0, wte_elements * sizeof(floatX)));
+    cudaCheck(cudaMemset(dwte_inplace, 0, wte_elements * sizeof(floatX)));
+    cudaCheck(cudaMemset(dup_standard, 0, up_elements * sizeof(floatX)));
+    cudaCheck(cudaMemset(dup_inplace, 0, up_elements * sizeof(floatX)));
+
+    matmul_forward_cublaslt(
+        lm_standard, lnf_standard, up, NULL, B, T, C, E, main_stream);
+    cudaCheck(cudaMemcpyAsync(
+        lm_inplace,
+        lm_standard,
+        bte * sizeof(floatX),
+        cudaMemcpyDeviceToDevice,
+        main_stream));
+    matmul_backward(
+        dlexical_standard,
+        dwte_standard,
+        NULL,
+        dlogits,
+        lm_standard,
+        wte,
+        NULL,
+        B,
+        T,
+        E,
+        V,
+        main_stream);
+    matmul_backward(
+        lnf_standard,
+        dup_standard,
+        NULL,
+        dlexical_standard,
+        lnf_inplace,
+        up,
+        NULL,
+        B,
+        T,
+        C,
+        E,
+        main_stream);
+    matmul_backward_inplace_input(
+        lm_inplace,
+        dwte_inplace,
+        dlogits,
+        wte,
+        B,
+        T,
+        E,
+        V,
+        main_stream);
+    matmul_backward_inplace_input(
+        lnf_inplace,
+        dup_inplace,
+        lm_inplace,
+        up,
+        B,
+        T,
+        C,
+        E,
+        main_stream);
+    cudaCheck(cudaDeviceSynchronize());
+
+    const std::vector<floatX> dlnf_standard =
+        copy_from_device(lnf_standard, btc);
+    const std::vector<floatX> dlnf_inplace =
+        copy_from_device(lnf_inplace, btc);
+    const std::vector<floatX> dwte_a =
+        copy_from_device(dwte_standard, wte_elements);
+    const std::vector<floatX> dwte_b =
+        copy_from_device(dwte_inplace, wte_elements);
+    const std::vector<floatX> dup_a =
+        copy_from_device(dup_standard, up_elements);
+    const std::vector<floatX> dup_b =
+        copy_from_device(dup_inplace, up_elements);
+    TEST_CHECK(
+        std::memcmp(
+            dlnf_standard.data(),
+            dlnf_inplace.data(),
+            btc * sizeof(floatX)) == 0,
+        "in-place bridge backward preserves the activation gradient bit-exactly");
+    TEST_CHECK(
+        std::memcmp(
+            dwte_a.data(),
+            dwte_b.data(),
+            wte_elements * sizeof(floatX)) == 0,
+        "in-place tied-head backward preserves the WTE gradient bit-exactly");
+    TEST_CHECK(
+        std::memcmp(
+            dup_a.data(),
+            dup_b.data(),
+            up_elements * sizeof(floatX)) == 0,
+        "in-place bridge backward preserves the projection gradient bit-exactly");
+
+    cudaCheck(cudaFree(lnf_standard));
+    cudaCheck(cudaFree(lnf_inplace));
+    cudaCheck(cudaFree(up));
+    cudaCheck(cudaFree(lm_standard));
+    cudaCheck(cudaFree(lm_inplace));
+    cudaCheck(cudaFree(wte));
+    cudaCheck(cudaFree(dlogits));
+    cudaCheck(cudaFree(dlexical_standard));
+    cudaCheck(cudaFree(dwte_standard));
+    cudaCheck(cudaFree(dwte_inplace));
+    cudaCheck(cudaFree(dup_standard));
+    cudaCheck(cudaFree(dup_inplace));
+}
+
+static void test_bridged_model_forward_backward_and_checkpoint() {
+    GPT2 model = {};
+    gpt2_init_common(&model);
+    model.config.max_seq_len = 32;
+    model.config.vocab_size = 50257;
+    model.config.padded_vocab_size = 50304;
+    model.config.num_layers = 1;
+    model.config.num_heads = 6;
+    model.config.channels = 384;
+    model.config.lexical_channels = 512;
+    model.config.position_encoding = LLMC_POSITION_ENCODING_ROPE;
+    model.config.rope_rotary_dim = 64;
+    model.config.rope_theta = LLMC_ROPE_THETA_DEFAULT;
+    gpt2_set_initializer_defaults(&model.config);
+    TEST_CHECK(
+        gpt2_validate_position_config(&model.config),
+        "tiny bridged RoPE config validates");
+    gpt2_allocate_weights(&model);
+
+    std::vector<floatX> parameters(model.num_parameters, (floatX)0.0f);
+    size_t tensor_offset = 0;
+    for (int tensor_id = 0;
+         tensor_id < NUM_PARAMETER_TENSORS;
+         ++tensor_id) {
+        const size_t elements = model.param_elements[tensor_id];
+        if (tensor_id == 2 || tensor_id == 8 || tensor_id == 14) {
+            for (size_t index = 0; index < elements; ++index) {
+                parameters[tensor_offset + index] = (floatX)1.0f;
+            }
+        } else if (
+            tensor_id == 0 || tensor_id == 4 || tensor_id == 6 ||
+            tensor_id == 10 || tensor_id == 12 || tensor_id == 16 ||
+            tensor_id == 17) {
+            for (size_t index = 0; index < elements; ++index) {
+                const float value = 0.002f *
+                    static_cast<float>(static_cast<int>(index % 23U) - 11);
+                parameters[tensor_offset + index] = (floatX)value;
+            }
+        }
+        tensor_offset += elements;
+    }
+    copy_to_device((floatX*)model.params_memory, parameters);
+
+    const char* checkpoint_path =
+        "build/lexical_bridge_tiny_checkpoint.bin";
+    gpt2_write_to_checkpoint(&model, checkpoint_path);
+    GPT2 loaded = {};
+    gpt2_init_common(&loaded);
+    gpt2_build_from_checkpoint(&loaded, checkpoint_path);
+    const std::vector<floatX> loaded_parameters = copy_from_device(
+        (floatX*)loaded.params_memory, loaded.num_parameters);
+    TEST_CHECK(
+        loaded.config.lexical_channels == 512 &&
+            loaded.config.channels == 384 &&
+            loaded.config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            loaded.num_parameters == model.num_parameters &&
+            std::memcmp(
+                loaded_parameters.data(),
+                parameters.data(),
+                parameters.size() * sizeof(floatX)) == 0,
+        "bridged model checkpoint round-trips metadata and parameters exactly");
+    cudaFreeCheck(&loaded.params_memory);
+    remove(checkpoint_path);
+
+    set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
+    gpt2_allocate_state(&model, 1, 32);
+    std::vector<int> inputs(32);
+    std::vector<int> targets(32);
+    for (int index = 0; index < 32; ++index) {
+        inputs[index] = (7 * index + 5) % model.config.vocab_size;
+        targets[index] = (7 * (index + 1) + 5) % model.config.vocab_size;
+    }
+    gpt2_forward(&model, inputs.data(), 1, 32);
+    gpt2_backward_and_reduce(
+        &model, inputs.data(), targets.data(), 1, 0);
+    const std::vector<float> down_gradient = dequantize_floatx(
+        copy_from_device(
+            model.grads.lexical_downw,
+            model.param_elements[16]));
+    const std::vector<float> up_gradient = dequantize_floatx(
+        copy_from_device(
+            model.grads.lexical_upw,
+            model.param_elements[17]));
+    const std::vector<float> tied_gradient = dequantize_floatx(
+        copy_from_device(model.grads.wte, model.param_elements[0]));
+    auto max_abs = [](const std::vector<float>& values) {
+        float result = 0.0f;
+        for (float value : values) {
+            result = std::max(result, std::fabs(value));
+        }
+        return result;
+    };
+    TEST_CHECK(
+        std::isfinite(model.mean_loss) && model.mean_loss > 0.0f,
+        "tiny bridged model produces a finite positive training loss");
+    TEST_CHECK(
+        all_finite(down_gradient) && max_abs(down_gradient) > 0.0f,
+        "input bridge receives a finite nonzero gradient");
+    TEST_CHECK(
+        all_finite(up_gradient) && max_abs(up_gradient) > 0.0f,
+        "output bridge receives a finite nonzero gradient");
+    TEST_CHECK(
+        all_finite(tied_gradient) && max_abs(tied_gradient) > 0.0f,
+        "tied lexical table receives finite nonzero lookup/head gradients");
+    gpt2_free(&model);
+    set_zero_configs(&multi_gpu_config, 0, 1);
 }
 
 static void test_encoder_without_wpe() {
@@ -971,6 +1281,46 @@ static void test_parameter_plan_and_views() {
              LLMC_OPTIMIZER_BACKEND_NORMUON) == expected_normuon,
             "only fcw/fcprojw route to NorMuon");
     }
+    GPT2Config bridged_config = {};
+    TEST_CHECK(
+        gpt2_config_from_descriptor(
+            &bridged_config, "gpt2:rope:d24:t2048:e4096"),
+        "bridged optimizer-plan descriptor parses");
+    bridged_config.vocab_size = 50257;
+    bridged_config.padded_vocab_size = 50304;
+    fill_in_parameter_sizes(
+        parameter_elements, parameter_sizeof, bridged_config);
+    TEST_CHECK(
+        llmc_build_optimizer_plan(
+            &plan,
+            &config,
+            bridged_config.num_layers,
+            bridged_config.channels,
+            parameter_elements,
+            error,
+            sizeof(error)),
+        "mixed optimizer plan builds for bridged GPT-2 Medium");
+    TEST_CHECK(
+        plan.parameter_types[16].tensor_elements == 4194304ULL &&
+            plan.parameter_types[17].tensor_elements == 4194304ULL &&
+            plan.parameter_types[16].backend_kind ==
+                LLMC_OPTIMIZER_BACKEND_ADAMW &&
+            plan.parameter_types[17].backend_kind ==
+                LLMC_OPTIMIZER_BACKEND_ADAMW &&
+            plan.normuon_parameter_type_count == 2,
+        "lexical bridges stay on AdamW while only core Wup/Wdown use NorMuon");
+    fill_in_parameter_sizes(
+        parameter_elements, parameter_sizeof, model_config);
+    TEST_CHECK(
+        llmc_build_optimizer_plan(
+            &plan,
+            &config,
+            model_config.num_layers,
+            model_config.channels,
+            parameter_elements,
+            error,
+            sizeof(error)),
+        "GPT-2 small mixed plan rebuilds after bridge routing check");
     const size_t q_elements =
         static_cast<size_t>(plan.normuon_view_count) *
         model_config.channels *
@@ -2094,6 +2444,8 @@ int main() {
     common_start(false, false);
 
     test_gpt2_context_descriptor();
+    test_bridge_inplace_matmul_backward();
+    test_bridged_model_forward_backward_and_checkpoint();
     test_encoder_without_wpe();
     test_rope_forward_backward();
     test_parameter_plan_and_views();
@@ -2111,9 +2463,9 @@ int main() {
     common_free(unused_model);
     multi_gpu_config_free(&multi_gpu_config);
     if (test_failures == 0) {
-        printf("All focused llm.c RoPE/NorMuon tests passed.\n");
+        printf("All focused llm.c RoPE/bridge/NorMuon tests passed.\n");
         return EXIT_SUCCESS;
     }
-    fprintf(stderr, "%d focused llm.c RoPE/NorMuon tests failed.\n", test_failures);
+    fprintf(stderr, "%d focused llm.c RoPE/bridge/NorMuon tests failed.\n", test_failures);
     return EXIT_FAILURE;
 }

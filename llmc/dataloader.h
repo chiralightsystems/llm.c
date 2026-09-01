@@ -389,7 +389,8 @@ void dataloader_init_with_policy(DataLoader *loader,
                                  int process_rank,
                                  int num_processes,
                                  int should_shuffle,
-                                 int row_aligned_sequential) {
+                                 int row_aligned_sequential,
+                                 int row_aligned_eval_regroup) {
     if (B == 0 || T == 0 || num_processes <= 0 ||
         process_rank < 0 || process_rank >= num_processes) {
         fprintf(stderr, "Error: invalid dataloader B, T, rank, or process count\n");
@@ -397,6 +398,10 @@ void dataloader_init_with_policy(DataLoader *loader,
     }
     if (should_shuffle && row_aligned_sequential) {
         fprintf(stderr, "Error: row-aligned sequential loading cannot also shuffle\n");
+        exit(EXIT_FAILURE);
+    }
+    if (row_aligned_eval_regroup && !row_aligned_sequential) {
+        fprintf(stderr, "Error: row-aligned eval regrouping requires row-aligned sequential loading\n");
         exit(EXIT_FAILURE);
     }
     loader->process_rank = process_rank;
@@ -463,13 +468,28 @@ void dataloader_init_with_policy(DataLoader *loader,
                         "Error: canonical row-aligned sequential loading requires a direct NumPy uint32 cache\n");
                 exit(EXIT_FAILURE);
             }
-            if (loader->numpy_columns % T != 0 || (size_t)shard_ntok % T != 0) {
+            const int logical_rows_fit_inside_physical_rows =
+                loader->numpy_columns % T == 0;
+            const int logical_rows_group_complete_physical_rows =
+                row_aligned_eval_regroup && T % loader->numpy_columns == 0;
+            const size_t trailing_tokens = (size_t)shard_ntok % T;
+            if ((!logical_rows_fit_inside_physical_rows &&
+                 !logical_rows_group_complete_physical_rows) ||
+                (trailing_tokens != 0 && !row_aligned_eval_regroup)) {
                 fprintf(stderr,
-                        "Error: row_reset sequential loading requires the NumPy row width (%zu) to be divisible by T (%zu)\n",
+                        "Error: row_reset sequential loading requires the NumPy row width (%zu) to tile T (%zu); only eval may regroup complete physical rows and drop a shorter tail\n",
                         loader->numpy_columns, T);
                 exit(EXIT_FAILURE);
             }
             loader->logical_row_count = (size_t)shard_ntok / T;
+            if (row_aligned_eval_regroup && loader->process_rank == 0 &&
+                (!logical_rows_fit_inside_physical_rows || trailing_tokens != 0)) {
+                printf(
+                    "Row-aligned eval regroup: physical row width %zu -> logical T %zu; ignoring %zu trailing token(s).\n",
+                    loader->numpy_columns,
+                    T,
+                    trailing_tokens);
+            }
             if (B > SIZE_MAX / (size_t)num_processes) {
                 fprintf(stderr, "Error: row-aligned global batch row count overflows size_t\n");
                 exit(EXIT_FAILURE);
@@ -519,6 +539,7 @@ void dataloader_init(DataLoader *loader,
         process_rank,
         num_processes,
         should_shuffle,
+        0,
         0);
 }
 

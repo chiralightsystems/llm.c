@@ -288,3 +288,30 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, B*T, stream, false, true, 0, 0, 0, 0,
                     true /* accumulate */, NULL, true);
 }
+
+// Bias-free backward variant for a dead forward activation that may be
+// overwritten by its own gradient. The weight-gradient GEMM must run first,
+// while the activation still contains its forward value; stream ordering then
+// makes the input-gradient GEMM safe to write back into the same allocation.
+void matmul_backward_inplace_input(
+        floatX* inp_and_dinp,
+        floatX* dweight,
+        floatX* dout,
+        floatX* weight,
+        int B,
+        int T,
+        int C,
+        int OC,
+        cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    matmul_cublaslt(
+        dweight, inp_and_dinp, dout, NULL,
+        C, OC, B*T, stream,
+        false, true, 0, 0, 0, 0,
+        true /* accumulate */, NULL, true);
+    matmul_cublaslt(
+        inp_and_dinp, weight, dout, NULL,
+        C, B*T, OC, stream,
+        false, false, 0, 0, 0, 0,
+        false, NULL, true);
+}

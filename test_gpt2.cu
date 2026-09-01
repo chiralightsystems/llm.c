@@ -47,7 +47,7 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
 
 // the same tensors as in the train file, but in float, which are used as reference
 typedef struct {
-    float*  wte; // (Vp, C)
+    float*  wte; // (Vp, E), where E is lexical_channels
     float*  wpe; // (maxT, C)
     float*  ln1w; // (L, C)
     float*  ln1b; // (L, C)
@@ -63,6 +63,8 @@ typedef struct {
     float*  fcprojb; // (L, C)
     float*  lnfw; // (C)
     float*  lnfb; // (C)
+    float*  lexical_downw; // (C, E)
+    float*  lexical_upw; // (E, C)
 } FloatParameterTensors;
 static_assert(sizeof(FloatParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -78,7 +80,8 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb,
+        &params->lexical_downw, &params->lexical_upw
     };
     float* params_memory_iterator = params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -278,7 +281,8 @@ int main(int argc, char *argv[]) {
                     5e-1f, 4e-3f, 1e-1f, 4e-2f,
                     5e-2f, 3.5e-2f, 2e-2f, 3e-2f,
                     5e-2f, 3e-2f, 3e-2f, 3e-2f,
-                    2e-2f, 1e-2f,1e-1f,2e-2f};
+                    2e-2f, 1e-2f,1e-1f,2e-2f,
+                    1e-1f, 1e-1f};
 
             #if defined(ENABLE_FP32)
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -288,7 +292,7 @@ int main(int argc, char *argv[]) {
             const char* names[NUM_PARAMETER_TENSORS] = {
                     "wte", "wpe", "ln1w", "ln1b", "qkvw", "qkvb", "attrpojw",
                     "attprojb", "ln2w", "ln2b", "fcw", "fcb", "fcprojw", "fcprojb",
-                    "lnfw", "lnfb"
+                    "lnfw", "lnfb", "lexical_downw", "lexical_upw"
             };
             size_t* count = model.param_elements;
             for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
@@ -337,7 +341,12 @@ int main(int argc, char *argv[]) {
 
     DataLoader loader;
     dataloader_init(&loader, "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
-    save_state("test_gpt2cu_state.ckpt", 10, &model, &loader);
+    save_state(
+        "test_gpt2cu_state.ckpt",
+        10,
+        &model,
+        &loader,
+        LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM);
     int tokens[10];
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
@@ -353,7 +362,12 @@ int main(int argc, char *argv[]) {
     gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
     int ld_step;
     gpt2_allocate_state(&model, B, T);
-    load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
+    load_state(
+        &ld_step,
+        &model,
+        &loader,
+        "test_gpt2cu_state.ckpt",
+        LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM);
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, B, T);

@@ -364,7 +364,7 @@ void test_numpy_uint32_row_aligned_sequential(void) {
         write_numpy_uint32(filename, 1, tokens, (size_t)row_count, 4);
 
         DataLoader loader;
-        dataloader_init_with_policy(&loader, filename, 2, 4, 0, 1, 0, 1);
+        dataloader_init_with_policy(&loader, filename, 2, 4, 0, 1, 0, 1, 0);
         assert(loader.row_aligned_sequential == 1);
         assert(loader.logical_row_count == (size_t)row_count);
         dataloader_next_batch(&loader);
@@ -383,7 +383,7 @@ void test_numpy_uint32_row_aligned_sequential(void) {
             check_row_aligned_batch(&loader, 1, 2);
 
             DataLoader resumed;
-            dataloader_init_with_policy(&resumed, filename, 2, 4, 0, 1, 0, 1);
+            dataloader_init_with_policy(&resumed, filename, 2, 4, 0, 1, 0, 1, 0);
             dataloader_resume(&resumed, 0, resume_cursor);
             dataloader_next_batch(&resumed);
             check_row_aligned_batch(&resumed, 4, 0);
@@ -411,8 +411,8 @@ void test_numpy_uint32_row_aligned_multiprocess(void) {
 
     DataLoader rank0;
     DataLoader rank1;
-    dataloader_init_with_policy(&rank0, filename, 2, 4, 0, 2, 0, 1);
-    dataloader_init_with_policy(&rank1, filename, 2, 4, 1, 2, 0, 1);
+    dataloader_init_with_policy(&rank0, filename, 2, 4, 0, 2, 0, 1, 0);
+    dataloader_init_with_policy(&rank1, filename, 2, 4, 1, 2, 0, 1, 0);
     assert(rank0.source_fingerprint == rank1.source_fingerprint);
 
     dataloader_next_batch(&rank0);
@@ -446,7 +446,7 @@ void test_numpy_uint32_row_aligned_divisor_view(void) {
     write_numpy_uint32(filename, 1, tokens, 3, 8);
 
     DataLoader loader;
-    dataloader_init_with_policy(&loader, filename, 2, 4, 0, 1, 0, 1);
+    dataloader_init_with_policy(&loader, filename, 2, 4, 0, 1, 0, 1, 0);
     assert(loader.numpy_rows == 3);
     assert(loader.numpy_columns == 8);
     assert(loader.logical_row_count == 6);
@@ -456,6 +456,41 @@ void test_numpy_uint32_row_aligned_divisor_view(void) {
     check_row_aligned_batch(&loader, 2, 3);
     dataloader_next_batch(&loader);
     check_row_aligned_batch(&loader, 4, 5);
+
+    dataloader_free(&loader);
+    remove(filename);
+    printf("OK\n");
+}
+
+void test_numpy_uint32_row_aligned_eval_regroup(void) {
+    printf("test_numpy_uint32_row_aligned_eval_regroup... ");
+    uint32_t tokens[5 * 4];
+    for (size_t index = 0; index < 5 * 4; ++index) {
+        tokens[index] = 70000U + (uint32_t)index;
+    }
+    const char* filename = "direct_rows_eval_regroup.npy";
+    write_numpy_uint32(filename, 1, tokens, 5, 4);
+
+    DataLoader loader;
+    dataloader_init_with_policy(&loader, filename, 2, 8, 0, 1, 0, 1, 1);
+    assert(loader.numpy_rows == 5);
+    assert(loader.numpy_columns == 4);
+    assert(loader.num_tokens == 20);
+    assert(loader.logical_row_count == 2);
+
+    for (int batch = 0; batch < 2; ++batch) {
+        dataloader_next_batch(&loader);
+        for (int row = 0; row < 2; ++row) {
+            for (int column = 0; column < 8; ++column) {
+                const int index = row * 8 + column;
+                const int expected_input = 70000 + index;
+                const int expected_target =
+                    column < 7 ? expected_input + 1 : expected_input;
+                assert(loader.inputs[index] == expected_input);
+                assert(loader.targets[index] == expected_target);
+            }
+        }
+    }
 
     dataloader_free(&loader);
     remove(filename);
@@ -493,6 +528,7 @@ int main(void) {
     test_numpy_uint32_row_aligned_sequential();
     test_numpy_uint32_row_aligned_multiprocess();
     test_numpy_uint32_row_aligned_divisor_view();
+    test_numpy_uint32_row_aligned_eval_regroup();
 
     // clean up the shards
     for (int shard_id = 0; shard_id < num_shards; shard_id++) {

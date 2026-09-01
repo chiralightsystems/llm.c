@@ -158,6 +158,10 @@ constexpr int LLMC_MODEL_VERSION_FP32_ABSOLUTE = 3;
 constexpr int LLMC_MODEL_VERSION_BF16_ABSOLUTE = 5;
 constexpr int LLMC_MODEL_VERSION_FP32_ROPE = 6;
 constexpr int LLMC_MODEL_VERSION_BF16_ROPE = 7;
+constexpr int LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE = 8;
+constexpr int LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE = 9;
+constexpr int LLMC_LEGACY_PARAMETER_TENSOR_COUNT = 16;
+constexpr int LLMC_EMBEDDING_BRIDGE_SCHEMA = 1;
 
 const char* llmc_position_encoding_name(int position_encoding) {
     switch (position_encoding) {
@@ -174,12 +178,24 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    int lexical_channels; // tied token embedding/head width; defaults to channels
     int position_encoding; // LlmcPositionEncoding
     int rope_rotary_dim; // rotated dimensions per head; 0 for learned absolute
     float rope_theta; // RoPE frequency base; 0 for learned absolute
     float initializer_std; // std for token/QKV/MLP input projections
     float residual_projection_std; // std for attention/MLP residual projections
+    float bridge_projection_std; // std for both bias-free lexical bridge matrices
 } GPT2Config;
+
+int gpt2_lexical_channels(const GPT2Config* config) {
+    return config->lexical_channels > 0
+        ? config->lexical_channels
+        : config->channels;
+}
+
+bool gpt2_uses_embedding_bridge(const GPT2Config* config) {
+    return gpt2_lexical_channels(config) != config->channels;
+}
 
 void gpt2_set_initializer_defaults(GPT2Config* config) {
     config->initializer_std = LLMC_GPT2_INITIALIZER_STD;
@@ -189,18 +205,32 @@ void gpt2_set_initializer_defaults(GPT2Config* config) {
     // initialization remains bit-identical.
     config->residual_projection_std =
         LLMC_GPT2_INITIALIZER_STD * residual_scale;
+    config->bridge_projection_std = gpt2_uses_embedding_bridge(config)
+        ? 1.0f / sqrtf((float)gpt2_lexical_channels(config))
+        : 0.0f;
 }
 
 bool gpt2_validate_position_config(const GPT2Config* config) {
     if (config == nullptr || config->num_heads <= 0 || config->channels <= 0 ||
+        gpt2_lexical_channels(config) <= 0 ||
+        gpt2_lexical_channels(config) % 8 != 0 ||
         config->channels % config->num_heads != 0 ||
         !std::isfinite(config->initializer_std) || config->initializer_std <= 0.0f ||
         !std::isfinite(config->residual_projection_std) ||
         config->residual_projection_std <= 0.0f) {
         return false;
     }
+    if (gpt2_uses_embedding_bridge(config) &&
+        (!std::isfinite(config->bridge_projection_std) ||
+         config->bridge_projection_std <= 0.0f)) {
+        return false;
+    }
     if (config->position_encoding == LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
-        return config->rope_rotary_dim == 0 && config->rope_theta == 0.0f;
+        // The placement of learned WPE relative to a lexical bridge is an
+        // architectural choice. Keep bridged descriptors RoPE-only rather
+        // than silently choosing a different computation graph.
+        return !gpt2_uses_embedding_bridge(config) &&
+               config->rope_rotary_dim == 0 && config->rope_theta == 0.0f;
     }
     if (config->position_encoding != LLMC_POSITION_ENCODING_ROPE) {
         return false;
@@ -213,9 +243,12 @@ bool gpt2_validate_position_config(const GPT2Config* config) {
 }
 
 // the parameters of the model
-constexpr const int NUM_PARAMETER_TENSORS = 16;
+constexpr const int NUM_PARAMETER_TENSORS = 18;
+static_assert(
+    NUM_PARAMETER_TENSORS == LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT,
+    "The GPT-2 tensor schema and optimizer plan must stay aligned");
 typedef struct {
-    floatX* wte; // (V, C)
+    floatX* wte; // (V, E), where E is lexical_channels
     floatX* wpe; // (maxT, C)
     floatX* ln1w; // (L, C)
     floatX* ln1b; // (L, C)
@@ -231,15 +264,18 @@ typedef struct {
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
     floatX* lnfb; // (C)
+    floatX* lexical_downw; // (C, E), absent when E == C
+    floatX* lexical_upw; // (E, C), absent when E == C
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
+    size_t E = (size_t)gpt2_lexical_channels(&config);
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
-    param_sizes[0] = Vp * C; // wte
+    param_sizes[0] = Vp * E; // wte
     param_sizes[1] = config.position_encoding == LLMC_POSITION_ENCODING_ROPE
         ? 0
         : maxT * C; // wpe is absent for RoPE models
@@ -257,6 +293,9 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
+    const bool use_bridge = E != C;
+    param_sizes[16] = use_bridge ? C * E : 0; // lexical_downw
+    param_sizes[17] = use_bridge ? E * C : 0; // lexical_upw
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -278,7 +317,8 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb,
+        &params->lexical_downw, &params->lexical_upw
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -326,7 +366,7 @@ typedef struct {
     floatX* output;
 
     // some additional scratch buffers
-    floatX* scratch_bt4c;   // (B, T, 4*C)
+    floatX* scratch_bt4c;   // (B, T, max(4*C, E))
     floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
@@ -345,6 +385,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
+    size_t E = (size_t)gpt2_lexical_channels(&config);
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
@@ -371,9 +412,14 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
     tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[ACTIVATION_TENSOR_OUTPUT] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    tensors[ACTIVATION_TENSOR_OUTPUT] = TENSOR_SPEC(
+        data->output,
+        B * T * max(max(3*C, 3*E), max(NH*T, Vp)));
 
-    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
+    // The bridge recomputes lexical activations into this buffer and then
+    // overwrites them with their gradients. It costs no extra memory when
+    // E <= 4C (including the requested E4096/C1024 shape).
+    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * max(4 * C, E));
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
 
@@ -559,7 +605,9 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
 
     // initialise cpu scratch buffers for encoder backward
-    size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
+    size_t num_c_groups = CEIL_DIV(
+        gpt2_lexical_channels(&model->config),
+        (WARP_SIZE * x128::size));
     assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
     model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
     model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
@@ -671,12 +719,20 @@ static uint64_t llmc_checkpoint_load_u64(const int* header, int word_index) {
 
 static bool llmc_model_version_is_rope(int version) {
     return version == LLMC_MODEL_VERSION_FP32_ROPE ||
-           version == LLMC_MODEL_VERSION_BF16_ROPE;
+           version == LLMC_MODEL_VERSION_BF16_ROPE ||
+           version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE;
+}
+
+static bool llmc_model_version_is_bridged(int version) {
+    return version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE;
 }
 
 static bool llmc_model_version_is_bf16(int version) {
     return version == LLMC_MODEL_VERSION_BF16_ABSOLUTE ||
-           version == LLMC_MODEL_VERSION_BF16_ROPE;
+           version == LLMC_MODEL_VERSION_BF16_ROPE ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE;
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -690,11 +746,16 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
     const bool use_rope =
         model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE;
-    model_header[1] = PRECISION_MODE == PRECISION_FP32
-        ? (use_rope ? LLMC_MODEL_VERSION_FP32_ROPE
-                    : LLMC_MODEL_VERSION_FP32_ABSOLUTE)
-        : (use_rope ? LLMC_MODEL_VERSION_BF16_ROPE
-                    : LLMC_MODEL_VERSION_BF16_ABSOLUTE);
+    const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
+    model_header[1] = use_bridge
+        ? (PRECISION_MODE == PRECISION_FP32
+               ? LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE
+               : LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE)
+        : (PRECISION_MODE == PRECISION_FP32
+               ? (use_rope ? LLMC_MODEL_VERSION_FP32_ROPE
+                           : LLMC_MODEL_VERSION_FP32_ABSOLUTE)
+               : (use_rope ? LLMC_MODEL_VERSION_BF16_ROPE
+                           : LLMC_MODEL_VERSION_BF16_ABSOLUTE));
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -702,7 +763,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
     if (use_rope) {
-        // Versions 6/7 use the formerly unused header words to make the
+        // Versions 6-9 use formerly unused header words to make the
         // position and initialization contracts self-describing.
         model_header[8] = model->config.position_encoding;
         model_header[9] = model->config.rope_rotary_dim;
@@ -710,6 +771,14 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
         model_header[11] = llmc_checkpoint_float_word(model->config.initializer_std);
         model_header[12] = llmc_checkpoint_float_word(
             model->config.residual_projection_std);
+    }
+    if (use_bridge) {
+        model_header[13] = gpt2_lexical_channels(&model->config);
+        model_header[14] = llmc_checkpoint_float_word(
+            model->config.bridge_projection_std);
+        model_header[15] = LLMC_EMBEDDING_BRIDGE_SCHEMA;
+        llmc_checkpoint_store_u64(
+            model_header, 16, (uint64_t)model->num_parameters);
     }
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
@@ -742,7 +811,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     if (!(version == LLMC_MODEL_VERSION_FP32_ABSOLUTE ||
           version == LLMC_MODEL_VERSION_BF16_ABSOLUTE ||
           version == LLMC_MODEL_VERSION_FP32_ROPE ||
-          version == LLMC_MODEL_VERSION_BF16_ROPE)) {
+          version == LLMC_MODEL_VERSION_BF16_ROPE ||
+          version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE ||
+          version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE)) {
         // 3 = fp32, padded vocab
         // 5 = bf16, padded vocab, layernorms also in bf16
         fprintf(stderr, "Bad version in model file\n");
@@ -783,7 +854,21 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
             fprintf(stderr, "RoPE model checkpoint has inconsistent position metadata\n");
             exit(EXIT_FAILURE);
         }
+        if (llmc_model_version_is_bridged(version)) {
+            model->config.lexical_channels = model_header[13];
+            model->config.bridge_projection_std =
+                llmc_checkpoint_word_float(model_header[14]);
+            if (model_header[15] != LLMC_EMBEDDING_BRIDGE_SCHEMA ||
+                !gpt2_uses_embedding_bridge(&model->config)) {
+                fprintf(stderr, "Bridged model checkpoint has inconsistent bridge metadata\n");
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            model->config.lexical_channels = model->config.channels;
+            model->config.bridge_projection_std = 0.0f;
+        }
     } else {
+        model->config.lexical_channels = model->config.channels;
         model->config.position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
         model->config.rope_rotary_dim = 0;
         model->config.rope_theta = 0.0f;
@@ -796,6 +881,12 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     // allocate memory for the model parameters
     gpt2_allocate_weights(model);
+    if (llmc_model_version_is_bridged(version) &&
+        llmc_checkpoint_load_u64(model_header, 16) !=
+            (uint64_t)model->num_parameters) {
+        fprintf(stderr, "Bridged model checkpoint parameter count does not match its metadata\n");
+        exit(EXIT_FAILURE);
+    }
 
     // read in the parameters if weight_init is true
     if (weight_init) {
@@ -822,6 +913,7 @@ bool gpt2_set_hyperparameters(GPT2Config* config, int depth, int max_seq_len) {
     else { return false; }
     config->num_layers = depth;
     config->channels = channels;
+    config->lexical_channels = channels;
     config->num_heads = num_heads;
     config->max_seq_len = max_seq_len;
     config->position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
@@ -848,8 +940,9 @@ static bool parse_positive_int_(const char* text, const char** end, int* value) 
 
 bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
     // Preserve the historical dX and gpt2:dX forms at maxT=1024, while
-    // allowing an explicit context override as gpt2:dX:tY. RoPE is opt-in as
-    // gpt2:rope:dX[:tY], keeping old experiment commands architecture-stable.
+    // allowing explicit context and lexical-width suffixes. RoPE is opt-in as
+    // gpt2:rope:dX[:tY][:eZ], keeping old commands architecture-stable. The
+    // suffix order is intentionally flexible.
     if (config == NULL || descriptor == NULL) {
         return false;
     }
@@ -876,17 +969,39 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
     }
 
     int max_seq_len = 1024;
-    if (*depth_end != '\0') {
-        if (!explicit_gpt2 || strncmp(depth_end, ":t", 2) != 0) {
+    int lexical_channels = 0;
+    bool saw_context = false;
+    bool saw_lexical_width = false;
+    const char* suffix = depth_end;
+    while (*suffix != '\0') {
+        if (!explicit_gpt2 || suffix[0] != ':' || suffix[1] == '\0') {
             return false;
         }
-        const char* seq_end = NULL;
-        if (!parse_positive_int_(depth_end + 2, &seq_end, &max_seq_len) || *seq_end != '\0') {
+        const char key = suffix[1];
+        const char* value_end = NULL;
+        int value = 0;
+        if (!parse_positive_int_(suffix + 2, &value_end, &value)) {
             return false;
         }
+        if (key == 't' && !saw_context) {
+            max_seq_len = value;
+            saw_context = true;
+        } else if (key == 'e' && !saw_lexical_width) {
+            lexical_channels = value;
+            saw_lexical_width = true;
+        } else {
+            return false;
+        }
+        suffix = value_end;
     }
     if (!gpt2_set_hyperparameters(config, depth, max_seq_len)) {
         return false;
+    }
+    if (saw_lexical_width) {
+        config->lexical_channels = lexical_channels;
+        config->bridge_projection_std = lexical_channels == config->channels
+            ? 0.0f
+            : 1.0f / sqrtf((float)lexical_channels);
     }
     if (use_rope) {
         config->position_encoding = LLMC_POSITION_ENCODING_ROPE;
@@ -916,6 +1031,7 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     assert(channels % head_size == 0);
     config->num_layers = depth;
     config->channels = channels;
+    config->lexical_channels = channels;
     config->num_heads = channels / head_size;
     config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
     config->position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
@@ -928,7 +1044,9 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
     // - explicit "gpt2:dX", or "gpt2:dX:tY" to override max context length.
-    // - "gpt2:rope:dX", or "gpt2:rope:dX:tY", for token-only input plus RoPE attention.
+    // - "gpt2:rope:dX[:tY][:eZ]" for RoPE and an optional tied lexical
+    //   embedding/head width Z bridged to the residual width. Suffixes may be
+    //   written in either order.
     // - "gpt3:cX", where X is now the channel count, e.g. "gpt3:c768" is the smallest GPT-3 model.
 
     // check the valid prexies and dispatch to the right setup function
@@ -965,7 +1083,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     size_t offset = 0;
     for (int l = 0; l < L; l++) {
         offset = 0;
-        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        for (int i = 0; i < LLMC_LEGACY_PARAMETER_TENSOR_COUNT; i++) {
             // the layernorm parameters are all initialized to 1
             if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_elements[i]; j++) {
@@ -979,7 +1097,8 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 size_t layer_offset = 0;
                 if (i == 0) {
                     // for wte tensor (padded vocab) override to init V instead of Vp rows
-                    n = model->config.vocab_size * model->config.channels;
+                    n = model->config.vocab_size *
+                        (size_t)gpt2_lexical_channels(&model->config);
                 }
                 if (i == 4 || i == 6 || i == 10 || i == 12) {
                     // weight tensors, we are only initializing layer l
@@ -1005,6 +1124,34 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 free(fp32_buffer);
             }
             offset += model->param_elements[i];
+        }
+    }
+
+    // Bridges are independent and bias-free. Initializing both with 1/sqrt(E)
+    // preserves the token-embedding variance through E->C and the ordinary
+    // C-wide GPT-2 initial logit variance through C->E->tied-head.
+    if (gpt2_uses_embedding_bridge(&model->config)) {
+        size_t bridge_offset = 0;
+        for (int i = 0; i < LLMC_LEGACY_PARAMETER_TENSOR_COUNT; ++i) {
+            bridge_offset += model->param_elements[i];
+        }
+        for (int i = LLMC_LEGACY_PARAMETER_TENSOR_COUNT;
+             i < NUM_PARAMETER_TENSORS;
+             ++i) {
+            const size_t n = model->param_elements[i];
+            float* fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+            normal_(
+                fp32_buffer,
+                n,
+                0.0f,
+                model->config.bridge_projection_std,
+                &init_rng);
+            for (size_t j = 0; j < n; ++j) {
+                params_memory_cpu[bridge_offset + j] =
+                    (floatX)fp32_buffer[j];
+            }
+            free(fp32_buffer);
+            bridge_offset += n;
         }
     }
 
@@ -1062,6 +1209,8 @@ void gpt2_forward(
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
+    const size_t E = (size_t)gpt2_lexical_channels(&model->config);
+    const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
 
     // validate B,T are not larger than the values used at initialisation
     // (smaller B,T are okay for inference only)
@@ -1079,7 +1228,37 @@ void gpt2_forward(
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    if (use_bridge) {
+        encoder_forward(
+            acts.scratch_bt4c,
+            model->inputs,
+            params.wte,
+            NULL,
+            B,
+            T,
+            E,
+            main_stream);
+        matmul_forward_cublaslt(
+            acts.encoded,
+            acts.scratch_bt4c,
+            params.lexical_downw,
+            NULL,
+            B,
+            T,
+            E,
+            C,
+            main_stream);
+    } else {
+        encoder_forward(
+            acts.encoded,
+            model->inputs,
+            params.wte,
+            params.wpe,
+            B,
+            T,
+            C,
+            main_stream); // encoding goes into residual[0]
+    }
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
@@ -1180,7 +1359,30 @@ void gpt2_forward(
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    floatX* classifier_input = acts.lnf;
+    if (use_bridge) {
+        classifier_input = acts.scratch_bt4c;
+        matmul_forward_cublaslt(
+            classifier_input,
+            acts.lnf,
+            params.lexical_upw,
+            NULL,
+            B,
+            T,
+            C,
+            E,
+            main_stream);
+    }
+    matmul_forward_cublaslt(
+        acts.output,
+        classifier_input,
+        params.wte,
+        NULL,
+        B,
+        T,
+        E,
+        Vp,
+        main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -1287,6 +1489,8 @@ void gpt2_backward_and_reduce(
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
+    const size_t E = (size_t)gpt2_lexical_channels(&model->config);
+    const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
 
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
@@ -1311,7 +1515,6 @@ void gpt2_backward_and_reduce(
         True,
         main_stream,
         mask_sequence_final_target);
-
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
     // reset residual stream gradients (put here to work with gradient accumulation)
@@ -1326,11 +1529,49 @@ void gpt2_backward_and_reduce(
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over the configured target set
-    // next: backward the classifier matmul
-    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    // next: backward the classifier matmul and optional output bridge. The
+    // bridge path deliberately computes each weight gradient before
+    // overwriting its now-dead forward activation with the input gradient.
+    if (use_bridge) {
+        matmul_backward_inplace_input(
+            acts.scratch_bt4c,
+            grads.wte,
+            acts.output,
+            params.wte,
+            B,
+            T,
+            E,
+            Vp,
+            main_stream);
+        matmul_backward_inplace_input(
+            acts.lnf,
+            grads.lexical_upw,
+            acts.scratch_bt4c,
+            params.lexical_upw,
+            B,
+            T,
+            C,
+            E,
+            main_stream);
+    } else {
+        matmul_backward(
+            model->acts.scratch_bt4c,
+            grads.wte,
+            NULL,
+            acts.output,
+            acts.lnf,
+            params.wte,
+            NULL,
+            B,
+            T,
+            C,
+            Vp,
+            main_stream);
+    }
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    floatX* dlnf = use_bridge ? acts.lnf : model->acts.scratch_bt4c;
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, dlnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -1438,8 +1679,59 @@ void gpt2_backward_and_reduce(
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
-    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
-                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+    if (use_bridge) {
+        // Recompute the token lookup after the block scratch reused its
+        // forward value, then form both the down-projection and tied-embedding
+        // gradient contributions without allocating a persistent B*T*E tensor.
+        encoder_forward(
+            acts.scratch_bt4c,
+            model->inputs,
+            params.wte,
+            NULL,
+            B,
+            T,
+            E,
+            main_stream);
+        matmul_backward_inplace_input(
+            acts.scratch_bt4c,
+            grads.lexical_downw,
+            dresidual,
+            params.lexical_downw,
+            B,
+            T,
+            E,
+            C,
+            main_stream);
+        encoder_backward(
+            grads.wte,
+            NULL,
+            scratchX,
+            model->workload_indices,
+            model->bucket_info,
+            acts.scratch_bt4c,
+            model->inputs,
+            inputs,
+            B,
+            T,
+            E,
+            random_u32(&model->rng_state),
+            main_stream);
+    } else {
+        encoder_backward(
+            grads.wte,
+            grads.wpe,
+            scratchX,
+            model->workload_indices,
+            model->bucket_info,
+            dresidual,
+            model->inputs,
+            inputs,
+            B,
+            T,
+            C,
+            random_u32(&model->rng_state),
+            main_stream);
+    }
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
@@ -1451,15 +1743,25 @@ void gpt2_backward_and_reduce(
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        if (model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE) {
+        if (use_bridge) {
+            floatX* const pointers[] = {
+                grads.wte,
+                grads.lnfw,
+                grads.lnfb,
+                grads.lexical_downw,
+                grads.lexical_upw};
+            const size_t nelem[] = {Vp * E, C, C, C * E, E * C};
+            multi_gpu_async_reduce_gradient(
+                pointers, nelem, &multi_gpu_config, main_stream);
+        } else if (model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE) {
             floatX* const pointers[] = {grads.wte, grads.lnfw, grads.lnfb};
-            const size_t nelem[] = {Vp * C, C, C};
+            const size_t nelem[] = {Vp * E, C, C};
             multi_gpu_async_reduce_gradient(
                 pointers, nelem, &multi_gpu_config, main_stream);
         } else {
             floatX* const pointers[] = {
                 grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-            const size_t nelem[] = {Vp * C, T * C, C, C};
+            const size_t nelem[] = {Vp * E, T * C, C, C};
             multi_gpu_async_reduce_gradient(
                 pointers, nelem, &multi_gpu_config, main_stream);
         }
@@ -1675,7 +1977,10 @@ void save_state(
     state_header[0] = 20240527; // magic number
     const bool use_rope =
         model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE;
-    state_header[1] = use_rope ? 2 : 1; // v2 binds state to the RoPE schema
+    const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
+    state_header[1] = use_bridge
+        ? 3
+        : (use_rope ? 2 : 1); // v3 additionally binds lexical-bridge schema
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
@@ -1700,6 +2005,17 @@ void save_state(
         llmc_checkpoint_store_u64(
             state_header, 36,
             (uint64_t)multi_gpu_config.shard_num_parameters);
+    }
+    if (use_bridge) {
+        state_header[18] = gpt2_lexical_channels(&model->config);
+        state_header[19] = llmc_checkpoint_float_word(
+            model->config.bridge_projection_std);
+        state_header[24] = LLMC_EMBEDDING_BRIDGE_SCHEMA;
+        state_header[25] = model->config.num_layers;
+        state_header[26] = model->config.num_heads;
+        state_header[27] = model->config.channels;
+        state_header[28] = model->config.padded_vocab_size;
+        state_header[29] = model->config.max_seq_len;
     }
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
@@ -1742,7 +2058,7 @@ void load_state(
     freadCheck(state_header, sizeof(int), 256, state_file);
     assert(state_header[0] == 20240527); // magic number
     const int state_version = state_header[1];
-    if (!(state_version == 1 || state_version == 2)) {
+    if (!(state_version == 1 || state_version == 2 || state_version == 3)) {
         fprintf(stderr, "Unsupported optimizer-state version: %d\n", state_version);
         exit(EXIT_FAILURE);
     }
@@ -1753,6 +2069,7 @@ void load_state(
     }
     if (state_version == 2) {
         const bool metadata_matches =
+            !gpt2_uses_embedding_bridge(&model->config) &&
             model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
             state_header[6] == model->config.position_encoding &&
             state_header[7] == model->config.rope_rotary_dim &&
@@ -1805,6 +2122,34 @@ void load_state(
             fprintf(
                 stderr,
                 "Checkpoint dataloader binding does not match B, T, sequence-boundary policy, source path/layout/extent, or shard count; use -yd 1 only for an intentional data-lineage fork\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (state_version == 3) {
+        const bool metadata_matches =
+            gpt2_uses_embedding_bridge(&model->config) &&
+            model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            state_header[6] == model->config.position_encoding &&
+            state_header[7] == model->config.rope_rotary_dim &&
+            state_header[8] == llmc_checkpoint_float_word(model->config.rope_theta) &&
+            state_header[9] == llmc_checkpoint_float_word(model->config.initializer_std) &&
+            state_header[12] == llmc_checkpoint_float_word(
+                model->config.residual_projection_std) &&
+            state_header[18] == gpt2_lexical_channels(&model->config) &&
+            state_header[19] == llmc_checkpoint_float_word(
+                model->config.bridge_projection_std) &&
+            state_header[24] == LLMC_EMBEDDING_BRIDGE_SCHEMA &&
+            state_header[25] == model->config.num_layers &&
+            state_header[26] == model->config.num_heads &&
+            state_header[27] == model->config.channels &&
+            state_header[28] == model->config.padded_vocab_size &&
+            state_header[29] == model->config.max_seq_len &&
+            llmc_checkpoint_load_u64(state_header, 34) ==
+                (uint64_t)model->num_parameters &&
+            llmc_checkpoint_load_u64(state_header, 36) ==
+                (uint64_t)multi_gpu_config.shard_num_parameters;
+        if (!metadata_matches) {
+            fprintf(stderr, "Optimizer state does not match the bridged RoPE model schema\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -1954,7 +2299,7 @@ void error_usage() {
     // file system input / output
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
-    fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -e <string> input .bin or descriptor; bridged example: gpt2:rope:d24:t2048:e4096 (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "              RoPE example: gpt2:rope:d30:t2048 (theta=10000, full head dimension)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
     fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
@@ -1967,6 +2312,7 @@ void error_usage() {
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+    fprintf(stderr, "  -mt <int>   eval-only RoPE checkpoint max-sequence override (default = 0; use checkpoint value)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     fprintf(stderr, "  -bp <string> sequence boundary: flat_stream|row_reset (default = flat_stream)\n");
     fprintf(stderr, "  -sh <int>   train data shuffle: 0=sequential, 1=shuffle (raw default = 1)\n");
@@ -2066,6 +2412,7 @@ int main(int argc, char *argv[]) {
     int resume_fork_normuon = 0; // preserve main state while explicitly changing NorMuon config and resetting polar/cache state
     int B = 4; // batch size
     int T = 1024; // sequence length max
+    int model_max_sequence_length_override = 0;
     LlmcSequenceBoundaryPolicy sequence_boundary_policy =
         LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM;
     int total_batch_size = -1; // will be calculated down below later, if not provided
@@ -2141,6 +2488,10 @@ int main(int argc, char *argv[]) {
         }
         if (strcmp(argv[i], "-vl") == 0) {
             validation_print_batch_losses = atoi(argv[i+1]);
+            continue;
+        }
+        if (strcmp(argv[i], "-mt") == 0) {
+            model_max_sequence_length_override = atoi(argv[i+1]);
             continue;
         }
         // read in the args
@@ -2296,6 +2647,10 @@ int main(int argc, char *argv[]) {
     char optimizer_config_error[256];
     if (train_shuffle < 0 || train_shuffle > 1) {
         fprintf(stderr, "-sh must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (model_max_sequence_length_override < 0) {
+        fprintf(stderr, "-mt must be nonnegative\n");
         exit(EXIT_FAILURE);
     }
     if (resume_reset_dataloader < 0 || resume_reset_dataloader > 1) {
@@ -2660,6 +3015,31 @@ int main(int argc, char *argv[]) {
         gpt_build_from_descriptor(&model, load_filename);
     }
 
+    if (model_max_sequence_length_override != 0) {
+        if (resuming == 1 || !ends_with_bin(load_filename)) {
+            fprintf(stderr, "-mt requires a directly loaded model checkpoint, not resume or a descriptor\n");
+            exit(EXIT_FAILURE);
+        }
+        if (max_steps != 0) {
+            fprintf(stderr, "-mt is evaluation-only and requires -x 0\n");
+            exit(EXIT_FAILURE);
+        }
+        if (model.config.position_encoding != LLMC_POSITION_ENCODING_ROPE) {
+            fprintf(stderr, "-mt is only valid for RoPE checkpoints\n");
+            exit(EXIT_FAILURE);
+        }
+        if (model_max_sequence_length_override < model.config.max_seq_len ||
+            model_max_sequence_length_override < T) {
+            fprintf(stderr, "-mt must be at least both the checkpoint max sequence length and requested T\n");
+            exit(EXIT_FAILURE);
+        }
+        printf0(
+            "Extending the evaluation-only RoPE cache from maxT=%d to maxT=%d; checkpoint weights are unchanged.\n",
+            model.config.max_seq_len,
+            model_max_sequence_length_override);
+        model.config.max_seq_len = model_max_sequence_length_override;
+    }
+
     model.optimizer_config = optimizer_config;
     bool resume_has_normuon_companion = false;
     char resume_normuon_path[512] = {0};
@@ -2718,6 +3098,12 @@ int main(int argc, char *argv[]) {
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf0("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf0("| channels C            | %-50d |\n", model.config.channels);
+    printf0("| lexical channels E    | %-50d |\n",
+            gpt2_lexical_channels(&model.config));
+    printf0("| lexical bridge        | %-50s |\n",
+            gpt2_uses_embedding_bridge(&model.config)
+                ? "bias-free E->C and C->E"
+                : "disabled");
     printf0("| position encoding     | %-50s |\n",
             llmc_position_encoding_name(model.config.position_encoding));
     printf0("| RoPE rotary dim       | %-50d |\n", model.config.rope_rotary_dim);
@@ -2725,6 +3111,11 @@ int main(int argc, char *argv[]) {
     printf0("| initializer std       | %-50g |\n", model.config.initializer_std);
     printf0("| residual proj. std    | %-50g |\n",
             model.config.residual_projection_std);
+    printf0("| bridge proj. std      | %-50g |\n",
+            model.config.bridge_projection_std);
+    printf0("| non-embedding params  | %-50zu |\n",
+            model.num_parameters - model.param_elements[0] -
+                model.param_elements[1]);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -2738,7 +3129,8 @@ int main(int argc, char *argv[]) {
         multi_gpu_config.process_rank,
         multi_gpu_config.num_processes,
         effective_train_shuffle,
-        row_aligned_train_loader);
+        row_aligned_train_loader,
+        max_steps == 0);
     dataloader_init_with_policy(
         &val_loader,
         val_data_pattern,
@@ -2747,7 +3139,8 @@ int main(int argc, char *argv[]) {
         multi_gpu_config.process_rank,
         multi_gpu_config.num_processes,
         0,
-        row_aligned_val_loader);
+        row_aligned_val_loader,
+        max_steps == 0);
     printf0("| train_data_format     | %-50s |\n", dataloader_token_format_name(train_loader.token_format));
     printf0("| val_data_format       | %-50s |\n", dataloader_token_format_name(val_loader.token_format));
     // figure out the number of training steps we will run for
@@ -2767,7 +3160,9 @@ int main(int argc, char *argv[]) {
     int val_num_batches = val_max_steps; // passed in from command line
     if (val_num_batches == -1) {
         // sensible default is to evaluate the full validation split
-        size_t ntok = val_loader.num_tokens;
+        size_t ntok = val_loader.row_aligned_sequential
+            ? val_loader.logical_row_count * val_loader.T
+            : val_loader.num_tokens;
         // note that unlike the training loop, there is no gradient accumulation inner loop here
         val_num_batches = ntok / tokens_per_fwdbwd;
         if (val_loader.row_aligned_sequential && ntok % tokens_per_fwdbwd != 0) {
