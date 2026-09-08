@@ -25,6 +25,7 @@ struct LlmcRopeCache {
     int max_seq_len;
     int rotary_dim;
     float theta;
+    int lowest_frequency_plane_is_dc;
     cudaStream_t owner_stream;
 };
 
@@ -39,7 +40,8 @@ inline bool llmc_rope_validate_config(
         int channels,
         int num_heads,
         int rotary_dim,
-        float theta) {
+        float theta,
+        int lowest_frequency_plane_is_dc) {
     if (max_seq_len <= 0 || channels <= 0 || num_heads <= 0) {
         return false;
     }
@@ -50,7 +52,9 @@ inline bool llmc_rope_validate_config(
     if (rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > head_dim) {
         return false;
     }
-    return isfinite(theta) && theta > 0.0f;
+    return isfinite(theta) && theta > 0.0f &&
+           (lowest_frequency_plane_is_dc == 0 ||
+            lowest_frequency_plane_is_dc == 1);
 }
 
 inline bool llmc_rope_checked_product(size_t lhs, size_t rhs, size_t* result) {
@@ -65,6 +69,7 @@ __global__ void llmc_rope_build_cache_kernel(
         float2* cos_sin,
         int rotary_dim,
         float log_theta,
+        int lowest_frequency_plane_is_dc,
         size_t table_elements) {
     const size_t rotary_pairs = (size_t)rotary_dim / 2U;
     for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -72,12 +77,21 @@ __global__ void llmc_rope_build_cache_kernel(
          index += (size_t)blockDim.x * gridDim.x) {
         const int position = (int)(index / rotary_pairs);
         const int pair = (int)(index % rotary_pairs);
-        const float inverse_frequency =
-            expf(-log_theta * (2.0f * (float)pair / (float)rotary_dim));
-        float sine;
-        float cosine;
-        sincosf((float)position * inverse_frequency, &sine, &cosine);
-        cos_sin[index] = make_float2(cosine, sine);
+        if (lowest_frequency_plane_is_dc != 0 &&
+            pair == (int)rotary_pairs - 1) {
+            // Construct exact identity phases instead of relying on sincosf(0).
+            // All other planes retain the canonical full-rotary-dimension
+            // logspace schedule; this is not equivalent to shortening
+            // rotary_dim, which would move every remaining frequency.
+            cos_sin[index] = make_float2(1.0f, 0.0f);
+        } else {
+            const float inverse_frequency =
+                expf(-log_theta * (2.0f * (float)pair / (float)rotary_dim));
+            float sine;
+            float cosine;
+            sincosf((float)position * inverse_frequency, &sine, &cosine);
+            cos_sin[index] = make_float2(cosine, sine);
+        }
     }
 }
 
@@ -105,15 +119,20 @@ inline bool llmc_rope_cache_allocate(
         int max_seq_len,
         int rotary_dim,
         float theta,
+        int lowest_frequency_plane_is_dc,
         cudaStream_t stream) {
     if (cache == nullptr || max_seq_len <= 0 || rotary_dim <= 0 ||
-        (rotary_dim & 1) != 0 || !isfinite(theta) || theta <= 0.0f) {
+        (rotary_dim & 1) != 0 || !isfinite(theta) || theta <= 0.0f ||
+        (lowest_frequency_plane_is_dc != 0 &&
+         lowest_frequency_plane_is_dc != 1)) {
         return false;
     }
     if (cache->cos_sin != nullptr) {
         return cache->max_seq_len == max_seq_len &&
                cache->rotary_dim == rotary_dim &&
                cache->theta == theta &&
+               cache->lowest_frequency_plane_is_dc ==
+                   lowest_frequency_plane_is_dc &&
                cache->owner_stream == stream;
     }
 
@@ -134,13 +153,18 @@ inline bool llmc_rope_cache_allocate(
     cudaCheck(cudaMalloc(
         reinterpret_cast<void**>(&allocation), table_elements * sizeof(float2)));
     llmc_rope_build_cache_kernel<<<(unsigned int)blocks, 256, 0, stream>>>(
-        allocation, rotary_dim, logf(theta), table_elements);
+        allocation,
+        rotary_dim,
+        logf(theta),
+        lowest_frequency_plane_is_dc,
+        table_elements);
     cudaCheck(cudaGetLastError());
 
     cache->cos_sin = allocation;
     cache->max_seq_len = max_seq_len;
     cache->rotary_dim = rotary_dim;
     cache->theta = theta;
+    cache->lowest_frequency_plane_is_dc = lowest_frequency_plane_is_dc;
     cache->owner_stream = stream;
     return true;
 }
@@ -222,7 +246,8 @@ inline bool llmc_rope_apply_qk_impl(
             channels,
             num_heads,
             cache->rotary_dim,
-            cache->theta)) {
+            cache->theta,
+            cache->lowest_frequency_plane_is_dc)) {
         return false;
     }
 

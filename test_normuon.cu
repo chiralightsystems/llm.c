@@ -454,6 +454,8 @@ static void test_gpt2_context_descriptor() {
     GPT2Config rope_xl = {};
     GPT2Config bridged_medium = {};
     GPT2Config bridged_medium_reordered = {};
+    GPT2Config dc_bridged_medium = {};
+    GPT2Config dc_bridged_medium_reordered = {};
     TEST_CHECK(
         gpt2_config_from_descriptor(&legacy, "d48"),
         "legacy GPT-2 XL descriptor parses");
@@ -482,6 +484,15 @@ static void test_gpt2_context_descriptor() {
             &bridged_medium_reordered, "gpt2:rope:d24:e4096:t2048"),
         "lexical-width and context suffixes may be reordered");
     TEST_CHECK(
+        gpt2_config_from_descriptor(
+            &dc_bridged_medium, "gpt2:rope-dc:d24:t2048:e4096"),
+        "lowest-plane-DC RoPE lexical-bridge descriptor parses");
+    TEST_CHECK(
+        gpt2_config_from_descriptor(
+            &dc_bridged_medium_reordered,
+            "gpt2:rope-dc:d24:e4096:t2048"),
+        "lowest-plane-DC descriptor suffixes may be reordered");
+    TEST_CHECK(
         legacy.num_layers == 48 && legacy.channels == 1600 &&
             legacy.num_heads == 25 && legacy.max_seq_len == 1024,
         "legacy GPT-2 XL shape is unchanged");
@@ -503,13 +514,15 @@ static void test_gpt2_context_descriptor() {
             rope_midpoint.max_seq_len == 2048 &&
             rope_midpoint.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
             rope_midpoint.rope_rotary_dim == 64 &&
-            rope_midpoint.rope_theta == 10000.0f,
+            rope_midpoint.rope_theta == 10000.0f &&
+            rope_midpoint.rope_lowest_frequency_plane_is_dc == 0,
         "RoPE midpoint uses full-head canonical rotary parameters");
     TEST_CHECK(
         explicit_legacy.position_encoding ==
                 LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE &&
             explicit_legacy.rope_rotary_dim == 0 &&
-            explicit_legacy.rope_theta == 0.0f,
+            explicit_legacy.rope_theta == 0.0f &&
+            explicit_legacy.rope_lowest_frequency_plane_is_dc == 0,
         "legacy descriptors retain learned absolute positions");
     TEST_CHECK(
         std::fabs(rope_midpoint.initializer_std - 0.02f) < 1.0e-8f &&
@@ -528,11 +541,29 @@ static void test_gpt2_context_descriptor() {
                 1.0e-8f,
         "bridged descriptor separates lexical and residual widths with variance-preserving init");
     TEST_CHECK(
+        dc_bridged_medium.num_layers == bridged_medium.num_layers &&
+            dc_bridged_medium.channels == bridged_medium.channels &&
+            dc_bridged_medium.lexical_channels ==
+                bridged_medium.lexical_channels &&
+            dc_bridged_medium.num_heads == bridged_medium.num_heads &&
+            dc_bridged_medium.max_seq_len == bridged_medium.max_seq_len &&
+            dc_bridged_medium.rope_rotary_dim ==
+                bridged_medium.rope_rotary_dim &&
+            dc_bridged_medium.rope_theta == bridged_medium.rope_theta &&
+            dc_bridged_medium.rope_lowest_frequency_plane_is_dc == 1,
+        "lowest-plane-DC descriptor changes only the explicit frequency mode");
+    TEST_CHECK(
         std::memcmp(
             &bridged_medium,
             &bridged_medium_reordered,
             sizeof(GPT2Config)) == 0,
         "descriptor suffix order does not alter the model schema");
+    TEST_CHECK(
+        std::memcmp(
+            &dc_bridged_medium,
+            &dc_bridged_medium_reordered,
+            sizeof(GPT2Config)) == 0,
+        "lowest-plane-DC descriptor suffix order does not alter the model schema");
     const float legacy_residual_scale = 1.0f / std::sqrt(60.0f);
     const float legacy_residual_std = 0.02f * legacy_residual_scale;
     TEST_CHECK(
@@ -550,6 +581,8 @@ static void test_gpt2_context_descriptor() {
         "gpt2:rope:d24:e", "gpt2:rope:d24:e0",
         "gpt2:rope:d24:e4097", "gpt2:rope:d24:e4096:e2048",
         "gpt2:rope:d24:t2048:t1024", "gpt2:d24:e4096",
+        "gpt2:rope-dc:d24:t", "gpt2:rope-dc:d24:t0",
+        "gpt2:rope-dc:d24:e0", "gpt2:rope-dc:d999:t2048",
     };
     for (const char* descriptor : malformed) {
         GPT2Config rejected = {};
@@ -844,6 +877,7 @@ static void test_bridged_model_forward_backward_and_checkpoint() {
     model.config.position_encoding = LLMC_POSITION_ENCODING_ROPE;
     model.config.rope_rotary_dim = 64;
     model.config.rope_theta = LLMC_ROPE_THETA_DEFAULT;
+    model.config.rope_lowest_frequency_plane_is_dc = 0;
     gpt2_set_initializer_defaults(&model.config);
     TEST_CHECK(
         gpt2_validate_position_config(&model.config),
@@ -886,6 +920,7 @@ static void test_bridged_model_forward_backward_and_checkpoint() {
         loaded.config.lexical_channels == 512 &&
             loaded.config.channels == 384 &&
             loaded.config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            loaded.config.rope_lowest_frequency_plane_is_dc == 0 &&
             loaded.num_parameters == model.num_parameters &&
             std::memcmp(
                 loaded_parameters.data(),
@@ -894,6 +929,30 @@ static void test_bridged_model_forward_backward_and_checkpoint() {
         "bridged model checkpoint round-trips metadata and parameters exactly");
     cudaFreeCheck(&loaded.params_memory);
     remove(checkpoint_path);
+
+    model.config.rope_lowest_frequency_plane_is_dc = 1;
+    const char* dc_checkpoint_path =
+        "build/lexical_bridge_tiny_rope_dc_checkpoint.bin";
+    gpt2_write_to_checkpoint(&model, dc_checkpoint_path);
+    GPT2 loaded_dc = {};
+    gpt2_init_common(&loaded_dc);
+    gpt2_build_from_checkpoint(&loaded_dc, dc_checkpoint_path);
+    const std::vector<floatX> loaded_dc_parameters = copy_from_device(
+        (floatX*)loaded_dc.params_memory, loaded_dc.num_parameters);
+    TEST_CHECK(
+        loaded_dc.config.lexical_channels == 512 &&
+            loaded_dc.config.channels == 384 &&
+            loaded_dc.config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            loaded_dc.config.rope_rotary_dim == 64 &&
+            loaded_dc.config.rope_lowest_frequency_plane_is_dc == 1 &&
+            loaded_dc.num_parameters == model.num_parameters &&
+            std::memcmp(
+                loaded_dc_parameters.data(),
+                parameters.data(),
+                parameters.size() * sizeof(floatX)) == 0,
+        "lowest-plane-DC bridged checkpoint round-trips its versioned schema and parameters exactly");
+    cudaFreeCheck(&loaded_dc.params_memory);
+    remove(dc_checkpoint_path);
 
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
     gpt2_allocate_state(&model, 1, 32);
@@ -1018,16 +1077,20 @@ static void test_rope_shape(int head_dim) {
 
     TEST_CHECK(
         llmc_rope_validate_config(
-            sequence_length, channels, num_heads, rotary_dim, theta),
+            sequence_length, channels, num_heads, rotary_dim, theta, 0),
         "valid full-head RoPE configuration is accepted");
     TEST_CHECK(
         !llmc_rope_validate_config(
-            sequence_length, channels, num_heads, rotary_dim - 1, theta),
+            sequence_length, channels, num_heads, rotary_dim - 1, theta, 0),
         "odd rotary dimension is rejected");
     TEST_CHECK(
         !llmc_rope_validate_config(
-            sequence_length, channels, num_heads, rotary_dim + 2, theta),
+            sequence_length, channels, num_heads, rotary_dim + 2, theta, 0),
         "rotary dimension wider than a head is rejected");
+    TEST_CHECK(
+        !llmc_rope_validate_config(
+            sequence_length, channels, num_heads, rotary_dim, theta, 2),
+        "unknown RoPE frequency modes are rejected");
 
     std::vector<floatX> input(elements);
     for (size_t index = 0; index < elements; ++index) {
@@ -1050,14 +1113,18 @@ static void test_rope_shape(int head_dim) {
     llmc_rope_cache_reset(&cache);
     TEST_CHECK(
         llmc_rope_cache_allocate(
-            &cache, sequence_length, rotary_dim, theta, main_stream),
+            &cache, sequence_length, rotary_dim, theta, 0, main_stream),
         "RoPE phase cache allocation succeeds");
     cudaStream_t other_stream;
     cudaCheck(cudaStreamCreate(&other_stream));
     TEST_CHECK(
         !llmc_rope_cache_allocate(
-            &cache, sequence_length, rotary_dim, theta, other_stream),
+            &cache, sequence_length, rotary_dim, theta, 0, other_stream),
         "RoPE cache rejects implicit cross-stream reuse");
+    TEST_CHECK(
+        !llmc_rope_cache_allocate(
+            &cache, sequence_length, rotary_dim, theta, 1, main_stream),
+        "RoPE cache identity includes the lowest-plane-DC mode");
     cudaCheck(cudaStreamDestroy(other_stream));
     TEST_CHECK(
         llmc_rope_cache_bytes(&cache) ==
@@ -1089,6 +1156,90 @@ static void test_rope_shape(int head_dim) {
         cache.cos_sin,
         phases.size() * sizeof(float2),
         cudaMemcpyDeviceToHost));
+
+    LlmcRopeCache dc_cache;
+    llmc_rope_cache_reset(&dc_cache);
+    TEST_CHECK(
+        llmc_rope_cache_allocate(
+            &dc_cache, sequence_length, rotary_dim, theta, 1, main_stream),
+        "lowest-plane-DC RoPE phase cache allocation succeeds");
+    std::vector<float2> dc_phases(phases.size());
+    cudaCheck(cudaMemcpy(
+        dc_phases.data(),
+        dc_cache.cos_sin,
+        dc_phases.size() * sizeof(float2),
+        cudaMemcpyDeviceToHost));
+    bool non_dc_phases_unchanged = true;
+    bool lowest_plane_is_exact_dc = true;
+    for (int position = 0; position < sequence_length; ++position) {
+        for (int pair = 0; pair < rotary_pairs; ++pair) {
+            const size_t index =
+                static_cast<size_t>(position) * rotary_pairs + pair;
+            if (pair == rotary_pairs - 1) {
+                lowest_plane_is_exact_dc = lowest_plane_is_exact_dc &&
+                    dc_phases[index].x == 1.0f &&
+                    dc_phases[index].y == 0.0f;
+            } else {
+                non_dc_phases_unchanged = non_dc_phases_unchanged &&
+                    std::memcmp(
+                        &dc_phases[index],
+                        &phases[index],
+                        sizeof(float2)) == 0;
+            }
+        }
+    }
+    TEST_CHECK(
+        lowest_plane_is_exact_dc,
+        "lowest-plane-DC RoPE cache stores exact identity phases");
+    TEST_CHECK(
+        non_dc_phases_unchanged,
+        "lowest-plane-DC RoPE leaves every other canonical phase bit-identical");
+
+    floatX* device_dc_qkv = nullptr;
+    cudaCheck(cudaMalloc(
+        reinterpret_cast<void**>(&device_dc_qkv), elements * sizeof(floatX)));
+    cudaCheck(cudaMemcpy(
+        device_dc_qkv,
+        input.data(),
+        elements * sizeof(floatX),
+        cudaMemcpyHostToDevice));
+    TEST_CHECK(
+        llmc_rope_apply_qk(
+            device_dc_qkv,
+            &dc_cache,
+            batch_size,
+            sequence_length,
+            channels,
+            num_heads,
+            main_stream),
+        "lowest-plane-DC RoPE Q/K forward launch succeeds");
+    cudaCheck(cudaDeviceSynchronize());
+    std::vector<floatX> dc_rotated(elements);
+    cudaCheck(cudaMemcpy(
+        dc_rotated.data(),
+        device_dc_qkv,
+        elements * sizeof(floatX),
+        cudaMemcpyDeviceToHost));
+    bool lowest_qk_plane_is_identity = true;
+    for (int position = 0; position < sequence_length; ++position) {
+        const size_t token_offset =
+            static_cast<size_t>(position) * 3U * channels;
+        for (int head = 0; head < num_heads; ++head) {
+            const size_t q_index = token_offset +
+                static_cast<size_t>(head) * head_dim + rotary_dim - 2U;
+            const size_t k_index = q_index + channels;
+            const size_t indices[] = {q_index, k_index};
+            for (size_t base : indices) {
+                lowest_qk_plane_is_identity = lowest_qk_plane_is_identity &&
+                    floatx_bits_equal(dc_rotated[base], input[base]) &&
+                    floatx_bits_equal(
+                        dc_rotated[base + 1U], input[base + 1U]);
+            }
+        }
+    }
+    TEST_CHECK(
+        lowest_qk_plane_is_identity,
+        "lowest-plane-DC RoPE leaves its Q/K channel pair bit-identical");
 
     bool v_unchanged = true;
     bool position_zero_unchanged = true;
@@ -1213,7 +1364,9 @@ static void test_rope_shape(int head_dim) {
         roundtrip_v_unchanged,
         "RoPE backward also leaves V byte-for-byte unchanged");
 
+    llmc_rope_cache_free(&dc_cache);
     llmc_rope_cache_free(&cache);
+    cudaCheck(cudaFree(device_dc_qkv));
     cudaCheck(cudaFree(device_qkv));
 }
 

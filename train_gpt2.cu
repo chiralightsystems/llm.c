@@ -160,8 +160,16 @@ constexpr int LLMC_MODEL_VERSION_FP32_ROPE = 6;
 constexpr int LLMC_MODEL_VERSION_BF16_ROPE = 7;
 constexpr int LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE = 8;
 constexpr int LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE = 9;
+constexpr int LLMC_MODEL_VERSION_FP32_ROPE_DC = 10;
+constexpr int LLMC_MODEL_VERSION_BF16_ROPE_DC = 11;
+constexpr int LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE_DC = 12;
+constexpr int LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC = 13;
 constexpr int LLMC_LEGACY_PARAMETER_TENSOR_COUNT = 16;
 constexpr int LLMC_EMBEDDING_BRIDGE_SCHEMA = 1;
+constexpr int LLMC_OPTIMIZER_STATE_VERSION_ABSOLUTE = 1;
+constexpr int LLMC_OPTIMIZER_STATE_VERSION_ROPE = 2;
+constexpr int LLMC_OPTIMIZER_STATE_VERSION_BRIDGED_ROPE = 3;
+constexpr int LLMC_OPTIMIZER_STATE_VERSION_ROPE_DC = 4;
 
 const char* llmc_position_encoding_name(int position_encoding) {
     switch (position_encoding) {
@@ -182,6 +190,7 @@ typedef struct {
     int position_encoding; // LlmcPositionEncoding
     int rope_rotary_dim; // rotated dimensions per head; 0 for learned absolute
     float rope_theta; // RoPE frequency base; 0 for learned absolute
+    int rope_lowest_frequency_plane_is_dc; // exact identity phase for the final rotary pair
     float initializer_std; // std for token/QKV/MLP input projections
     float residual_projection_std; // std for attention/MLP residual projections
     float bridge_projection_std; // std for both bias-free lexical bridge matrices
@@ -230,7 +239,8 @@ bool gpt2_validate_position_config(const GPT2Config* config) {
         // architectural choice. Keep bridged descriptors RoPE-only rather
         // than silently choosing a different computation graph.
         return !gpt2_uses_embedding_bridge(config) &&
-               config->rope_rotary_dim == 0 && config->rope_theta == 0.0f;
+               config->rope_rotary_dim == 0 && config->rope_theta == 0.0f &&
+               config->rope_lowest_frequency_plane_is_dc == 0;
     }
     if (config->position_encoding != LLMC_POSITION_ENCODING_ROPE) {
         return false;
@@ -239,7 +249,9 @@ bool gpt2_validate_position_config(const GPT2Config* config) {
     return config->rope_rotary_dim > 0 &&
            config->rope_rotary_dim <= head_dim &&
            config->rope_rotary_dim % 2 == 0 &&
-           std::isfinite(config->rope_theta) && config->rope_theta > 0.0f;
+           std::isfinite(config->rope_theta) && config->rope_theta > 0.0f &&
+           (config->rope_lowest_frequency_plane_is_dc == 0 ||
+            config->rope_lowest_frequency_plane_is_dc == 1);
 }
 
 // the parameters of the model
@@ -581,6 +593,7 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
                 model->config.max_seq_len,
                 model->config.rope_rotary_dim,
                 model->config.rope_theta,
+                model->config.rope_lowest_frequency_plane_is_dc,
                 main_stream)) {
             fprintf(stderr, "Failed to allocate the RoPE phase cache\n");
             exit(EXIT_FAILURE);
@@ -721,18 +734,33 @@ static bool llmc_model_version_is_rope(int version) {
     return version == LLMC_MODEL_VERSION_FP32_ROPE ||
            version == LLMC_MODEL_VERSION_BF16_ROPE ||
            version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE ||
-           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE;
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE ||
+           version == LLMC_MODEL_VERSION_FP32_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_BF16_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC;
+}
+
+static bool llmc_model_version_is_rope_dc(int version) {
+    return version == LLMC_MODEL_VERSION_FP32_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_BF16_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC;
 }
 
 static bool llmc_model_version_is_bridged(int version) {
     return version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE ||
-           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE;
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE ||
+           version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC;
 }
 
 static bool llmc_model_version_is_bf16(int version) {
     return version == LLMC_MODEL_VERSION_BF16_ABSOLUTE ||
            version == LLMC_MODEL_VERSION_BF16_ROPE ||
-           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE;
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE ||
+           version == LLMC_MODEL_VERSION_BF16_ROPE_DC ||
+           version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC;
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -747,15 +775,27 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     const bool use_rope =
         model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE;
     const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
-    model_header[1] = use_bridge
-        ? (PRECISION_MODE == PRECISION_FP32
-               ? LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE
-               : LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE)
-        : (PRECISION_MODE == PRECISION_FP32
-               ? (use_rope ? LLMC_MODEL_VERSION_FP32_ROPE
-                           : LLMC_MODEL_VERSION_FP32_ABSOLUTE)
-               : (use_rope ? LLMC_MODEL_VERSION_BF16_ROPE
-                           : LLMC_MODEL_VERSION_BF16_ABSOLUTE));
+    const bool use_rope_dc =
+        use_rope && model->config.rope_lowest_frequency_plane_is_dc != 0;
+    if (use_rope_dc) {
+        model_header[1] = use_bridge
+            ? (PRECISION_MODE == PRECISION_FP32
+                   ? LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE_DC
+                   : LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC)
+            : (PRECISION_MODE == PRECISION_FP32
+                   ? LLMC_MODEL_VERSION_FP32_ROPE_DC
+                   : LLMC_MODEL_VERSION_BF16_ROPE_DC);
+    } else {
+        model_header[1] = use_bridge
+            ? (PRECISION_MODE == PRECISION_FP32
+                   ? LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE
+                   : LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE)
+            : (PRECISION_MODE == PRECISION_FP32
+                   ? (use_rope ? LLMC_MODEL_VERSION_FP32_ROPE
+                               : LLMC_MODEL_VERSION_FP32_ABSOLUTE)
+                   : (use_rope ? LLMC_MODEL_VERSION_BF16_ROPE
+                               : LLMC_MODEL_VERSION_BF16_ABSOLUTE));
+    }
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -763,7 +803,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
     if (use_rope) {
-        // Versions 6-9 use formerly unused header words to make the
+        // Versions 6-13 use formerly unused header words to make the
         // position and initialization contracts self-describing.
         model_header[8] = model->config.position_encoding;
         model_header[9] = model->config.rope_rotary_dim;
@@ -813,7 +853,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
           version == LLMC_MODEL_VERSION_FP32_ROPE ||
           version == LLMC_MODEL_VERSION_BF16_ROPE ||
           version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE ||
-          version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE)) {
+          version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE ||
+          version == LLMC_MODEL_VERSION_FP32_ROPE_DC ||
+          version == LLMC_MODEL_VERSION_BF16_ROPE_DC ||
+          version == LLMC_MODEL_VERSION_FP32_BRIDGED_ROPE_DC ||
+          version == LLMC_MODEL_VERSION_BF16_BRIDGED_ROPE_DC)) {
         // 3 = fp32, padded vocab
         // 5 = bf16, padded vocab, layernorms also in bf16
         fprintf(stderr, "Bad version in model file\n");
@@ -847,6 +891,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         model->config.position_encoding = model_header[8];
         model->config.rope_rotary_dim = model_header[9];
         model->config.rope_theta = llmc_checkpoint_word_float(model_header[10]);
+        model->config.rope_lowest_frequency_plane_is_dc =
+            llmc_model_version_is_rope_dc(version) ? 1 : 0;
         model->config.initializer_std = llmc_checkpoint_word_float(model_header[11]);
         model->config.residual_projection_std =
             llmc_checkpoint_word_float(model_header[12]);
@@ -872,6 +918,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         model->config.position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
         model->config.rope_rotary_dim = 0;
         model->config.rope_theta = 0.0f;
+        model->config.rope_lowest_frequency_plane_is_dc = 0;
         gpt2_set_initializer_defaults(&model->config);
     }
     if (!gpt2_validate_position_config(&model->config)) {
@@ -919,6 +966,7 @@ bool gpt2_set_hyperparameters(GPT2Config* config, int depth, int max_seq_len) {
     config->position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
     config->rope_rotary_dim = 0;
     config->rope_theta = 0.0f;
+    config->rope_lowest_frequency_plane_is_dc = 0;
     gpt2_set_initializer_defaults(config);
     return true;
 }
@@ -941,14 +989,16 @@ static bool parse_positive_int_(const char* text, const char** end, int* value) 
 bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
     // Preserve the historical dX and gpt2:dX forms at maxT=1024, while
     // allowing explicit context and lexical-width suffixes. RoPE is opt-in as
-    // gpt2:rope:dX[:tY][:eZ], keeping old commands architecture-stable. The
-    // suffix order is intentionally flexible.
+    // gpt2:rope:dX[:tY][:eZ], while gpt2:rope-dc:dX[:tY][:eZ]
+    // replaces only the lowest-frequency rotary plane with exact DC. Old
+    // commands remain architecture-stable and suffix order is flexible.
     if (config == NULL || descriptor == NULL) {
         return false;
     }
     const char* depth_text = NULL;
     bool explicit_gpt2 = false;
     bool use_rope = false;
+    bool use_rope_dc = false;
     if (descriptor[0] == 'd') {
         depth_text = descriptor + 1;
     } else if (strncmp(descriptor, "gpt2:d", 6) == 0) {
@@ -958,6 +1008,11 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
         depth_text = descriptor + 11;
         explicit_gpt2 = true;
         use_rope = true;
+    } else if (strncmp(descriptor, "gpt2:rope-dc:d", 14) == 0) {
+        depth_text = descriptor + 14;
+        explicit_gpt2 = true;
+        use_rope = true;
+        use_rope_dc = true;
     } else {
         return false;
     }
@@ -1007,6 +1062,7 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
         config->position_encoding = LLMC_POSITION_ENCODING_ROPE;
         config->rope_rotary_dim = config->channels / config->num_heads;
         config->rope_theta = LLMC_ROPE_THETA_DEFAULT;
+        config->rope_lowest_frequency_plane_is_dc = use_rope_dc ? 1 : 0;
     }
     return gpt2_validate_position_config(config);
 }
@@ -1037,6 +1093,7 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     config->position_encoding = LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE;
     config->rope_rotary_dim = 0;
     config->rope_theta = 0.0f;
+    config->rope_lowest_frequency_plane_is_dc = 0;
     gpt2_set_initializer_defaults(config);
 }
 
@@ -1047,6 +1104,8 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // - "gpt2:rope:dX[:tY][:eZ]" for RoPE and an optional tied lexical
     //   embedding/head width Z bridged to the residual width. Suffixes may be
     //   written in either order.
+    // - "gpt2:rope-dc:dX[:tY][:eZ]" for the same schedule except that its
+    //   lowest-frequency rotary plane is an exact identity/DC plane.
     // - "gpt3:cX", where X is now the channel count, e.g. "gpt3:c768" is the smallest GPT-3 model.
 
     // check the valid prexies and dispatch to the right setup function
@@ -1978,9 +2037,15 @@ void save_state(
     const bool use_rope =
         model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE;
     const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
-    state_header[1] = use_bridge
-        ? 3
-        : (use_rope ? 2 : 1); // v3 additionally binds lexical-bridge schema
+    const bool use_rope_dc =
+        use_rope && model->config.rope_lowest_frequency_plane_is_dc != 0;
+    state_header[1] = use_rope_dc
+        ? LLMC_OPTIMIZER_STATE_VERSION_ROPE_DC
+        : (use_bridge
+               ? LLMC_OPTIMIZER_STATE_VERSION_BRIDGED_ROPE
+               : (use_rope
+                      ? LLMC_OPTIMIZER_STATE_VERSION_ROPE
+                      : LLMC_OPTIMIZER_STATE_VERSION_ABSOLUTE));
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
@@ -1993,6 +2058,12 @@ void save_state(
     state_header[17] = (int)sequence_boundary_policy;
     llmc_checkpoint_store_u64(state_header, 38, (uint64_t)loader->num_tokens);
     llmc_checkpoint_store_u64(state_header, 40, loader->source_fingerprint);
+    if (use_rope_dc) {
+        // Optimizer-state v4 binds the frequency override and whether the
+        // lexical bridge schema below must be present.
+        state_header[42] = model->config.rope_lowest_frequency_plane_is_dc;
+        state_header[43] = use_bridge ? 1 : 0;
+    }
     if (use_rope) {
         state_header[6] = model->config.position_encoding;
         state_header[7] = model->config.rope_rotary_dim;
@@ -2058,19 +2129,23 @@ void load_state(
     freadCheck(state_header, sizeof(int), 256, state_file);
     assert(state_header[0] == 20240527); // magic number
     const int state_version = state_header[1];
-    if (!(state_version == 1 || state_version == 2 || state_version == 3)) {
+    if (!(state_version == LLMC_OPTIMIZER_STATE_VERSION_ABSOLUTE ||
+          state_version == LLMC_OPTIMIZER_STATE_VERSION_ROPE ||
+          state_version == LLMC_OPTIMIZER_STATE_VERSION_BRIDGED_ROPE ||
+          state_version == LLMC_OPTIMIZER_STATE_VERSION_ROPE_DC)) {
         fprintf(stderr, "Unsupported optimizer-state version: %d\n", state_version);
         exit(EXIT_FAILURE);
     }
-    if (state_version == 1 &&
+    if (state_version == LLMC_OPTIMIZER_STATE_VERSION_ABSOLUTE &&
         model->config.position_encoding != LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
         fprintf(stderr, "Legacy optimizer state cannot be loaded into a RoPE model\n");
         exit(EXIT_FAILURE);
     }
-    if (state_version == 2) {
+    if (state_version == LLMC_OPTIMIZER_STATE_VERSION_ROPE) {
         const bool metadata_matches =
             !gpt2_uses_embedding_bridge(&model->config) &&
             model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            model->config.rope_lowest_frequency_plane_is_dc == 0 &&
             state_header[6] == model->config.position_encoding &&
             state_header[7] == model->config.rope_rotary_dim &&
             state_header[8] == llmc_checkpoint_float_word(model->config.rope_theta) &&
@@ -2125,10 +2200,11 @@ void load_state(
             exit(EXIT_FAILURE);
         }
     }
-    if (state_version == 3) {
+    if (state_version == LLMC_OPTIMIZER_STATE_VERSION_BRIDGED_ROPE) {
         const bool metadata_matches =
             gpt2_uses_embedding_bridge(&model->config) &&
             model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            model->config.rope_lowest_frequency_plane_is_dc == 0 &&
             state_header[6] == model->config.position_encoding &&
             state_header[7] == model->config.rope_rotary_dim &&
             state_header[8] == llmc_checkpoint_float_word(model->config.rope_theta) &&
@@ -2150,6 +2226,44 @@ void load_state(
                 (uint64_t)multi_gpu_config.shard_num_parameters;
         if (!metadata_matches) {
             fprintf(stderr, "Optimizer state does not match the bridged RoPE model schema\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (state_version == LLMC_OPTIMIZER_STATE_VERSION_ROPE_DC) {
+        const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
+        const bool common_metadata_matches =
+            model->config.position_encoding == LLMC_POSITION_ENCODING_ROPE &&
+            model->config.rope_lowest_frequency_plane_is_dc == 1 &&
+            state_header[42] ==
+                model->config.rope_lowest_frequency_plane_is_dc &&
+            state_header[43] == (use_bridge ? 1 : 0) &&
+            state_header[6] == model->config.position_encoding &&
+            state_header[7] == model->config.rope_rotary_dim &&
+            state_header[8] ==
+                llmc_checkpoint_float_word(model->config.rope_theta) &&
+            state_header[9] ==
+                llmc_checkpoint_float_word(model->config.initializer_std) &&
+            state_header[12] == llmc_checkpoint_float_word(
+                model->config.residual_projection_std) &&
+            llmc_checkpoint_load_u64(state_header, 34) ==
+                (uint64_t)model->num_parameters &&
+            llmc_checkpoint_load_u64(state_header, 36) ==
+                (uint64_t)multi_gpu_config.shard_num_parameters;
+        const bool bridge_metadata_matches =
+            !use_bridge ||
+            (state_header[18] == gpt2_lexical_channels(&model->config) &&
+             state_header[19] == llmc_checkpoint_float_word(
+                 model->config.bridge_projection_std) &&
+             state_header[24] == LLMC_EMBEDDING_BRIDGE_SCHEMA &&
+             state_header[25] == model->config.num_layers &&
+             state_header[26] == model->config.num_heads &&
+             state_header[27] == model->config.channels &&
+             state_header[28] == model->config.padded_vocab_size &&
+             state_header[29] == model->config.max_seq_len);
+        if (!common_metadata_matches || !bridge_metadata_matches) {
+            fprintf(
+                stderr,
+                "Optimizer state does not match the lowest-plane-DC RoPE model schema\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -2301,6 +2415,7 @@ void error_usage() {
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input .bin or descriptor; bridged example: gpt2:rope:d24:t2048:e4096 (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "              RoPE example: gpt2:rope:d30:t2048 (theta=10000, full head dimension)\n");
+    fprintf(stderr, "              lowest-plane-DC example: gpt2:rope-dc:d24:t2048:e4096\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
     fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
     fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
@@ -3108,6 +3223,23 @@ int main(int argc, char *argv[]) {
             llmc_position_encoding_name(model.config.position_encoding));
     printf0("| RoPE rotary dim       | %-50d |\n", model.config.rope_rotary_dim);
     printf0("| RoPE theta            | %-50g |\n", model.config.rope_theta);
+    if (model.config.position_encoding == LLMC_POSITION_ENCODING_ROPE) {
+        const int lowest_plane = model.config.rope_rotary_dim / 2 - 1;
+        const float lowest_inverse_frequency =
+            model.config.rope_lowest_frequency_plane_is_dc != 0
+                ? 0.0f
+                : powf(
+                      model.config.rope_theta,
+                      -2.0f * (float)lowest_plane /
+                          (float)model.config.rope_rotary_dim);
+        printf0("| RoPE lowest plane mode| %-50s |\n",
+                model.config.rope_lowest_frequency_plane_is_dc != 0
+                    ? "exact DC identity"
+                    : "canonical logspace");
+        printf0("| RoPE lowest plane idx | %-50d |\n", lowest_plane);
+        printf0("| RoPE lowest inv. freq | %-50e |\n",
+                lowest_inverse_frequency);
+    }
     printf0("| initializer std       | %-50g |\n", model.config.initializer_std);
     printf0("| residual proj. std    | %-50g |\n",
             model.config.residual_projection_std);
