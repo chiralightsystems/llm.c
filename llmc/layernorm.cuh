@@ -162,7 +162,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     __syncthreads();
 
     int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    if(idx > N) return;
+    if(idx >= N) return;
 
     // adjust pointers to current token
     residual += C * idx;

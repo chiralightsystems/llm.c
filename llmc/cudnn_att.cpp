@@ -4,6 +4,8 @@
 
 #define NOMINMAX
 #include <unistd.h>
+#include <cstdlib>
+#include <cstring>
 #include "cudnn_att.h"
 #include <cudnn_frontend.h>
 
@@ -20,7 +22,7 @@ static_assert(false, "cuDNN is not supported in FP32 mode.")
 #endif
 
 static cudnnHandle_t cudnn_handle;
-static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
+static size_t cudnn_workspace_size = 0; // provider-reported, shape/policy dependent
 static void* cudnn_workspace = NULL;
 
 static void cuDNNCheck(cudnnStatus_t error, const char *file, int line) {
@@ -39,6 +41,42 @@ static void checkCudnnFE(const fe::error_object& e, const char *file, int line) 
 }
 #define checkCudnnFE(err) checkCudnnFE(err, __FILE__, __LINE__)
 
+// Keep historical determinism unless the run explicitly opts into cuDNN's
+// recomputing parallel backward. Resolve once: graph policy must not change
+// after a cached plan or its workspace has been selected.
+static bool deterministic_attention_backward() {
+    static const bool deterministic = []() {
+        const char* value = std::getenv("LLMC_CUDNN_ATTENTION_DETERMINISTIC_BACKWARD");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        fprintf(stderr, "LLMC_CUDNN_ATTENTION_DETERMINISTIC_BACKWARD must be 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }();
+    return deterministic;
+}
+
+static void reserve_attention_workspace(
+        const std::shared_ptr<fe::graph::Graph>& graph,
+        const char* direction, int B, int H, int T, int HS, int deterministic) {
+    const size_t required = graph->get_workspace_size();
+    printf("cudnn_attention_plan direction=%s B=%d H=%d T=%d HS=%d deterministic=%d workspace_bytes=%zu\n",
+           direction, B, H, T, HS, deterministic, required);
+    fflush(stdout);
+    if (required <= cudnn_workspace_size) return;
+    if (cudnn_workspace != nullptr) cudaCheck(cudaFree(cudnn_workspace));
+    cudnn_workspace = nullptr;
+    cudnn_workspace_size = 0;
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaCheck(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (required > free_bytes) {
+        fprintf(stderr, "cuDNN %s workspace needs %zu bytes; only %zu device bytes free\n",
+                direction, required, free_bytes);
+        exit(EXIT_FAILURE);
+    }
+    cudaCheck(cudaMalloc(&cudnn_workspace, required));
+    cudnn_workspace_size = required;
+}
+
 enum UIDs {
     Q_UID,
     K_UID,
@@ -54,7 +92,7 @@ enum UIDs {
 
 // Need a cache because graph->build_operation_graph() is slow but everything else seems fast
 using cache_type_fwd = std::map<std::tuple<int,int,int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
-using cache_type_bwd = std::map<std::tuple<int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
+using cache_type_bwd = std::map<std::tuple<int,int,int,int,bool>, std::shared_ptr<fe::graph::Graph>>;
 
 // Loosely based on cuDNN frontend samples functions and massively simplified
 auto lookup_cache_or_build_graph_fwd(
@@ -129,15 +167,7 @@ auto lookup_cache_or_build_graph_fwd(
     auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
     checkCudnnFE(graph->check_support(cudnn_handle));
     checkCudnnFE(graph->build_plans(cudnn_handle));
-    // Reallocate the workspace if the required size is greater than the current workspace
-    // In H100 this may be around 16B
-    if (graph->get_workspace_size() > cudnn_workspace_size) {
-        if (cudnn_workspace_size > 0) {
-            cudaCheck(cudaFree(cudnn_workspace));
-        }
-        cudnn_workspace_size = graph->get_workspace_size();
-        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
-    }
+    reserve_attention_workspace(graph, "forward", B, H, T, HS, -1);
 
     user_maintained_cache_fwd.insert({key, graph});
 
@@ -147,7 +177,7 @@ auto lookup_cache_or_build_graph_fwd(
 auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
     static cache_type_bwd user_maintained_cache_bwd;
 
-    auto key = std::make_tuple(B, NH, T, HS);
+    auto key = std::make_tuple(B, NH, T, HS, deterministic_attention_backward());
 
     auto it = user_maintained_cache_bwd.find(key);
     if (it != user_maintained_cache_bwd.end()) {
@@ -195,7 +225,7 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
                             .set_data_type(fe::DataType_t::FLOAT));
     auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
 #if CUDNN_FRONTEND_MAJOR_VERSION > 1 || CUDNN_FRONTEND_MINOR_VERSION >= 5
-                            .set_deterministic_algorithm(true) // 1.5+ needs this for determinism
+                            .set_deterministic_algorithm(deterministic_attention_backward())
 #endif
                             .set_causal_mask(true)
                             .set_attn_scale(attn_scale);
@@ -215,15 +245,7 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
     checkCudnnFE(graph->check_support(cudnn_handle));
     checkCudnnFE(graph->build_plans(cudnn_handle));
 
-    // Reallocate the workspace if the required size is greater than the current workspace
-    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
-    if (graph->get_workspace_size() > cudnn_workspace_size) {
-        if (cudnn_workspace_size > 0) {
-            cudaCheck(cudaFree(cudnn_workspace));
-        }
-        cudnn_workspace_size = graph->get_workspace_size();
-        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
-    }
+    reserve_attention_workspace(graph, "backward", B, NH, T, HS, deterministic_attention_backward() ? 1 : 0);
 
     user_maintained_cache_bwd.insert({key, graph});
     return graph;

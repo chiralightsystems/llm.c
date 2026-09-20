@@ -11,7 +11,7 @@ AdamW kernel
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
-__device__ float lerp(float start, float end, float weight) {
+__device__ float llmc_adamw_lerp(float start, float end, float weight) {
     return fma(weight, end, fma(-weight, start, start));
 }
 
@@ -27,10 +27,10 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     float m = m_memory[idx];
     float v = v_memory[idx];
     // update the first moment (momentum)
-    m = lerp(grad, m, beta1);
+    m = llmc_adamw_lerp(grad, m, beta1);
     m_memory[idx] = m;
     // update the second moment (RMSprop)
-    v = lerp(grad * grad, v, beta2);
+    v = llmc_adamw_lerp(grad * grad, v, beta2);
     v_memory[idx] = v;
     m /= beta1_correction;  // m_hat
     v /= beta2_correction;  // v_hat

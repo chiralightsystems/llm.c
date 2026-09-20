@@ -1,0 +1,99 @@
+{
+  "schema": "llmc.worldmodel_integration.v1",
+  "working_branch": "kyin/worldmodel-checkout",
+  "parent_repository": "https://github.com/chiralightsystems/worldmodel",
+  "parent_source_commit": "a822579769cd433bb203f96f19d5468389cdacde",
+  "parent_decode_import_commit": "d6d74f6a1bcf725acb858a8629e917df2fb73bc2",
+  "original_llmc_decode_base": "247f4384b978faad621dc0255d375986e5df09b6",
+  "merged_cachemuon_commit": "15ca124571a6f30069d37c666ac4844a836a62c1",
+  "merged_classifier_commit": "0e09f142ea11dc6e894f765c78fd0b14cf92d1b4",
+  "source_copies": [
+    {
+      "source_path": "experiments/llmc_muon/decode/base_patches/attention_workspace.patch",
+      "fork_path": "worldmodel/history/decode_patches/attention_workspace.patch",
+      "sha256": "cd9313cc7eaf7870b826b3987d044db54ca6db610c4b2654f1dbfa68659ce05c"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/base_patches/validation_timing.patch",
+      "fork_path": "worldmodel/history/decode_patches/validation_timing.patch",
+      "sha256": "4388ca143ad040e0dac589205da34de9f333060f7344d7b3b1b92d957e12b64b"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/base_patches/small_vocab_classifier.patch",
+      "fork_path": "worldmodel/history/decode_patches/small_vocab_classifier.patch",
+      "sha256": "17daed725a31e0dfedf671d55d54b248e9321ce44638cfa9d38379680ac84db7"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/layernorm_decode.patch",
+      "fork_path": "worldmodel/history/decode_patches/layernorm_decode.patch",
+      "sha256": "37ad8df5fac6de4f4f09dd8f22f871e831305c51c3f712ec4be96cb9e85813d0"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/linux_cpp20.patch",
+      "fork_path": "worldmodel/history/decode_patches/linux_cpp20.patch",
+      "sha256": "55ed393a3ff19a719c371fef15c8d7db7b1efa98790f060be52735d20fd7d18e"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/nope_inference.patch",
+      "fork_path": "worldmodel/history/decode_patches/nope_inference.patch",
+      "sha256": "a3f0d63267c73272851dc200faacebaddbf873d5f7e231f45b39dea3f4345c5e"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/cached_decode.cu",
+      "fork_path": "worldmodel/decode/cached_decode.cu",
+      "sha256": "04f7991683440ac87148b477fe8f998ccefe7ca9a78b06a264f617d1bd518b33"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/cached_attention.cu",
+      "fork_path": "worldmodel/decode/cached_attention.cu",
+      "sha256": "0d66e288d43bff3637f14331233bb8b565c852cd99eac88d0be193702c23f627"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/cached_attention.h",
+      "fork_path": "worldmodel/decode/cached_attention.h",
+      "sha256": "0320c6b04ea40a2c7c7970c9a141d20f8f60bafcd08100895c35013efd3a5215"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/cached_matmul.h",
+      "fork_path": "worldmodel/decode/cached_matmul.h",
+      "sha256": "c30622b1398adf29a5023191865658141363ce9fd5e40634d5e2ae4fd402395f"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/test_cached_attention.cu",
+      "fork_path": "worldmodel/decode/test_cached_attention.cu",
+      "sha256": "c11d2e59833947e6b0465b990eb6f8be7264a62626c0816b666eadb571ecff09"
+    },
+    {
+      "source_path": "experiments/llmc_muon/decode/test_decode_primitives.cu",
+      "fork_path": "worldmodel/decode/test_decode_primitives.cu",
+      "sha256": "969ad1f5dccdcce7260e22b824022ab4b5fb511ca5e4378d2bedfb88d29338fb"
+    },
+    {
+      "source_path": "experiments/llmc_muon/evaluation/grammar_score.cu",
+      "fork_path": "worldmodel/evaluation/grammar_score.cu",
+      "sha256": "d959168d08259870a479d9fab09d5ef15cf731165487f6dff6793e3c1608208d"
+    },
+    {
+      "source_path": "experiments/llmc_muon/evaluation/grammar_score_host.h",
+      "fork_path": "worldmodel/evaluation/grammar_score_host.h",
+      "sha256": "9701c7720786f77df33787f15b96a977c638c5a7534a56e7bee5200232d5d1ab"
+    },
+    {
+      "source_path": "experiments/llmc_muon/tests/test_attention_memory.cu",
+      "fork_path": "worldmodel/tests/test_attention_memory.cu",
+      "sha256": "228cd6de6dfd7187913aac91bdc5207618787f0b347eb160f820ab9980db0855"
+    },
+    {
+      "source_path": "experiments/llmc_muon/tests/test_grammar_score_host.cpp",
+      "fork_path": "worldmodel/tests/test_grammar_score_host.cpp",
+      "sha256": "44b080b78d495a39f093a2d8d6991f230fc84d37427f62065729a264fe675406"
+    }
+  ],
+  "adapted_tools": [
+    "worldmodel/scripts/build_cached_decode.py",
+    "worldmodel/scripts/run_cached_decode.py",
+    "worldmodel/scripts/check_cached_decode.py"
+  ],
+  "integration_only_guard": "Reject inference-only NoPE descriptors in ordinary trainer main before model construction",
+  "qualification": "Original qualification remains historical; new integrated binary requires its own GPU qualification. No experiments run for this import."
+}

@@ -34,3 +34,7 @@ dev/cuda/global_norm
 
 # log files
 *.log
+
+# Worldmodel integration build snapshots and Python caches
+/artifacts/
+__pycache__/

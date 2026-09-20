@@ -1,0 +1,64 @@
+--- a/train_gpt2.cu
++++ b/train_gpt2.cu
+@@ -150,6 +150,7 @@
+ enum LlmcPositionEncoding {
+     LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE = 0,
+     LLMC_POSITION_ENCODING_ROPE = 1,
++    LLMC_POSITION_ENCODING_NONE = 2, // explicit inference NoPE profile
+ };
+ 
+ constexpr float LLMC_GPT2_INITIALIZER_STD = 0.02f;
+@@ -175,6 +176,7 @@
+     switch (position_encoding) {
+         case LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE: return "learned_absolute";
+         case LLMC_POSITION_ENCODING_ROPE: return "rope";
++        case LLMC_POSITION_ENCODING_NONE: return "none";
+         default: return "unknown";
+     }
+ }
+@@ -233,6 +235,10 @@
+         (!std::isfinite(config->bridge_projection_std) ||
+          config->bridge_projection_std <= 0.0f)) {
+         return false;
++    }
++    if (config->position_encoding == LLMC_POSITION_ENCODING_NONE) {
++        return config->rope_rotary_dim == 0 && config->rope_theta == 0.0f &&
++               config->rope_lowest_frequency_plane_is_dc == 0;
+     }
+     if (config->position_encoding == LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
+         // The placement of learned WPE relative to a lexical bridge is an
+@@ -288,7 +294,7 @@
+     size_t maxT = config.max_seq_len;
+     size_t L = config.num_layers;
+     param_sizes[0] = Vp * E; // wte
+-    param_sizes[1] = config.position_encoding == LLMC_POSITION_ENCODING_ROPE
++    param_sizes[1] = config.position_encoding != LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE
+         ? 0
+         : maxT * C; // wpe is absent for RoPE models
+     param_sizes[2] = L * C; // ln1w
+@@ -1019,11 +1025,16 @@
+     bool explicit_gpt2 = false;
+     bool use_rope = false;
+     bool use_rope_dc = false;
++    bool use_nope = false;
+     if (descriptor[0] == 'd') {
+         depth_text = descriptor + 1;
+     } else if (strncmp(descriptor, "gpt2:d", 6) == 0) {
+         depth_text = descriptor + 6;
+         explicit_gpt2 = true;
++    } else if (strncmp(descriptor, "gpt2:nope:d", 11) == 0) {
++        depth_text = descriptor + 11;
++        explicit_gpt2 = true;
++        use_nope = true;
+     } else if (strncmp(descriptor, "gpt2:rope:d", 11) == 0) {
+         depth_text = descriptor + 11;
+         explicit_gpt2 = true;
+@@ -1083,6 +1094,8 @@
+         config->rope_rotary_dim = config->channels / config->num_heads;
+         config->rope_theta = LLMC_ROPE_THETA_DEFAULT;
+         config->rope_lowest_frequency_plane_is_dc = use_rope_dc ? 1 : 0;
++    } else if (use_nope) {
++        config->position_encoding = LLMC_POSITION_ENCODING_NONE;
+     }
+     return gpt2_validate_position_config(config);
+ }

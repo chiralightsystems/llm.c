@@ -1,0 +1,2 @@
+# Keep imported source hashes stable across Windows and Linux checkouts.
+worldmodel/** text eol=lf

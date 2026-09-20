@@ -150,6 +150,7 @@ size_t llmc_supervised_target_count(
 enum LlmcPositionEncoding {
     LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE = 0,
     LLMC_POSITION_ENCODING_ROPE = 1,
+    LLMC_POSITION_ENCODING_NONE = 2, // explicit inference NoPE profile
 };
 
 constexpr float LLMC_GPT2_INITIALIZER_STD = 0.02f;
@@ -175,6 +176,7 @@ const char* llmc_position_encoding_name(int position_encoding) {
     switch (position_encoding) {
         case LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE: return "learned_absolute";
         case LLMC_POSITION_ENCODING_ROPE: return "rope";
+        case LLMC_POSITION_ENCODING_NONE: return "none";
         default: return "unknown";
     }
 }
@@ -234,6 +236,10 @@ bool gpt2_validate_position_config(const GPT2Config* config) {
          config->bridge_projection_std <= 0.0f)) {
         return false;
     }
+    if (config->position_encoding == LLMC_POSITION_ENCODING_NONE) {
+        return config->rope_rotary_dim == 0 && config->rope_theta == 0.0f &&
+               config->rope_lowest_frequency_plane_is_dc == 0;
+    }
     if (config->position_encoding == LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE) {
         // The placement of learned WPE relative to a lexical bridge is an
         // architectural choice. Keep bridged descriptors RoPE-only rather
@@ -288,7 +294,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
     param_sizes[0] = Vp * E; // wte
-    param_sizes[1] = config.position_encoding == LLMC_POSITION_ENCODING_ROPE
+    param_sizes[1] = config.position_encoding != LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE
         ? 0
         : maxT * C; // wpe is absent for RoPE models
     param_sizes[2] = L * C; // ln1w
@@ -424,9 +430,29 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
     tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
+    // cuDNN owns attention's temporary storage. The NH*T term is only
+    // needed by the materialized non-cuDNN attention backward path.
+    size_t output_width = max(max(3*C, 3*E), Vp);
+#ifndef ENABLE_CUDNN
+    output_width = max(output_width, NH*T);
+#endif
+    size_t output_bytes = B * T * output_width * sizeof(floatX);
+    // This same allocation is reused as FP32 reduction scratch. Its hardware-
+    // sized minimum still applies to tiny batches and diagnostic vocabularies.
+    const size_t sm_count = (size_t)deviceProp.multiProcessorCount;
+    size_t scratch_floats = 32 + 4*C*sm_count; // layernorm_backward
+    const size_t threads_per_sm = (size_t)deviceProp.maxThreadsPerMultiProcessor;
+    const size_t bias_block = threads_per_sm == 1536 ? 768 : 1024;
+    for (size_t output_channels : {C, 3*C, 4*C}) {
+        const size_t grid_x = CEIL_DIV(output_channels, 8*x128::size);
+        const size_t grid_y = max((size_t)1, threads_per_sm*sm_count/(bias_block*grid_x));
+        if (grid_y > 1) scratch_floats = max(scratch_floats, output_channels*grid_y);
+    }
+    const size_t norm_grid = threads_per_sm*sm_count/512;
+    scratch_floats = max(scratch_floats, max(norm_grid, CEIL_DIV(norm_grid, L)*L));
+    output_bytes = max(output_bytes, scratch_floats*sizeof(float));
     tensors[ACTIVATION_TENSOR_OUTPUT] = TENSOR_SPEC(
-        data->output,
-        B * T * max(max(3*C, 3*E), max(NH*T, Vp)));
+        data->output, CEIL_DIV(output_bytes, sizeof(floatX)));
 
     // The bridge recomputes lexical activations into this buffer and then
     // overwrites them with their gradients. It costs no extra memory when
@@ -999,11 +1025,16 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
     bool explicit_gpt2 = false;
     bool use_rope = false;
     bool use_rope_dc = false;
+    bool use_nope = false;
     if (descriptor[0] == 'd') {
         depth_text = descriptor + 1;
     } else if (strncmp(descriptor, "gpt2:d", 6) == 0) {
         depth_text = descriptor + 6;
         explicit_gpt2 = true;
+    } else if (strncmp(descriptor, "gpt2:nope:d", 11) == 0) {
+        depth_text = descriptor + 11;
+        explicit_gpt2 = true;
+        use_nope = true;
     } else if (strncmp(descriptor, "gpt2:rope:d", 11) == 0) {
         depth_text = descriptor + 11;
         explicit_gpt2 = true;
@@ -1063,6 +1094,8 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
         config->rope_rotary_dim = config->channels / config->num_heads;
         config->rope_theta = LLMC_ROPE_THETA_DEFAULT;
         config->rope_lowest_frequency_plane_is_dc = use_rope_dc ? 1 : 0;
+    } else if (use_nope) {
+        config->position_encoding = LLMC_POSITION_ENCODING_NONE;
     }
     return gpt2_validate_position_config(config);
 }
@@ -3169,6 +3202,13 @@ int main(int argc, char *argv[]) {
     } else {
         // if it's not .bin, it could be a "special descriptor". This descriptor is used to
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
+        GPT2Config requested_config{};
+        if (gpt2_config_from_descriptor(&requested_config, load_filename) &&
+            requested_config.position_encoding == LLMC_POSITION_ENCODING_NONE) {
+            fprintf(stderr, "NoPE descriptors are inference-only; use worldmodel/decode/cached_decode.cu. "
+                            "The trainer checkpoint/state formats do not support NoPE.\n");
+            exit(EXIT_FAILURE);
+        }
         gpt_build_from_descriptor(&model, load_filename);
     }
 
@@ -3831,9 +3871,12 @@ int main(int argc, char *argv[]) {
         if (step % val_loss_every == 0 || last_step) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
+            double val_warm_time_ms = 0.0;
+            int val_warm_batches = 0;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
+                cudaCheck(cudaEventRecord(start, main_stream));
                 float val_batch_loss = gpt2_validate(
                     &model,
                     val_loader.inputs,
@@ -3844,6 +3887,14 @@ int main(int argc, char *argv[]) {
                     validation_attention_blackout_width,
                     validation_attention_disabled != 0,
                     validation_loss_ignore_prefix);
+                cudaCheck(cudaEventRecord(end, main_stream));
+                cudaCheck(cudaEventSynchronize(end));
+                float val_batch_time_ms = 0.0f;
+                cudaCheck(cudaEventElapsedTime(&val_batch_time_ms, start, end));
+                if (i > 0) {
+                    val_warm_time_ms += val_batch_time_ms;
+                    val_warm_batches += 1;
+                }
                 val_loss += val_batch_loss;
                 if (validation_print_batch_losses != 0) {
                     printf0(
@@ -3857,6 +3908,23 @@ int main(int argc, char *argv[]) {
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
+            if (val_warm_batches > 0) {
+                const double val_mean_batch_time_ms =
+                    val_warm_time_ms / (double)val_warm_batches;
+                const double val_visible_tokens_per_second =
+                    (double)B * (double)T * 1000.0 /
+                    val_mean_batch_time_ms;
+                const double val_supervised_targets_per_second =
+                    (double)validation_supervised_targets_per_batch * 1000.0 /
+                    val_mean_batch_time_ms;
+                printf0(
+                    "val throughput warm_batches %d | mean %.3f ms | "
+                    "visible %.0f tok/s | supervised %.0f target/s\n",
+                    val_warm_batches,
+                    val_mean_batch_time_ms,
+                    val_visible_tokens_per_second,
+                    val_supervised_targets_per_second);
+            }
             logger_log_val(&logger, step, val_loss);
         }
 

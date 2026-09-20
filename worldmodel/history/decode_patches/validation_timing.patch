@@ -1,0 +1,56 @@
+diff --git a/train_gpt2.cu b/train_gpt2.cu
+index 8453b65..5475e59 100644
+--- a/train_gpt2.cu
++++ b/train_gpt2.cu
+@@ -3754,9 +3754,12 @@ int main(int argc, char *argv[]) {
+         if (step % val_loss_every == 0 || last_step) {
+             NvtxRange validation_range("validation");
+             float val_loss = 0.0f;
++            double val_warm_time_ms = 0.0;
++            int val_warm_batches = 0;
+             dataloader_reset(&val_loader);
+             for (int i = 0; i < val_num_batches; i++) {
+                 dataloader_next_batch(&val_loader);
++                cudaCheck(cudaEventRecord(start, main_stream));
+                 float val_batch_loss = gpt2_validate(
+                     &model,
+                     val_loader.inputs,
+@@ -3767,6 +3770,14 @@ int main(int argc, char *argv[]) {
+                     validation_attention_blackout_width,
+                     validation_attention_disabled != 0,
+                     validation_loss_ignore_prefix);
++                cudaCheck(cudaEventRecord(end, main_stream));
++                cudaCheck(cudaEventSynchronize(end));
++                float val_batch_time_ms = 0.0f;
++                cudaCheck(cudaEventElapsedTime(&val_batch_time_ms, start, end));
++                if (i > 0) {
++                    val_warm_time_ms += val_batch_time_ms;
++                    val_warm_batches += 1;
++                }
+                 val_loss += val_batch_loss;
+                 if (validation_print_batch_losses != 0) {
+                     printf0(
+@@ -3780,6 +3791,23 @@ int main(int argc, char *argv[]) {
+             val_loss /= val_num_batches;
+             val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
+             printf0("val loss %f\n", val_loss);
++            if (val_warm_batches > 0) {
++                const double val_mean_batch_time_ms =
++                    val_warm_time_ms / (double)val_warm_batches;
++                const double val_visible_tokens_per_second =
++                    (double)B * (double)T * 1000.0 /
++                    val_mean_batch_time_ms;
++                const double val_supervised_targets_per_second =
++                    (double)validation_supervised_targets_per_batch * 1000.0 /
++                    val_mean_batch_time_ms;
++                printf0(
++                    "val throughput warm_batches %d | mean %.3f ms | "
++                    "visible %.0f tok/s | supervised %.0f target/s\n",
++                    val_warm_batches,
++                    val_mean_batch_time_ms,
++                    val_visible_tokens_per_second,
++                    val_supervised_targets_per_second);
++            }
+             logger_log_val(&logger, step, val_loss);
+         }
+ 
