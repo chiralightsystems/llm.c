@@ -27,7 +27,8 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
 
     // special-case loop to handle the unaligned elements at the end of the array
     // this lets us skip the bounds check in the main loop below, which improves performance
-    while ((i+1)*x128::size > V) {
+    // A negative index marks an inactive thread; guard it before size_t promotion.
+    while (i >= 0 && (i+1)*x128::size > V) {
         for(int k = 0; k < x128::size; ++k) {
             if (i*x128::size+k >= V) {
                 break; // bounds checking against real V (rather than padded P)
