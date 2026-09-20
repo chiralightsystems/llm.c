@@ -2459,10 +2459,15 @@ void error_usage() {
     fprintf(stderr, "  -nv <float>  adaptive tracker Wdown family-mean skew threshold (default = 0.57)\n");
     fprintf(stderr, "  -nn <int>    tracker correction iterations (default = 2)\n");
     fprintf(stderr, "  -ng <float>  tracker correction gain (default = 1.0)\n");
+    fprintf(stderr, "  -nP <float>  square-tracker spectral pmax in (1,1.5] (default = 1.2)\n");
     fprintf(stderr, "  -nh <float>  CacheMuon normalized polar-residual threshold gamma (default = 5.0)\n");
-    fprintf(stderr, "  -nd <string> tracker correction: global_frobenius|diagonal_sylvester (default = global_frobenius; damp eta=0.05 raw-Frobenius-cap=0.25)\n");
+    fprintf(stderr, "  -nH <float>  CacheMuon tracker relative-motion refresh threshold (default = 0.15)\n");
+    fprintf(stderr, "  -nS <float>  CacheMuon tracker relative CG-residual threshold (default = 0.25)\n");
+    fprintf(stderr, "  -nR <float>  CacheMuon tracker SPD trust threshold in (0,1) (default = 0.50)\n");
+    fprintf(stderr, "  -nK <int>    CacheMuon tracker CG iterations in [1,16] (default = 2)\n");
+    fprintf(stderr, "  -nd <string> tracker correction: global_frobenius|diagonal_sylvester|basis_free_first_order (default = global_frobenius; basis-free is square-only, one extra square GEMM)\n");
     fprintf(stderr, "  -nt <string> tracker retraction: disabled|newton_schulz|commuted_canonical_stage2 (default = newton_schulz; 0|1 accepted)\n");
-    fprintf(stderr, "  -np <int>    square-tracker diagnostics every N optimizer steps (0=off; default=0)\n");
+    fprintf(stderr, "  -np <int>    square/cache-tracker detailed diagnostics every N optimizer steps (0=off; default=0)\n");
     fprintf(stderr, "  -da <float>  square-tracker LR dither amplitude in [0,1) (0=off; default=0)\n");
     fprintf(stderr, "  -di <int>    square-tracker LR dither pulse interval (default=12)\n");
     fprintf(stderr, "  -dm <string> LR dither mode: walsh_pulse|sinusoidal|heterodyne_chopper (default=walsh_pulse)\n");
@@ -2508,6 +2513,42 @@ void error_usage() {
     fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
     fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
     exit(EXIT_FAILURE);
+}
+
+// Keep the already-large main CLI dispatch below MSVC's nested-block limit.
+// These options all have the same parse shape, so one leaf handles them
+// without changing their spellings or semantics.
+static bool llmc_parse_normuon_scalar_cli_option(
+    const char* option,
+    const char* value,
+    LlmcNormuonConfig* config) {
+    if (option == nullptr || value == nullptr || config == nullptr ||
+        option[0] != '-' || option[1] != 'n') {
+        return false;
+    }
+    switch (option[2]) {
+        case 'l': config->learning_rate = atof(value); break;
+        case 'w': config->weight_decay = atof(value); break;
+        case 'b': config->momentum = atof(value); break;
+        case '2': config->beta2 = atof(value); break;
+        case 'e': config->epsilon = atof(value); break;
+        case 's': config->update_scale = atof(value); break;
+        case 'q': config->wdown_learning_rate_multiplier = atof(value); break;
+        case 'i': config->refresh_interval = atoi(value); break;
+        case 'j': config->tracker_max_refresh_age = atoi(value); break;
+        case 'u': config->tracker_wup_skew_threshold = atof(value); break;
+        case 'v': config->tracker_wdown_skew_threshold = atof(value); break;
+        case 'n': config->correction_iterations = atoi(value); break;
+        case 'g': config->correction_gain = atof(value); break;
+        case 'P': config->tracker_spectral_pmax = atof(value); break;
+        case 'h': config->cache_residual_threshold = atof(value); break;
+        case 'H': config->cache_tracker_motion_threshold = atof(value); break;
+        case 'S': config->cache_tracker_solve_relative_threshold = atof(value); break;
+        case 'R': config->cache_tracker_spd_trust_threshold = atof(value); break;
+        case 'K': config->cache_tracker_cg_iterations = atoi(value); break;
+        default: return false;
+    }
+    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -2637,13 +2678,10 @@ int main(int argc, char *argv[]) {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_approximation_policy(argv[i+1], &optimizer_config.correction_policy)) { error_usage(); }
         }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'l') { optimizer_cli_explicit = 1; optimizer_config.learning_rate = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'w') { optimizer_cli_explicit = 1; optimizer_config.weight_decay = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'b') { optimizer_cli_explicit = 1; optimizer_config.momentum = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == '2') { optimizer_cli_explicit = 1; optimizer_config.beta2 = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'e') { optimizer_cli_explicit = 1; optimizer_config.epsilon = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 's') { optimizer_cli_explicit = 1; optimizer_config.update_scale = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'q') { optimizer_cli_explicit = 1; optimizer_config.wdown_learning_rate_multiplier = atof(argv[i+1]); }
+        else if (llmc_parse_normuon_scalar_cli_option(
+                     argv[i], argv[i+1], &optimizer_config)) {
+            optimizer_cli_explicit = 1;
+        }
         else if (argv[i][1] == 'n' && argv[i][2] == 'a') {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_tracker_refresh_mode(
@@ -2651,13 +2689,6 @@ int main(int argc, char *argv[]) {
                 error_usage();
             }
         }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'i') { optimizer_cli_explicit = 1; optimizer_config.refresh_interval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'j') { optimizer_cli_explicit = 1; optimizer_config.tracker_max_refresh_age = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'u') { optimizer_cli_explicit = 1; optimizer_config.tracker_wup_skew_threshold = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'v') { optimizer_cli_explicit = 1; optimizer_config.tracker_wdown_skew_threshold = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'n') { optimizer_cli_explicit = 1; optimizer_config.correction_iterations = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'g') { optimizer_cli_explicit = 1; optimizer_config.correction_gain = atof(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'h') { optimizer_cli_explicit = 1; optimizer_config.cache_residual_threshold = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'd') {
             optimizer_cli_explicit = 1;
             if (!llmc_parse_normuon_tracker_correction_mode(
@@ -2798,12 +2829,14 @@ int main(int argc, char *argv[]) {
         (optimizer_config.optimizer_selection !=
              LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON ||
          optimizer_config.execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
-         optimizer_config.orthogonalization_mode !=
-             LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q)) {
+         (optimizer_config.orthogonalization_mode !=
+              LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q &&
+          !llmc_normuon_is_cache_inverse_root_tracker_mode(
+              optimizer_config.orthogonalization_mode)))) {
         fprintf(
             stderr,
             "-np currently requires adamw_normuon, bf16_batched, and "
-            "skew_polar_track_q\n");
+            "skew_polar_track_q or rectangular_cache_muon_inverse_root_tracker\n");
         exit(EXIT_FAILURE);
     }
     if (!isfinite(normuon_lr_dither_amplitude) ||
@@ -3045,12 +3078,21 @@ int main(int argc, char *argv[]) {
     printf0("| Tracker Wdn skew gate | %-50e |\n", optimizer_config.tracker_wdown_skew_threshold);
     printf0("| NorMuon correction N  | %-50u |\n", optimizer_config.correction_iterations);
     printf0("| NorMuon corr. gain    | %-50e |\n", optimizer_config.correction_gain);
+    printf0("| Tracker spectral pmax | %-50e |\n", optimizer_config.tracker_spectral_pmax);
     printf0("| CacheMuon gamma       | %-50e |\n", optimizer_config.cache_residual_threshold);
+    printf0("| Cache tracker motion  | %-50e |\n", optimizer_config.cache_tracker_motion_threshold);
+    printf0("| Cache tracker solve   | %-50e |\n", optimizer_config.cache_tracker_solve_relative_threshold);
+    printf0("| Cache tracker SPD     | %-50e |\n", optimizer_config.cache_tracker_spd_trust_threshold);
+    printf0("| Cache tracker CG N    | %-50u |\n", optimizer_config.cache_tracker_cg_iterations);
     printf0("| NorMuon corr. mode    | %-50s |\n",
             llmc_normuon_tracker_correction_mode_name(
                 optimizer_config.correction_mode));
     printf0("| NorMuon retraction    | %-50s |\n",
-            llmc_normuon_tracker_retraction_mode_name(optimizer_config.retraction_mode));
+            llmc_normuon_is_cache_inverse_root_tracker_mode(
+                    optimizer_config.orthogonalization_mode)
+                ? "disabled_not_applicable"
+                : llmc_normuon_tracker_retraction_mode_name(
+                      optimizer_config.retraction_mode));
     printf0("| Tracker diagnostics N | %-50d |\n",
             normuon_tracker_diagnostics_every);
     printf0("| Tracker LR dither amp | %-50e |\n",
@@ -3391,6 +3433,28 @@ int main(int argc, char *argv[]) {
         const bool retraction_enabled =
             model.optimizer_config.retraction_mode !=
             LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+        const bool cache_inverse_root_tracker =
+            llmc_normuon_is_cache_inverse_root_tracker_mode(
+                model.optimizer_config.orthogonalization_mode);
+        const bool rectangular_non_tracker =
+            model.optimizer_config.orthogonalization_mode ==
+                LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ||
+            model.optimizer_config.orthogonalization_mode ==
+                LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON;
+        const char* tracker_retraction_form = cache_inverse_root_tracker
+            ? "not_applicable_smaller_side_inverse_root_tracker"
+            : (rectangular_non_tracker
+                   ? "not_applicable_non_tracker"
+                   : (!retraction_enabled
+                          ? "disabled"
+                          : (commuted_canonical_stage2
+                                 ? "canonical_taylor_stage2_post_product"
+                                 : (thin_canonical_stage2
+                                        ? "canonical_taylor_stage2_thin_factor"
+                                        : (model.optimizer_config.execution_mode ==
+                                                   LLMC_NORMUON_EXECUTION_BF16_BATCHED
+                                               ? "D(3I-D^T D)/2"
+                                               : "(3I-DD^T)D/2")))));
         printf0(
             "normuon_variant: %s\n",
             model.optimizer_config.orthogonalization_mode ==
@@ -3402,8 +3466,10 @@ int main(int argc, char *argv[]) {
                        ? "proper rectangular Muon (scratch FreshGNS every step)"
                        : "proper rectangular Muon (scratch-only)")
                 : model.optimizer_config.orthogonalization_mode ==
-                          LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON
-                      ? "proper rectangular CacheMuon (residual-gated FreshGNS)"
+                           LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON
+                       ? "proper rectangular CacheMuon (residual-gated FreshGNS)"
+                : cache_inverse_root_tracker
+                      ? "proper rectangular CacheMuon smaller-side inverse-root tracker"
                 : model.optimizer_config.orthogonalization_mode ==
                           LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q
                       ? "proper rectangular polar-factor tracker"
@@ -3426,24 +3492,12 @@ int main(int argc, char *argv[]) {
                     ? "single_pack_reused_through_prefix_polynomial"
                     : "not_applicable");
         printf0("normuon_tracker_retraction_form: %s\n",
-                (model.optimizer_config.orthogonalization_mode ==
-                         LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ||
-                 model.optimizer_config.orthogonalization_mode ==
-                         LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON)
-                    ? "not_applicable_non_tracker"
-                    : (!retraction_enabled
-                    ? "disabled"
-                    : (commuted_canonical_stage2
-                           ? "canonical_taylor_stage2_post_product"
-                           : (thin_canonical_stage2
-                                  ? "canonical_taylor_stage2_thin_factor"
-                                  : (model.optimizer_config.execution_mode ==
-                                      LLMC_NORMUON_EXECUTION_BF16_BATCHED
-                                      ? "D(3I-D^T D)/2"
-                                      : "(3I-DD^T)D/2")))));
+                tracker_retraction_form);
         printf0("normuon_tracker_retraction_mode: %s\n",
-                llmc_normuon_tracker_retraction_mode_name(
-                    model.optimizer_config.retraction_mode));
+                cache_inverse_root_tracker
+                    ? "disabled_not_applicable"
+                    : llmc_normuon_tracker_retraction_mode_name(
+                          model.optimizer_config.retraction_mode));
         printf0("normuon_orthogonalization_mode: %s\n",
                 llmc_normuon_orthogonalization_mode_name(model.optimizer_config.orthogonalization_mode));
         printf0("normuon_refresh_policy: %s\n",
@@ -3486,8 +3540,22 @@ int main(int argc, char *argv[]) {
                     : "not_applicable");
         printf0("normuon_correction_iterations: %u\n", model.optimizer_config.correction_iterations);
         printf0("normuon_correction_gain: %.9g\n", model.optimizer_config.correction_gain);
+        printf0("normuon_tracker_spectral_pmax: %.9g\n",
+                model.optimizer_config.tracker_spectral_pmax);
+        printf0("normuon_tracker_spectral_norm_estimator: power_iteration\n");
+        printf0("normuon_tracker_spectral_power_iterations: %u\n",
+                LLMC_NORMUON_TRACKER_SPECTRAL_POWER_ITERATIONS);
         printf0("normuon_cache_residual_threshold: %.9g\n",
                 model.optimizer_config.cache_residual_threshold);
+        printf0("normuon_cache_tracker_motion_threshold: %.9g\n",
+                model.optimizer_config.cache_tracker_motion_threshold);
+        printf0("normuon_cache_tracker_solve_relative_threshold: %.9g\n",
+                model.optimizer_config.cache_tracker_solve_relative_threshold);
+        printf0("normuon_cache_tracker_spd_trust_threshold: %.9g\n",
+                model.optimizer_config.cache_tracker_spd_trust_threshold);
+        printf0("normuon_cache_tracker_cg_iterations: %u\n",
+                model.optimizer_config.cache_tracker_cg_iterations);
+        printf0("normuon_cache_tracker_direction_timing: lagged_old_candidate\n");
         printf0("normuon_cache_normalization_epsilon: %.9g\n",
                 LLMC_CACHEMUON_EPSILON);
         printf0("normuon_cache_restart_stage: %u\n",
@@ -3506,6 +3574,11 @@ int main(int argc, char *argv[]) {
                     LLMC_NORMUON_TRACKER_DAMPING_ETA);
             printf0("normuon_tracker_correction_cap: %.9g\n",
                     LLMC_NORMUON_TRACKER_CORRECTION_CAP);
+        } else if (model.optimizer_config.correction_mode ==
+                   LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER) {
+            printf0("normuon_tracker_basis_free_alpha: trace_mean_with_rms_floor\n");
+            printf0("normuon_tracker_damping_eta: %.9g\n",
+                    LLMC_NORMUON_TRACKER_DAMPING_ETA);
         }
         printf0("normuon_retraction: %u\n", retraction_enabled ? 1U : 0U);
         printf0("normuon_tracker_pre_product_correction_stage_count: %u\n",
@@ -3592,7 +3665,11 @@ int main(int argc, char *argv[]) {
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
     gpt2_allocate_state(&model, B, T);
-    if ((normuon_tracker_diagnostics_every > 0 ||
+    const bool square_tracker_diagnostics_requested =
+        normuon_tracker_diagnostics_every > 0 &&
+        optimizer_config.orthogonalization_mode ==
+            LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q;
+    if ((square_tracker_diagnostics_requested ||
          normuon_lr_dither_amplitude > 0.0f) &&
         !llmc_normuon_enable_tracker_diagnostics(
             &model.normuon_runtime,
@@ -4324,6 +4401,99 @@ int main(int argc, char *argv[]) {
                     probes - model.normuon_runtime.cache_step_miss_count),
                 mean_residual,
                 model.normuon_runtime.cache_step_residual_max);
+            if (llmc_normuon_is_cache_inverse_root_tracker_mode(
+                    model.optimizer_config.orthogonalization_mode) &&
+                normuon_tracker_diagnostics_every > 0 &&
+                (step % normuon_tracker_diagnostics_every) == 0) {
+                for (int family_slot = 0;
+                     family_slot < LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT;
+                     ++family_slot) {
+                    const LlmcCacheMuonTrackerDiagnostics& d =
+                        model.normuon_runtime
+                            .cache_tracker_step_diagnostics[family_slot];
+                    if (d.probe_count == 0U) continue;
+                    printf0(
+                        "cachemuon_tracker_diag {\"step\":%d,\"family\":\"%s\","
+                        "\"probe_count\":%llu,\"refresh_count\":%llu,"
+                        "\"r_q_valid_count\":%llu,\"r_q_mean\":%.9g,\"r_q_max\":%.9g,"
+                        "\"relative_motion_valid_count\":%llu,\"relative_motion_mean\":%.9g,\"relative_motion_max\":%.9g,"
+                        "\"solve_relative_residual_valid_count\":%llu,\"solve_relative_residual_mean\":%.9g,\"solve_relative_residual_max\":%.9g,"
+                        "\"spd_trust_valid_count\":%llu,\"spd_trust_mean\":%.9g,\"spd_trust_max\":%.9g,"
+                        "\"antisymmetry_valid_count\":%llu,\"antisymmetry_mean\":%.9g,\"antisymmetry_max\":%.9g,"
+                        "\"refresh_reason_invalid_count\":%llu,"
+                        "\"refresh_reason_nonfinite_count\":%llu,"
+                        "\"refresh_reason_r_q_count\":%llu,"
+                        "\"refresh_reason_malformed_solve_count\":%llu,"
+                        "\"refresh_reason_solve_relative_count\":%llu,"
+                        "\"refresh_reason_relative_motion_count\":%llu,"
+                        "\"refresh_reason_spd_trust_count\":%llu}\n",
+                        step + 1,
+                        family_slot == 0 ? "mlp_wup" : "mlp_wdown",
+                        static_cast<unsigned long long>(d.probe_count),
+                        static_cast<unsigned long long>(d.refresh_count),
+                        static_cast<unsigned long long>(d.r_q_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.r_q_sum, d.r_q_valid_count),
+                        d.r_q_max,
+                        static_cast<unsigned long long>(
+                            d.relative_motion_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.relative_motion_sum,
+                            d.relative_motion_valid_count),
+                        d.relative_motion_max,
+                        static_cast<unsigned long long>(
+                            d.solve_relative_residual_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.solve_relative_residual_sum,
+                            d.solve_relative_residual_valid_count),
+                        d.solve_relative_residual_max,
+                        static_cast<unsigned long long>(d.spd_trust_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.spd_trust_sum, d.spd_trust_valid_count),
+                        d.spd_trust_max,
+                        static_cast<unsigned long long>(d.antisymmetry_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.antisymmetry_sum, d.antisymmetry_valid_count),
+                        d.antisymmetry_max,
+                        static_cast<unsigned long long>(d.refresh_reason_invalid_count),
+                        static_cast<unsigned long long>(d.refresh_reason_nonfinite_count),
+                        static_cast<unsigned long long>(d.refresh_reason_r_q_count),
+                        static_cast<unsigned long long>(d.refresh_reason_malformed_solve_count),
+                        static_cast<unsigned long long>(d.refresh_reason_solve_relative_count),
+                        static_cast<unsigned long long>(d.refresh_reason_relative_motion_count),
+                        static_cast<unsigned long long>(d.refresh_reason_spd_trust_count));
+                }
+                for (size_t diagnostic_index = 0U;
+                     diagnostic_index < model.normuon_runtime
+                         .cache_tracker_step_view_diagnostic_capacity;
+                     ++diagnostic_index) {
+                    const LlmcCacheMuonTrackerViewDiagnostics& d =
+                        model.normuon_runtime
+                            .cache_tracker_step_view_diagnostics[diagnostic_index];
+                    if (!d.valid) continue;
+                    printf0(
+                        "cachemuon_tracker_diag_view {\"step\":%d,"
+                        "\"family\":\"%s\",\"layer\":%d,\"view\":0,"
+                        "\"refreshed\":%s,\"reason_mask\":%u,"
+                        "\"metric_valid_mask\":%u,"
+                        "\"r_q\":%.9g,\"relative_motion\":%.9g,"
+                        "\"solve_relative_residual\":%.9g,"
+                        "\"spd_trust\":%.9g,\"antisymmetry\":%.9g}\n",
+                        step + 1,
+                        d.family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
+                            ? "mlp_wup"
+                            : "mlp_wdown",
+                        d.matrix_index,
+                        d.refreshed ? "true" : "false",
+                        d.refresh_reason_mask,
+                        d.metric_valid_mask,
+                        d.r_q,
+                        d.relative_motion,
+                        d.solve_relative_residual,
+                        d.spd_trust,
+                        d.antisymmetry);
+                }
+            }
         }
         if (model.normuon_runtime.tracker_diagnostics_active_step) {
             for (int diagnostic_slot = 0;
@@ -4349,6 +4519,15 @@ int main(int argc, char *argv[]) {
                     "\"dimension_normalized_skew_max\":%.9g,"
                     "\"correction_frobenius_mean\":%.9g,"
                     "\"correction_frobenius_max\":%.9g,"
+                    "\"correction_guard_probe_count\":%llu,"
+                    "\"correction_raw_frobenius_exact_mean\":%.9g,"
+                    "\"correction_raw_frobenius_exact_max\":%.9g,"
+                    "\"correction_spectral_norm_estimate_mean\":%.9g,"
+                    "\"correction_spectral_norm_estimate_max\":%.9g,"
+                    "\"correction_guard_scale_mean\":%.9g,"
+                    "\"correction_guard_scale_min\":%.9g,"
+                    "\"correction_guard_clipped_count\":%llu,"
+                    "\"correction_guard_clipped_fraction\":%.9g,"
                     "\"refresh_comparison_count\":%llu,"
                      "\"refresh_cosine_mean\":%.9g,"
                      "\"refresh_cosine_min\":%.9g,"
@@ -4388,6 +4567,17 @@ int main(int argc, char *argv[]) {
                     diagnostics.dimension_normalized_skew_max,
                     diagnostics.correction_frobenius_mean,
                     diagnostics.correction_frobenius_max,
+                    static_cast<unsigned long long>(
+                        diagnostics.correction_guard_probe_count),
+                    diagnostics.correction_raw_frobenius_mean,
+                    diagnostics.correction_raw_frobenius_max,
+                    diagnostics.correction_spectral_norm_estimate_mean,
+                    diagnostics.correction_spectral_norm_estimate_max,
+                    diagnostics.correction_guard_scale_mean,
+                    diagnostics.correction_guard_scale_min,
+                    static_cast<unsigned long long>(
+                        diagnostics.correction_guard_clipped_count),
+                    diagnostics.correction_guard_clipped_fraction,
                     static_cast<unsigned long long>(
                         diagnostics.refresh_comparison_count),
                     diagnostics.refresh_cosine_mean,
@@ -4456,6 +4646,11 @@ int main(int argc, char *argv[]) {
                     "\"skew_ratio\":%.9g,"
                     "\"dimension_normalized_skew\":%.9g,"
                     "\"correction_frobenius\":%.9g,"
+                     "\"correction_guard_probed\":%s,"
+                     "\"correction_raw_frobenius_exact\":%.9g,"
+                     "\"correction_spectral_norm_estimate\":%.9g,"
+                     "\"correction_guard_scale\":%.9g,"
+                     "\"correction_guard_clipped\":%s,"
                      "\"refresh_compared\":%s,"
                      "\"refresh_cosine\":%.9g,"
                      "\"refresh_relative_error\":%.9g,"
@@ -4486,6 +4681,11 @@ int main(int argc, char *argv[]) {
                     diagnostics.skew_ratio,
                     diagnostics.dimension_normalized_skew,
                     diagnostics.correction_frobenius,
+                     diagnostics.correction_guard_probed ? "true" : "false",
+                     diagnostics.correction_raw_frobenius,
+                     diagnostics.correction_spectral_norm_estimate,
+                     diagnostics.correction_guard_scale,
+                     diagnostics.correction_guard_clipped ? "true" : "false",
                      diagnostics.refresh_compared ? "true" : "false",
                      diagnostics.refresh_cosine,
                      diagnostics.refresh_relative_error,
@@ -4546,6 +4746,199 @@ int main(int argc, char *argv[]) {
         printf0("cachemuon_mean_residual: %.9g\n", mean_residual);
         printf0("cachemuon_max_residual: %.9g\n",
                 model.normuon_runtime.cache_total_residual_max);
+        if (llmc_normuon_is_cache_inverse_root_tracker_mode(
+                model.optimizer_config.orthogonalization_mode)) {
+            for (int family_slot = 0;
+                 family_slot < LLMC_NORMUON_TRACKER_DIAGNOSTIC_FAMILY_COUNT;
+                 ++family_slot) {
+                const LlmcCacheMuonTrackerDiagnostics& d =
+                    model.normuon_runtime
+                        .cache_tracker_total_diagnostics[family_slot];
+                const char* family = family_slot == 0 ? "mlp_wup" : "mlp_wdown";
+                printf0("cachemuon_tracker_total_%s_probes: %llu\n", family,
+                        static_cast<unsigned long long>(d.probe_count));
+                printf0("cachemuon_tracker_total_%s_refreshes: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_count));
+                printf0("cachemuon_tracker_total_%s_r_q_valid: %llu\n", family,
+                        static_cast<unsigned long long>(d.r_q_valid_count));
+                printf0("cachemuon_tracker_total_%s_r_q_mean: %.9g\n", family,
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.r_q_sum, d.r_q_valid_count));
+                printf0("cachemuon_tracker_total_%s_r_q_max: %.9g\n", family, d.r_q_max);
+                printf0("cachemuon_tracker_total_%s_relative_motion_valid: %llu\n", family,
+                        static_cast<unsigned long long>(
+                            d.relative_motion_valid_count));
+                printf0("cachemuon_tracker_total_%s_relative_motion_mean: %.9g\n", family,
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.relative_motion_sum,
+                            d.relative_motion_valid_count));
+                printf0("cachemuon_tracker_total_%s_relative_motion_max: %.9g\n", family,
+                        d.relative_motion_max);
+                printf0("cachemuon_tracker_total_%s_solve_relative_residual_valid: %llu\n", family,
+                        static_cast<unsigned long long>(
+                            d.solve_relative_residual_valid_count));
+                printf0("cachemuon_tracker_total_%s_solve_relative_residual_mean: %.9g\n", family,
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.solve_relative_residual_sum,
+                            d.solve_relative_residual_valid_count));
+                printf0("cachemuon_tracker_total_%s_solve_relative_residual_max: %.9g\n", family,
+                        d.solve_relative_residual_max);
+                printf0("cachemuon_tracker_total_%s_spd_trust_valid: %llu\n", family,
+                        static_cast<unsigned long long>(d.spd_trust_valid_count));
+                printf0("cachemuon_tracker_total_%s_spd_trust_mean: %.9g\n", family,
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.spd_trust_sum, d.spd_trust_valid_count));
+                printf0("cachemuon_tracker_total_%s_spd_trust_max: %.9g\n", family, d.spd_trust_max);
+                printf0("cachemuon_tracker_total_%s_antisymmetry_valid: %llu\n", family,
+                        static_cast<unsigned long long>(
+                            d.antisymmetry_valid_count));
+                printf0("cachemuon_tracker_total_%s_antisymmetry_mean: %.9g\n", family,
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.antisymmetry_sum, d.antisymmetry_valid_count));
+                printf0("cachemuon_tracker_total_%s_antisymmetry_max: %.9g\n", family,
+                        d.antisymmetry_max);
+                printf0("cachemuon_tracker_total_%s_refresh_reason_invalid_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_invalid_count));
+                printf0("cachemuon_tracker_total_%s_refresh_reason_nonfinite_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_nonfinite_count));
+                printf0("cachemuon_tracker_total_%s_refresh_reason_r_q_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_r_q_count));
+                printf0("cachemuon_tracker_total_%s_refresh_reason_malformed_solve_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_malformed_solve_count));
+                printf0("cachemuon_tracker_total_%s_refresh_reason_solve_relative_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_solve_relative_count));
+                printf0("cachemuon_tracker_total_%s_refresh_reason_relative_motion_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_relative_motion_count));
+                printf0("cachemuon_tracker_total_%s_refresh_reason_spd_trust_count: %llu\n", family,
+                        static_cast<unsigned long long>(d.refresh_reason_spd_trust_count));
+                printf0(
+                    "cachemuon_tracker_total {\"family\":\"%s\","
+                    "\"probe_count\":%llu,\"refresh_count\":%llu,"
+                    "\"r_q_valid_count\":%llu,\"r_q_mean\":%.9g,\"r_q_max\":%.9g,"
+                    "\"relative_motion_valid_count\":%llu,\"relative_motion_mean\":%.9g,\"relative_motion_max\":%.9g,"
+                    "\"solve_relative_residual_valid_count\":%llu,\"solve_relative_residual_mean\":%.9g,"
+                    "\"solve_relative_residual_max\":%.9g,"
+                    "\"spd_trust_valid_count\":%llu,\"spd_trust_mean\":%.9g,\"spd_trust_max\":%.9g,"
+                    "\"antisymmetry_valid_count\":%llu,\"antisymmetry_mean\":%.9g,\"antisymmetry_max\":%.9g,"
+                    "\"refresh_reason_invalid_count\":%llu,"
+                    "\"refresh_reason_nonfinite_count\":%llu,"
+                    "\"refresh_reason_r_q_count\":%llu,"
+                    "\"refresh_reason_malformed_solve_count\":%llu,"
+                    "\"refresh_reason_solve_relative_count\":%llu,"
+                    "\"refresh_reason_relative_motion_count\":%llu,"
+                    "\"refresh_reason_spd_trust_count\":%llu}\n",
+                    family,
+                    static_cast<unsigned long long>(d.probe_count),
+                    static_cast<unsigned long long>(d.refresh_count),
+                    static_cast<unsigned long long>(d.r_q_valid_count),
+                    llmc_cachemuon_tracker_metric_mean(
+                        d.r_q_sum, d.r_q_valid_count),
+                    d.r_q_max,
+                    static_cast<unsigned long long>(
+                        d.relative_motion_valid_count),
+                    llmc_cachemuon_tracker_metric_mean(
+                        d.relative_motion_sum, d.relative_motion_valid_count),
+                    d.relative_motion_max,
+                    static_cast<unsigned long long>(
+                        d.solve_relative_residual_valid_count),
+                    llmc_cachemuon_tracker_metric_mean(
+                        d.solve_relative_residual_sum,
+                        d.solve_relative_residual_valid_count),
+                    d.solve_relative_residual_max,
+                    static_cast<unsigned long long>(d.spd_trust_valid_count),
+                    llmc_cachemuon_tracker_metric_mean(
+                        d.spd_trust_sum, d.spd_trust_valid_count),
+                    d.spd_trust_max,
+                    static_cast<unsigned long long>(d.antisymmetry_valid_count),
+                    llmc_cachemuon_tracker_metric_mean(
+                        d.antisymmetry_sum, d.antisymmetry_valid_count),
+                    d.antisymmetry_max,
+                    static_cast<unsigned long long>(d.refresh_reason_invalid_count),
+                    static_cast<unsigned long long>(d.refresh_reason_nonfinite_count),
+                    static_cast<unsigned long long>(d.refresh_reason_r_q_count),
+                    static_cast<unsigned long long>(d.refresh_reason_malformed_solve_count),
+                    static_cast<unsigned long long>(d.refresh_reason_solve_relative_count),
+                    static_cast<unsigned long long>(d.refresh_reason_relative_motion_count),
+                    static_cast<unsigned long long>(d.refresh_reason_spd_trust_count));
+            }
+            if (model.normuon_runtime.cache_tracker_total_view_diagnostics !=
+                nullptr) {
+                for (size_t diagnostic_index = 0U;
+                     diagnostic_index < model.normuon_runtime
+                         .cache_tracker_step_view_diagnostic_capacity;
+                     ++diagnostic_index) {
+                    const LlmcCacheMuonTrackerDiagnostics& d =
+                        model.normuon_runtime
+                            .cache_tracker_total_view_diagnostics[
+                                diagnostic_index];
+                    if (d.probe_count == 0U) continue;
+                    const bool wdown = diagnostic_index >=
+                        model.normuon_runtime.batch_matrix_capacity;
+                    const size_t layer = diagnostic_index -
+                        (wdown ? model.normuon_runtime.batch_matrix_capacity
+                               : 0U);
+                    printf0(
+                        "cachemuon_tracker_total_view {\"family\":\"%s\","
+                        "\"layer\":%zu,\"view\":0,"
+                        "\"probe_count\":%llu,\"refresh_count\":%llu,"
+                        "\"r_q_valid_count\":%llu,\"r_q_mean\":%.9g,\"r_q_max\":%.9g,"
+                        "\"relative_motion_valid_count\":%llu,\"relative_motion_mean\":%.9g,\"relative_motion_max\":%.9g,"
+                        "\"solve_relative_residual_valid_count\":%llu,\"solve_relative_residual_mean\":%.9g,\"solve_relative_residual_max\":%.9g,"
+                        "\"spd_trust_valid_count\":%llu,\"spd_trust_mean\":%.9g,\"spd_trust_max\":%.9g,"
+                        "\"antisymmetry_valid_count\":%llu,\"antisymmetry_mean\":%.9g,\"antisymmetry_max\":%.9g,"
+                        "\"refresh_reason_invalid_count\":%llu,"
+                        "\"refresh_reason_nonfinite_count\":%llu,"
+                        "\"refresh_reason_r_q_count\":%llu,"
+                        "\"refresh_reason_malformed_solve_count\":%llu,"
+                        "\"refresh_reason_solve_relative_count\":%llu,"
+                        "\"refresh_reason_relative_motion_count\":%llu,"
+                        "\"refresh_reason_spd_trust_count\":%llu}\n",
+                        wdown ? "mlp_wdown" : "mlp_wup",
+                        layer,
+                        static_cast<unsigned long long>(d.probe_count),
+                        static_cast<unsigned long long>(d.refresh_count),
+                        static_cast<unsigned long long>(d.r_q_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.r_q_sum, d.r_q_valid_count),
+                        d.r_q_max,
+                        static_cast<unsigned long long>(
+                            d.relative_motion_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.relative_motion_sum,
+                            d.relative_motion_valid_count),
+                        d.relative_motion_max,
+                        static_cast<unsigned long long>(
+                            d.solve_relative_residual_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.solve_relative_residual_sum,
+                            d.solve_relative_residual_valid_count),
+                        d.solve_relative_residual_max,
+                        static_cast<unsigned long long>(d.spd_trust_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.spd_trust_sum, d.spd_trust_valid_count),
+                        d.spd_trust_max,
+                        static_cast<unsigned long long>(
+                            d.antisymmetry_valid_count),
+                        llmc_cachemuon_tracker_metric_mean(
+                            d.antisymmetry_sum, d.antisymmetry_valid_count),
+                        d.antisymmetry_max,
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_invalid_count),
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_nonfinite_count),
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_r_q_count),
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_malformed_solve_count),
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_solve_relative_count),
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_relative_motion_count),
+                        static_cast<unsigned long long>(
+                            d.refresh_reason_spd_trust_count));
+                }
+            }
+        }
     }
     if (model.optimizer_config.tracker_refresh_mode ==
         LLMC_NORMUON_TRACKER_REFRESH_ADAPTIVE_MEAN_SKEW) {

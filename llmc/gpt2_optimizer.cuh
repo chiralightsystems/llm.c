@@ -420,6 +420,19 @@ void gpt2_update(
         model->normuon_runtime.cache_step_miss_count = 0U;
         model->normuon_runtime.cache_step_residual_sum = 0.0;
         model->normuon_runtime.cache_step_residual_max = 0.0f;
+        memset(
+            model->normuon_runtime.cache_tracker_step_diagnostics,
+            0,
+            sizeof(model->normuon_runtime.cache_tracker_step_diagnostics));
+        if (model->normuon_runtime.cache_tracker_step_view_diagnostics !=
+            nullptr) {
+            memset(
+                model->normuon_runtime.cache_tracker_step_view_diagnostics,
+                0,
+                model->normuon_runtime
+                        .cache_tracker_step_view_diagnostic_capacity *
+                    sizeof(LlmcCacheMuonTrackerViewDiagnostics));
+        }
     }
     if (uses_normuon && llmc_normuon_is_tracker_mode(
             model->optimizer_config.orthogonalization_mode)) {
