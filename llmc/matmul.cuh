@@ -9,6 +9,7 @@ Matrix Multiplication, with help from cuBLASLt
 #include "cublas_common.h"
 // GELU can be either fused (cublasLt) or non-fused (gelu.h)
 #include "gelu.cuh"
+#include "mlp_activation.cuh"
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -245,7 +246,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      float* dbias_buffer,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     floatX* pre_gelu=NULL, int gelu_fusion=1, float* dinp_fp32=NULL) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -276,8 +277,13 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
-    matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu : NULL, true);
+    if (dinp_fp32 != NULL) {
+        assert(pre_gelu == NULL);
+        llmc_mlp_gemm_fp32(dinp_fp32, weight, dout, C, B*T, OC, false, stream);
+    } else {
+        matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
+                        gelu_fusion >= 2 ? pre_gelu : NULL, true);
+    }
 
     // backward GELU (if it wasn't fused into the matmul above)
     if (gelu_fusion < 2 && pre_gelu) {

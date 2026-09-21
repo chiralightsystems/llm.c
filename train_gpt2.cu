@@ -398,7 +398,7 @@ struct TensorSpec {
 
 #define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
 
-void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
+void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute, bool fp32_mlp=false) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -421,7 +421,9 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
     tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    // Custom FP32 activation replays the full input GEMM, not saved BF16
+    // preactivations. Keep one legacy-sized panel for non-cuDNN attention scratch.
+    tensors[10] = TENSOR_SPEC(data->fch, (fp32_mlp ? 1 : L) * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
     tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
@@ -537,6 +539,9 @@ typedef struct {
     int use_master_weights; // keep master weights copy in float for optim update? 0|1
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
+    int mlp_activation; // declared, checkpoint-bound pointwise MLP policy
+    float* mlp_preact_fp32; // one shared full-precision GEMM+bias replay panel
+    float* mlp_dact_fp32; // one shared full-precision dH panel
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
@@ -592,6 +597,9 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->mlp_activation = LLMC_MLP_GELU;
+    model->mlp_preact_fp32 = nullptr;
+    model->mlp_dact_fp32 = nullptr;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -633,10 +641,21 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     model->seq_len = T;
 
     // allocate the space
-    fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute);
+    fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute,
+        llmc_mlp_activation_is_custom(model->mlp_activation));
     model->acts_memory_bytes =
         activation_allocation_bytes(model->acts_specs);
     model->acts_memory = malloc_and_point_activations(model->acts_specs);
+    if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+        if (model->gelu_fusion != 0) {
+            fprintf(stderr, "Custom MLP activation requires -ge 0; fused GELU cannot implement this activation\n");
+            exit(EXIT_FAILURE);
+        }
+        const size_t bytes = size_t(B) * T * 4 * model->config.channels * sizeof(float);
+        cudaCheck(cudaMalloc(&model->mlp_preact_fp32, bytes));
+        cudaCheck(cudaMalloc(&model->mlp_dact_fp32, bytes));
+        printf0("mlp_fp32_scratch_bytes: %zu\n", 2 * bytes);
+    }
     // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -717,6 +736,10 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // report on mixed memory allocation status (re-using our float reduce function, bit awk ok)
     int reduced_memory_status = (int) multi_gpu_cpu_float_sum((float)memory_status, &multi_gpu_config);
     if (reduced_memory_status >= 1) {
+        if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+            fprintf(stderr, "Custom MLP device allocation admission failed: managed-memory fallback forbidden\n");
+            exit(EXIT_FAILURE);
+        }
         printf0("WARNING: Fell back to cudaMallocManaged when initializing m,v,master_weights on %d GPUs\n", reduced_memory_status);
         printf0("         Prevents an OOM, but code may run much slower due to device <-> host memory movement\n");
     }
@@ -846,6 +869,11 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
         llmc_checkpoint_store_u64(
             model_header, 16, (uint64_t)model->num_parameters);
     }
+    if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+        llmc_store_mlp_contract(model_header, 18, model_header[1], model->mlp_activation);
+        model_header[1] = PRECISION_MODE == PRECISION_FP32
+            ? LLMC_MODEL_VERSION_FP32_MLP_ACTIVATION : LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION;
+    }
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
@@ -874,6 +902,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
+    model->mlp_activation = LLMC_MLP_GELU;
+    if (version == LLMC_MODEL_VERSION_FP32_MLP_ACTIVATION ||
+        version == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION) {
+        if (!llmc_valid_mlp_contract(model_header, 18) ||
+            (version == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION) !=
+                llmc_model_version_is_bf16(model_header[18])) {
+            fprintf(stderr, "Invalid custom MLP checkpoint formula/precision contract\n");
+            exit(EXIT_FAILURE);
+        }
+        model->mlp_activation = model_header[19];
+        version = model_header[18];
+    }
     if (!(version == LLMC_MODEL_VERSION_FP32_ABSOLUTE ||
           version == LLMC_MODEL_VERSION_BF16_ABSOLUTE ||
           version == LLMC_MODEL_VERSION_FP32_ROPE ||
@@ -1130,6 +1170,8 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     gpt2_set_initializer_defaults(config);
 }
 
+void gpt2_initialize_weights(GPT2 *model);
+
 void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
@@ -1161,7 +1203,10 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
     gpt2_allocate_weights(model);
+    gpt2_initialize_weights(model);
+}
 
+void gpt2_initialize_weights(GPT2 *model) {
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
@@ -1294,6 +1339,12 @@ void gpt2_forward(
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
     }
+    if (model->mlp_activation != LLMC_MLP_GELU &&
+        (!llmc_mlp_activation_is_custom(model->mlp_activation) ||
+         model->gelu_fusion != 0 || model->mlp_preact_fp32 == nullptr)) {
+        fprintf(stderr, "Custom MLP requires its declared FP32 scratch and unfused activation path\n");
+        exit(EXIT_FAILURE);
+    }
 
     // convenience parameters
     const size_t V = model->config.vocab_size;
@@ -1380,7 +1431,7 @@ void gpt2_forward(
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch = acts.fch + (model->mlp_activation == LLMC_MLP_GELU ? l * B * T * 4*C : 0);
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
@@ -1433,7 +1484,12 @@ void gpt2_forward(
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         #endif
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+            llmc_mlp_activation_forward(l_fch_gelu, model->mlp_preact_fp32, l_ln2,
+                l_fcw, l_fcb, B*T, C, 4*C, model->mlp_activation, main_stream);
+        } else {
+            matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        }
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
@@ -1707,7 +1763,7 @@ void gpt2_backward_and_reduce(
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
+        floatX* l_fch_pre_gelu = acts.fch + (model->mlp_activation == LLMC_MLP_GELU ? l * B * T * 4*C : 0);
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
@@ -1716,6 +1772,18 @@ void gpt2_backward_and_reduce(
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
+        if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+            // Always replay the same full FP32 GEMM+bias, even for -r 0.
+            // Replaying a saved BF16 auxiliary would change the derivative.
+            if (model->recompute >= 2)
+                layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            llmc_mlp_activation_forward(l_fch_gelu, model->mlp_preact_fp32, l_ln2,
+                l_fcw, params.fcb + l * 4*C, B*T, C, 4*C, model->mlp_activation, main_stream);
+            matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
+                l_fcprojw, scratchF, B,T,4*C,C,main_stream,nullptr,0,model->mlp_dact_fp32);
+            llmc_mlp_activation_backward(dl_bt4c, model->mlp_dact_fp32, model->mlp_preact_fp32,
+                size_t(B)*T*4*C, model->mlp_activation, main_stream);
+        } else {
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
@@ -1725,6 +1793,7 @@ void gpt2_backward_and_reduce(
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+        }
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -2006,6 +2075,8 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->v_memory);
     cudaFreeCheck(&model->master_weights);
     cudaFreeCheck(&model->acts_memory);
+    cudaFreeCheck(&model->mlp_preact_fp32);
+    cudaFreeCheck(&model->mlp_dact_fp32);
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
     cudaFreeCheck(&model->accumulated_mean_loss);
@@ -2079,6 +2150,10 @@ void save_state(
                : (use_rope
                       ? LLMC_OPTIMIZER_STATE_VERSION_ROPE
                       : LLMC_OPTIMIZER_STATE_VERSION_ABSOLUTE));
+    if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+        llmc_store_mlp_contract(state_header, 44, state_header[1], model->mlp_activation);
+        state_header[1] = LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION;
+    }
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
@@ -2161,7 +2236,14 @@ void load_state(
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
     assert(state_header[0] == 20240527); // magic number
-    const int state_version = state_header[1];
+    int state_version = state_header[1];
+    const bool custom_mlp_state = state_version == LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION;
+    if (custom_mlp_state != llmc_mlp_activation_is_custom(model->mlp_activation) ||
+        (custom_mlp_state && !llmc_mlp_contract_matches(state_header, 44, model->mlp_activation))) {
+        fprintf(stderr, "Optimizer state/model MLP activation or numerical contract mismatch\n");
+        exit(EXIT_FAILURE);
+    }
+    if (custom_mlp_state) state_version = state_header[44];
     if (!(state_version == LLMC_OPTIMIZER_STATE_VERSION_ABSOLUTE ||
           state_version == LLMC_OPTIMIZER_STATE_VERSION_ROPE ||
           state_version == LLMC_OPTIMIZER_STATE_VERSION_BRIDGED_ROPE ||
@@ -2535,6 +2617,8 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    fprintf(stderr, "  -ma <str>   MLP activation: gelu (default), swish_power125_k8, swish, relu_squared, swish_power2_k8 (custom requires -ge 0)\n");
+    fprintf(stderr, "  -pa <int>   zero-update allocation/forward/backward preflight, no checkpoint (0|1, default 0)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -2631,6 +2715,9 @@ int main(int argc, char *argv[]) {
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
+    int mlp_activation = LLMC_MLP_GELU;
+    bool mlp_activation_explicit = false;
+    int allocation_preflight = 0;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
@@ -2681,6 +2768,22 @@ int main(int argc, char *argv[]) {
         }
         if (strcmp(argv[i], "-mt") == 0) {
             model_max_sequence_length_override = atoi(argv[i+1]);
+            continue;
+        }
+        // Parse new multi-letter options before legacy single-letter prefixes.
+        // In particular -ma must never become atoi("swish_power125_k8") for -m.
+        if (strcmp(argv[i], "-ma") == 0) {
+            if (!llmc_parse_mlp_activation(argv[i+1], &mlp_activation)) {
+                fprintf(stderr, "Unknown -ma activation: %s\n", argv[i+1]); exit(EXIT_FAILURE);
+            }
+            mlp_activation_explicit = true;
+            continue;
+        }
+        if (strcmp(argv[i], "-pa") == 0) {
+            if (strcmp(argv[i+1], "0") && strcmp(argv[i+1], "1")) {
+                fprintf(stderr, "-pa expects exactly 0 or 1\n"); exit(EXIT_FAILURE);
+            }
+            allocation_preflight = atoi(argv[i+1]);
             continue;
         }
         // read in the args
@@ -2793,7 +2896,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (strcmp(argv[i], "-m") == 0) { val_max_steps = atoi(argv[i+1]); }
         else if (strcmp(argv[i], "-sh") == 0) { train_shuffle = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
@@ -3286,8 +3389,45 @@ int main(int argc, char *argv[]) {
         }
     }
     model.use_master_weights = use_master_weights;
+    if (mlp_activation_explicit) {
+        if (model.mlp_activation != LLMC_MLP_GELU && model.mlp_activation != mlp_activation) {
+            fprintf(stderr, "Explicit -ma conflicts with checkpoint-bound activation\n");
+            exit(EXIT_FAILURE);
+        }
+        model.mlp_activation = mlp_activation;
+    }
+    if (llmc_mlp_activation_is_custom(model.mlp_activation) && gelu_fusion != 0) {
+        fprintf(stderr, "%s requires -ge 0; no silent numerical-path override\n",
+            llmc_mlp_activation_name(model.mlp_activation));
+        exit(EXIT_FAILURE);
+    }
+    if (allocation_preflight && resuming) {
+        fprintf(stderr, "Allocation preflight requires a direct cold source, not resume\n");
+        exit(EXIT_FAILURE);
+    }
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
+    printf0("mlp_activation: %s\n", llmc_mlp_activation_name(model.mlp_activation));
+    printf0("mlp_activation_numerics: %s\n", llmc_mlp_activation_is_custom(model.mlp_activation)
+        ? "fp32_gemm_bias_activation_bf16_output" : "historical_gelu");
+    if (model.mlp_activation == LLMC_MLP_SWISH_POWER125_K8) {
+        printf0("mlp_activation_formula: x*sigmoid(x)*(1+softplus(8*(x-1))/8)^(1/4)\n");
+        printf0("mlp_activation_parameters: p=1.25 k=8 transition=1 swish_beta=1\n");
+    } else if (model.mlp_activation == LLMC_MLP_SWISH) {
+        printf0("mlp_activation_formula: x*sigmoid(x)\n");
+        printf0("mlp_activation_parameters: swish_beta=1\n");
+    } else if (model.mlp_activation == LLMC_MLP_RELU_SQUARED) {
+        printf0("mlp_activation_formula: max(0,x)^2\n");
+        printf0("mlp_activation_parameters: exponent=2\n");
+        printf0("mlp_activation_derivative_at_zero: 0\n");
+    } else if (model.mlp_activation == LLMC_MLP_SWISH_POWER2_K8) {
+        printf0("mlp_activation_formula: x*sigmoid(x)*(1+softplus(8*(x-1))/8)\n");
+        printf0("mlp_activation_parameters: p=2 k=8 transition=1 swish_beta=1\n");
+    }
+    if (llmc_mlp_activation_is_custom(model.mlp_activation)) {
+        printf0("mlp_activation_backward: fp32_dH_times_derivative_of_fp32_replayed_preact_then_bf16\n");
+        printf0("mlp_activation_recompute: full_input_gemm_fp32_bias_activation\n");
+    }
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
@@ -3862,7 +4002,25 @@ int main(int argc, char *argv[]) {
     size_t peak_device_memory_used_bytes = 0U;
     double total_optimizer_time_ms = 0.0;
     int completed_optimizer_steps = 0;
-    for (; step <= train_num_batches; step++) {
+    bool nonfinite_stopped = false;
+    if (allocation_preflight) {
+        // Admit lazy attention workspace and real backward kernels in addition
+        // to parameters, optimizer buffers, master weights and MLP scratch.
+        // No optimizer update or checkpoint, and this process must terminate.
+        dataloader_next_batch(&train_loader);
+        gpt2_forward(&model, train_loader.inputs, B, T);
+        gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, 1, 0, mask_sequence_final_target);
+        const float preflight_grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+        cudaCheck(cudaDeviceSynchronize());
+        size_t free_bytes, total_bytes;
+        cudaCheck(cudaMemGetInfo(&free_bytes, &total_bytes));
+        nonfinite_stopped = !isfinite(model.mean_loss) || !isfinite(preflight_grad_norm);
+        printf0("llmc_allocation_preflight: {\"status\":\"%s\",\"optimizer_steps\":0,\"checkpoint_saved\":0,\"batch\":%d,\"sequence_length\":%d,\"memory_used_bytes\":%zu,\"mlp_activation\":\"%s\",\"loss\":\"%.9g\",\"grad_norm\":\"%.9g\"}\n",
+            nonfinite_stopped ? "nonfinite" : "passed",B,T,total_bytes-free_bytes,
+            llmc_mlp_activation_name(model.mlp_activation),model.mean_loss,preflight_grad_norm);
+        fflush(stdout);
+    }
+    for (; !allocation_preflight && step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
         int last_step = step == train_num_batches;
@@ -4142,6 +4300,26 @@ int main(int argc, char *argv[]) {
         float batch_replay_sample_plus_parameter = 0.0f;
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+        if (!isfinite(model.mean_loss) || !isfinite(grad_norm)) {
+            // Test before any optimizer mutation, not after a poisoned update.
+            // Retain earlier checkpoints and never advance/retry this step.
+            char guard_json[1024];
+            snprintf(guard_json, sizeof(guard_json),
+                "{\"status\":\"nonfinite\",\"step\":%d,\"completed_optimizer_steps\":%d,\"optimizer_step_applied\":false,\"loss_finite\":%s,\"grad_norm_finite\":%s,\"loss\":\"%.9g\",\"grad_norm\":\"%.9g\",\"mlp_activation\":\"%s\"}",
+                step+1,completed_optimizer_steps,isfinite(model.mean_loss)?"true":"false",
+                isfinite(grad_norm)?"true":"false",model.mean_loss,grad_norm,
+                llmc_mlp_activation_name(model.mlp_activation));
+            printf0("llmc_nonfinite_guard: %s\n",guard_json);
+            if (output_log_dir != nullptr && multi_gpu_config.process_rank == 0) {
+                const std::string path = std::string(output_log_dir) + "/nonfinite_guard.json";
+                FILE* receipt = fopenCheck(path.c_str(), "wx");
+                fprintf(receipt, "%s\n", guard_json);
+                fcloseCheck(receipt);
+            }
+            fflush(stdout); fflush(stderr);
+            nonfinite_stopped = true;
+            break;
+        }
         float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
         // update the model parameters
         if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
@@ -5069,6 +5247,6 @@ int main(int argc, char *argv[]) {
     multi_gpu_config_free(&multi_gpu_config);
     gpt2_free(&model);
     common_free(model);
-    return 0;
+    return nonfinite_stopped ? 3 : 0;
 }
 #endif

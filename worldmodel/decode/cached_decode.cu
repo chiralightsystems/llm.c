@@ -197,6 +197,8 @@ struct Decode {
         fch((size_t)B*4*C), gelu((size_t)B*4*C), logits((size_t)B*Vp),
         key((size_t)L*B*capacity*C), value((size_t)L*B*capacity*C),
         mean(B), rstd(B), tokens(B), history((size_t)B*steps), positions(B), lengths(B), status(1) {
+        require(model.mlp_activation == LLMC_MLP_GELU,
+            "Cached decode supports GELU only; custom MLP checkpoints require their declared FP32 activation path");
         require(C%8==0 && C/H==64 && E%8==0, "Unsupported decode vector/head geometry");
         require(llmc_cached_attention_create(&attention, B, H, C/H, capacity, main_stream, error), error);
         auto p = model.params;
