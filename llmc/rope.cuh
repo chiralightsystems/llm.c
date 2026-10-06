@@ -188,7 +188,8 @@ __global__ void llmc_rope_apply_qk_kernel(
         int num_heads,
         int head_dim,
         int rotary_dim,
-        size_t work_items) {
+        size_t work_items,
+        const int32_t* local_positions = nullptr) {
     const size_t rotary_pairs = (size_t)rotary_dim / 2U;
     for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          index < work_items;
@@ -208,7 +209,8 @@ __global__ void llmc_rope_apply_qk_kernel(
         const size_t pair_offset = (size_t)(2 * pair);
         const size_t q_index = token_offset + head_offset + pair_offset;
         const size_t k_index = q_index + (size_t)channels;
-        const float2 phase = cos_sin[(size_t)position * rotary_pairs + pair];
+        const int phase_position = local_positions ? local_positions[(size_t)batch * sequence_length + position] : position;
+        const float2 phase = cos_sin[(size_t)phase_position * rotary_pairs + pair];
 
         const float q0 = (float)qkv[q_index];
         const float q1 = (float)qkv[q_index + 1U];
@@ -236,7 +238,8 @@ inline bool llmc_rope_apply_qk_impl(
         int sequence_length,
         int channels,
         int num_heads,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const int32_t* local_positions = nullptr) {
     if (qkv == nullptr || cache == nullptr || cache->cos_sin == nullptr ||
         cache->owner_stream != stream ||
         batch_size <= 0 || sequence_length <= 0 ||
@@ -275,7 +278,8 @@ inline bool llmc_rope_apply_qk_impl(
         num_heads,
         head_dim,
         cache->rotary_dim,
-        work_items);
+        work_items,
+        local_positions);
     cudaCheck(cudaGetLastError());
     return true;
 }

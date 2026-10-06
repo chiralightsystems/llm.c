@@ -46,6 +46,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/cuda_utils.cuh"
 // defines: LlmcRopeCache, llmc_rope_cache_*, llmc_rope_apply_qk_*
 #include "llmc/rope.cuh"
+#include "llmc/eos_boundary.cuh"
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
 #include "llmc/cublas_common.h"
@@ -504,6 +505,11 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
 typedef struct {
     GPT2Config config;
     LlmcRopeCache rope_cache;
+    int attention_boundary_policy;
+    int eos_token_id;
+#ifdef ENABLE_CUDNN
+    LlmcEosAttention* eos_attention;
+#endif
     // the weights of the model, and their sizes
     ParameterTensors params;
     size_t param_elements[NUM_PARAMETER_TENSORS];
@@ -600,6 +606,11 @@ void gpt2_init_common(GPT2 *model) {
     model->mlp_activation = LLMC_MLP_GELU;
     model->mlp_preact_fp32 = nullptr;
     model->mlp_dact_fp32 = nullptr;
+    model->attention_boundary_policy = LLMC_ATTENTION_ROW_CAUSAL;
+    model->eos_token_id = -1;
+#ifdef ENABLE_CUDNN
+    model->eos_attention = nullptr;
+#endif
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -736,12 +747,21 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // report on mixed memory allocation status (re-using our float reduce function, bit awk ok)
     int reduced_memory_status = (int) multi_gpu_cpu_float_sum((float)memory_status, &multi_gpu_config);
     if (reduced_memory_status >= 1) {
-        if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+        if (llmc_mlp_activation_is_custom(model->mlp_activation) ||
+            model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
             fprintf(stderr, "Custom MLP device allocation admission failed: managed-memory fallback forbidden\n");
             exit(EXIT_FAILURE);
         }
         printf0("WARNING: Fell back to cudaMallocManaged when initializing m,v,master_weights on %d GPUs\n", reduced_memory_status);
         printf0("         Prevents an OOM, but code may run much slower due to device <-> host memory movement\n");
+    }
+    if (model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
+#ifdef ENABLE_CUDNN
+        model->eos_attention = llmc_eos_attention_create(B,T,model->config.num_heads,
+            model->config.channels,main_stream,llmc_eos_copy_stats_cuda,llmc_eos_relayout_qkv_cuda);
+#else
+        fprintf(stderr,"EOS isolation requires the cuDNN backend\n"); exit(EXIT_FAILURE);
+#endif
     }
     // report on device memory usage
     size_t free, total;
@@ -874,6 +894,10 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
         model_header[1] = PRECISION_MODE == PRECISION_FP32
             ? LLMC_MODEL_VERSION_FP32_MLP_ACTIVATION : LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION;
     }
+    if (model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
+        llmc_store_eos_contract(model_header,model_header[1],model->eos_token_id);
+        model_header[1] = PRECISION_MODE == PRECISION_FP32 ? LLMC_MODEL_VERSION_FP32_EOS : LLMC_MODEL_VERSION_BF16_EOS;
+    }
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
@@ -902,6 +926,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
+    model->attention_boundary_policy = LLMC_ATTENTION_ROW_CAUSAL;
+    model->eos_token_id = -1;
+    if (version == LLMC_MODEL_VERSION_FP32_EOS || version == LLMC_MODEL_VERSION_BF16_EOS) {
+        const int base = model_header[64];
+        const bool base_bf16 = base == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION || llmc_model_version_is_bf16(base);
+        if (!llmc_valid_eos_contract(model_header,model_header[3]) ||
+            (version == LLMC_MODEL_VERSION_BF16_EOS) != base_bf16 ||
+            base == LLMC_MODEL_VERSION_FP32_EOS || base == LLMC_MODEL_VERSION_BF16_EOS) {
+            fprintf(stderr,"Invalid EOS model contract\n"); exit(EXIT_FAILURE);
+        }
+        model->attention_boundary_policy=model_header[66];model->eos_token_id=model_header[67];version=base;
+    }
     model->mlp_activation = LLMC_MLP_GELU;
     if (version == LLMC_MODEL_VERSION_FP32_MLP_ACTIVATION ||
         version == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION) {
@@ -990,6 +1026,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     if (!gpt2_validate_position_config(&model->config)) {
         fprintf(stderr, "Invalid position encoding or initializer metadata in model checkpoint\n");
         exit(EXIT_FAILURE);
+    }
+    if (model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS &&
+        (model->config.position_encoding != LLMC_POSITION_ENCODING_ROPE ||
+         model->config.rope_lowest_frequency_plane_is_dc)) {
+        fprintf(stderr,"EOS checkpoint requires standard RoPE\n");exit(EXIT_FAILURE);
     }
 
     // allocate memory for the model parameters
@@ -1308,13 +1349,17 @@ void gpt2_apply_rope_or_exit(
     if (model->config.position_encoding != LLMC_POSITION_ENCODING_ROPE) {
         return;
     }
+    const int32_t* local_positions = nullptr;
+#ifdef ENABLE_CUDNN
+    local_positions = llmc_eos_attention_positions(model->eos_attention);
+#endif
     const bool ok = backward
-        ? llmc_rope_apply_qk_backward(
+        ? llmc_rope_apply_qk_impl<true>(
               qkv, &model->rope_cache, (int)B, (int)T, (int)C, (int)NH,
-              main_stream)
-        : llmc_rope_apply_qk(
+              main_stream,local_positions)
+        : llmc_rope_apply_qk_impl<false>(
               qkv, &model->rope_cache, (int)B, (int)T, (int)C, (int)NH,
-              main_stream);
+              main_stream,local_positions);
     if (!ok) {
         fprintf(stderr, "Invalid RoPE runtime shape or uninitialized phase cache\n");
         exit(EXIT_FAILURE);
@@ -1334,6 +1379,16 @@ void gpt2_forward(
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
+    if(model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
+#ifdef ENABLE_CUDNN
+        if(validation_attention_blackout_width || validation_attention_disabled) {
+            fprintf(stderr,"EOS isolation does not admit blackout/attention-off\n");exit(EXIT_FAILURE);
+        }
+        llmc_eos_attention_prepare(model->eos_attention,inputs,(int)B,(int)T,model->eos_token_id,main_stream);
+#else
+        fprintf(stderr,"EOS isolation requires cuDNN\n");exit(EXIT_FAILURE);
+#endif
+    }
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
@@ -1444,7 +1499,9 @@ void gpt2_forward(
         if (!validation_attention_disabled) {
             matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
             gpt2_apply_rope_or_exit(model, l_qkvr, B, T, C, NH, false);
-            if (validation_attention_blackout_width > 0) {
+            if (model->eos_attention) {
+                llmc_eos_attention_forward(model->eos_attention,l_atty,l_att,l_qkvr,main_stream);
+            } else if (validation_attention_blackout_width > 0) {
                 attention_forward_cudnn_recent_blackout(
                     l_atty,
                     l_qkvr,
@@ -1802,7 +1859,11 @@ void gpt2_backward_and_reduce(
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
+        if (model->eos_attention) {
+            llmc_eos_attention_backward(model->eos_attention,dl_bt4c,dl_btc,l_qkvr,l_atty,(float*)l_att,main_stream);
+        } else {
+            attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
+        }
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
@@ -2067,6 +2128,10 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 }
 
 void gpt2_free(GPT2 *model) {
+#ifdef ENABLE_CUDNN
+    llmc_eos_attention_destroy(model->eos_attention);
+    model->eos_attention=nullptr;
+#endif
     llmc_normuon_runtime_free(&model->normuon_runtime);
     llmc_rope_cache_free(&model->rope_cache);
     cudaFreeCheck(&model->params_memory);
@@ -2154,6 +2219,10 @@ void save_state(
         llmc_store_mlp_contract(state_header, 44, state_header[1], model->mlp_activation);
         state_header[1] = LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION;
     }
+    if (model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
+        llmc_store_eos_contract(state_header,state_header[1],model->eos_token_id);
+        state_header[1] = LLMC_OPTIMIZER_STATE_VERSION_EOS;
+    }
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
@@ -2237,6 +2306,12 @@ void load_state(
     freadCheck(state_header, sizeof(int), 256, state_file);
     assert(state_header[0] == 20240527); // magic number
     int state_version = state_header[1];
+    const bool eos_state = state_version == LLMC_OPTIMIZER_STATE_VERSION_EOS;
+    if (!llmc_eos_contract_matches(state_header,eos_state,model->attention_boundary_policy,
+            model->eos_token_id,model->config.vocab_size)) {
+        fprintf(stderr,"Optimizer state/model EOS attention contract mismatch\n");exit(EXIT_FAILURE);
+    }
+    if(eos_state) state_version=state_header[64];
     const bool custom_mlp_state = state_version == LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION;
     if (custom_mlp_state != llmc_mlp_activation_is_custom(model->mlp_activation) ||
         (custom_mlp_state && !llmc_mlp_contract_matches(state_header, 44, model->mlp_activation))) {
@@ -2545,6 +2620,8 @@ void error_usage() {
     fprintf(stderr, "  -mt <int>   eval-only RoPE checkpoint max-sequence override (default = 0; use checkpoint value)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     fprintf(stderr, "  -bp <string> sequence boundary: flat_stream|row_reset (default = flat_stream)\n");
+    fprintf(stderr, "  -ab <string> attention boundary: row_causal_v1|isolate_segments_v1 (default = row_causal_v1)\n");
+    fprintf(stderr, "  -ei <int> EOS input token id; required with isolated attention (default = -1)\n");
     fprintf(stderr, "  -sh <int>   train data shuffle: 0=sequential, 1=shuffle (raw default = 1)\n");
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
@@ -2688,6 +2765,8 @@ int main(int argc, char *argv[]) {
     int model_max_sequence_length_override = 0;
     LlmcSequenceBoundaryPolicy sequence_boundary_policy =
         LLMC_SEQUENCE_BOUNDARY_FLAT_STREAM;
+    int attention_boundary_policy = LLMC_ATTENTION_ROW_CAUSAL;
+    int eos_token_id = -1;
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int log_gpu_every = -1;
@@ -2750,6 +2829,18 @@ int main(int argc, char *argv[]) {
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // Keep evaluation-only controls outside the already very deep legacy
         // else-if parser so MSVC does not exceed its nested-block limit.
+        if (strcmp(argv[i], "-ab") == 0) {
+            if(!llmc_parse_attention_boundary(argv[i+1],&attention_boundary_policy)) {
+                fprintf(stderr,"Unknown -ab attention boundary: %s\n",argv[i+1]);exit(EXIT_FAILURE);
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "-ei") == 0) {
+            if(!llmc_parse_eos_id(argv[i+1],&eos_token_id)) {
+                fprintf(stderr,"Invalid -ei EOS token: %s\n",argv[i+1]);exit(EXIT_FAILURE);
+            }
+            continue;
+        }
         if (strcmp(argv[i], "-vb") == 0) {
             validation_attention_blackout_width = atoi(argv[i+1]);
             continue;
@@ -3313,6 +3404,36 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
         gpt_build_from_descriptor(&model, load_filename);
+    }
+
+    if (!llmc_valid_eos_policy(attention_boundary_policy,eos_token_id,model.config.vocab_size)) {
+        fprintf(stderr,"EOS policy requires an in-vocabulary token; row_causal_v1 requires -ei -1\n");exit(EXIT_FAILURE);
+    }
+    if (resuming || ends_with_bin(load_filename)) {
+        if(model.attention_boundary_policy!=attention_boundary_policy || model.eos_token_id!=eos_token_id) {
+            fprintf(stderr,"Explicit attention boundary/token does not match checkpoint; legacy checkpoints cannot acquire EOS isolation\n");exit(EXIT_FAILURE);
+        }
+    } else { model.attention_boundary_policy=attention_boundary_policy;model.eos_token_id=eos_token_id; }
+    if(attention_boundary_policy==LLMC_ATTENTION_ISOLATE_SEGMENTS) {
+        if(sequence_boundary_policy!=LLMC_SEQUENCE_BOUNDARY_ROW_RESET ||
+           model.config.position_encoding!=LLMC_POSITION_ENCODING_ROPE || model.config.rope_lowest_frequency_plane_is_dc ||
+           validation_attention_blackout_width || validation_attention_disabled || hellaswag_eval || sample_every!=0 ||
+           num_processes!=1 || zero_stage!=0) {
+            fprintf(stderr,"EOS isolation requires row_reset, standard RoPE, single GPU/zero stage0, no blackout, attention-off, sampling or HellaSwag\n");exit(EXIT_FAILURE);
+        }
+#ifndef ENABLE_CUDNN
+        fprintf(stderr,"EOS isolation requires cuDNN\n");exit(EXIT_FAILURE);
+#endif
+        const char* deterministic=getenv("LLMC_CUDNN_ATTENTION_DETERMINISTIC_BACKWARD");
+        if(!deterministic || strcmp(deterministic,"0")) {
+            fprintf(stderr,"EOS isolation requires explicit LLMC_CUDNN_ATTENTION_DETERMINISTIC_BACKWARD=0\n");exit(EXIT_FAILURE);
+        }
+        printf0("attention_boundary_policy: isolate_segments_v1\n");
+        printf0("eos_token_id: %d\n",eos_token_id);
+        printf0("eos_position_policy: segment_relative_standard_rope\n");
+        printf0("eos_targets_scored: 1\n");
+        printf0("supervised_targets_per_microbatch: %zu\n",(size_t)B*(T-1));
+        printf0("cudnn_attention_deterministic_backward: 0\n");
     }
 
     if (model_max_sequence_length_override != 0) {

@@ -9,6 +9,7 @@
 namespace {
 int failures=0;
 int test_policy=LLMC_MLP_SWISH_POWER125_K8;
+bool test_eos=false;
 void check(bool ok,const char* what){if(!ok){fprintf(stderr,"FAIL %s\n",what);++failures;}}
 template<class T> struct Buffer {
     T* p=nullptr; size_t n;
@@ -164,6 +165,21 @@ void test_seeded_initialization() {
         printf("llmc_mlp_initializer_geometry: layers=12 channels=768 heads=12 vocab=50257 padded_vocab=50304 sequence=1024 parameters=123689472 target_shape=1\n");
     printf("llmc_mlp_initializer: seed=42 selectors=gelu,swish_power125_k8,swish,relu_squared,swish_power2_k8 tensor_bytes_identical=1 result=%s\n",failures?"fail":"pass");
 }
+void test_eos_seed_identity() {
+    std::vector<floatX> baseline;
+    for(int boundary:{LLMC_ATTENTION_ROW_CAUSAL,LLMC_ATTENTION_ISOLATE_SEGMENTS}) {
+        GPT2 m;gpt2_init_common(&m);m.mlp_activation=LLMC_MLP_RELU_SQUARED;
+        m.attention_boundary_policy=boundary;m.eos_token_id=boundary?50256:-1;
+        gpt_build_from_descriptor(&m,"gpt2:rope:d12:t1024");
+        check(m.config.num_layers==12&&m.config.channels==768&&m.config.num_heads==12&&m.num_parameters==123689472,"EOS target-shape seed geometry");
+        check(m.attention_boundary_policy==boundary&&m.mlp_activation==LLMC_MLP_RELU_SQUARED,"initializer retains requested EOS/activation metadata");
+        auto actual=read_device(static_cast<const floatX*>(m.params_memory),m.num_parameters);
+        if(baseline.empty())baseline=actual;
+        else check(actual.size()==baseline.size()&&!memcmp(actual.data(),baseline.data(),m.num_parameters_bytes),"same seed42 ReLU-squared row-causal/EOS tensor bytes identical");
+        cudaFreeCheck(&m.params_memory);
+    }
+    printf("llmc_eos_initializer: seed=42 activation=relu_squared policies=row_causal_v1,isolate_segments_v1 tensor_bytes_identical=1 target_shape=1 result=%s\n",failures?"fail":"pass");
+}
 struct Run {float loss; std::vector<floatX> gradients;};
 Run tiny_run(int recompute,const std::filesystem::path& output) {
     constexpr int B=8,T=64,C=128,L=2,V=128;
@@ -173,6 +189,7 @@ Run tiny_run(int recompute,const std::filesystem::path& output) {
     m.config.position_encoding=LLMC_POSITION_ENCODING_ROPE;m.config.rope_rotary_dim=64;m.config.rope_theta=10000;
     gpt2_set_initializer_defaults(&m.config);
     m.mlp_activation=test_policy;m.gelu_fusion=0;m.recompute=recompute;
+    if(test_eos){m.attention_boundary_policy=LLMC_ATTENTION_ISOLATE_SEGMENTS;m.eos_token_id=V-1;}
     gpt2_allocate_weights(&m);
     std::vector<floatX> weights(m.num_parameters);
     size_t at=0;
@@ -197,18 +214,35 @@ Run tiny_run(int recompute,const std::filesystem::path& output) {
         auto tokens=output/"tokens.npy";write_tokens(tokens);
         DataLoader loader={};dataloader_init_with_policy(&loader,tokens.string().c_str(),B,T,0,1,0,1,0);
         dataloader_next_batch(&loader);
+        if(test_eos) {
+            gpt2_validate(&m,loader.inputs,loader.targets,B,T,true);
+            int eos_targets=0;
+            for(int b=0;b<B;++b)for(int t=0;t<T;++t) {
+                const int index=b*T+t;
+                if(t<T-1)check(loader.targets[index]==loader.inputs[index+1],"EOS preserves shifted cache labels");
+                if(t<T-1&&loader.targets[index]==V-1){++eos_targets;check(std::isfinite(m.cpu_losses[index])&&m.cpu_losses[index]>0,"EOS target receives ordinary cross entropy");}
+                if(t==T-1)check(m.cpu_losses[index]==0,"only row-final target excluded");
+            }
+            check(eos_targets>0,"fixture includes EOS targets");
+        }
         auto path=output/"custom_model.bin";
         gpt2_write_to_checkpoint(&m,path.string().c_str());
         auto state=output/"custom_state.bin";
         save_state(state.string().c_str(),1,&m,&loader,LLMC_SEQUENCE_BOUNDARY_ROW_RESET);
         int header[256];FILE* file=fopenCheck(state.string().c_str(),"rb");freadCheck(header,sizeof(int),256,file);fcloseCheck(file);
-        check(header[1]==LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION&&header[44]==2&&llmc_mlp_contract_matches(header,44,test_policy),"optimizer state custom contract");
+        check(header[1]==(test_eos?LLMC_OPTIMIZER_STATE_VERSION_EOS:LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION)&&header[44]==2&&llmc_mlp_contract_matches(header,44,test_policy),"optimizer state custom contract");
+        if(test_eos) {
+            check(header[64]==LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION&&llmc_eos_contract_matches(header,true,m.attention_boundary_policy,m.eos_token_id,V),"optimizer EOS contract");
+            mutate_header(path,output/"invalid_model_eos_schema.bin",65);
+            mutate_header(state,output/"invalid_state_eos_token.bin",67);
+        }
         mutate_header(path,output/"invalid_model_formula.bin",21);
         mutate_header(state,output/"invalid_state_numerics.bin",51);
         change_state_activation(state,output/"invalid_state_activation.bin",
             test_policy==LLMC_MLP_SWISH?LLMC_MLP_RELU_SQUARED:LLMC_MLP_SWISH);
         GPT2 restored;gpt2_init_common(&restored);gpt2_build_from_checkpoint(&restored,path.string().c_str());
         check(restored.mlp_activation==test_policy,"checkpoint auto selects custom activation");
+        check(restored.attention_boundary_policy==m.attention_boundary_policy&&restored.eos_token_id==m.eos_token_id,"checkpoint preserves exact EOS policy/token");
         auto checkpoint_weights=read_device(static_cast<const floatX*>(m.params_memory),m.num_parameters);
         auto restored_weights=read_device(static_cast<const floatX*>(restored.params_memory),m.num_parameters);
         check(!memcmp(checkpoint_weights.data(),restored_weights.data(),m.num_parameters_bytes),"checkpoint weights byte identical");
@@ -261,6 +295,8 @@ int main(int argc,char** argv) {
         if(!strcmp(argv[i],"--output-dir")&&!output_text)output_text=argv[i+1];
         else if(!strcmp(argv[i],"--activation")) {
             if(!llmc_parse_mlp_activation(argv[i+1],&test_policy)||!llmc_mlp_activation_is_custom(test_policy))return 2;
+        } else if(!strcmp(argv[i],"--eos")&&!strcmp(argv[i+1],"1")) {
+            test_eos=true;
         } else return 2;
     }
     if(!output_text){fprintf(stderr,"usage: test_mlp_activation [--activation SELECTOR] --output-dir NEW_DIRECTORY\n");return 2;}
@@ -269,7 +305,9 @@ int main(int argc,char** argv) {
     multi_gpu_config=multi_gpu_config_init(1,0,1,nullptr,nullptr,nullptr);
     common_start(false);
     printf("mlp_activation: %s\n",llmc_mlp_activation_name(test_policy));
+    printf("test_eos_isolation: %d\n",test_eos?1:0);
     test_edges();test_gemm_boundary();test_seeded_initialization();
+    if(test_eos)test_eos_seed_identity();
     auto baseline=tiny_run(0,output);
     for(int recompute:{1,2}) {
         auto other=tiny_run(recompute,output);

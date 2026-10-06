@@ -363,6 +363,223 @@ void create_cudnn() {
     cuDNNCheck(cudnnCreate(&cudnn_handle));
 }
 
+// EOS isolation uses the same cuDNN ragged/padding/causal construction as the
+// native FRNA provider. Forward retains packed QKV. SM120 backward requires
+// token-contiguous Q/K/V planes; bitwise relayout uses the dead final dqkv
+// destination as input staging and one admitted scratch for planar adjoints.
+// INT64 absolute offsets select disjoint document spans in both layouts.
+struct LlmcEosAttention {
+    int max_B, max_T, H, C;
+    size_t max_tokens, metadata_capacity;
+    LlmcEosHostPlan host;
+    int32_t* positions = nullptr;
+    int32_t* lengths = nullptr;
+    int64_t* qkv_offsets = nullptr;
+    int64_t* output_offsets = nullptr;
+    float* stats = nullptr;
+    floatX* planar_gradients = nullptr;
+    bool prepared = false;
+    LlmcEosStatsCopy copy_stats = nullptr;
+    LlmcEosQkvRelayout relayout_qkv = nullptr;
+};
+
+enum { EOS_RQ = 101, EOS_RK, EOS_RV, EOS_RO, EOS_LQ, EOS_LK };
+
+static auto eos_graph(int count, int H, int S, int C, int physical_tokens, bool backward) {
+    using Key = std::tuple<int,int,int,int,int,bool>;
+    static std::map<Key, std::shared_ptr<fe::graph::Graph>> cache;
+    const Key key{count,H,S,C,physical_tokens,backward};
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    if (deterministic_attention_backward()) {
+        fprintf(stderr, "EOS ragged SDPA requires explicit LLMC_CUDNN_ATTENTION_DETERMINISTIC_BACKWARD=0; no automatic override\n");
+        exit(EXIT_FAILURE);
+    }
+    const int HS = C / H;
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(CUDNN_16BIT).set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto offsets = [&](int uid) {
+        return graph->tensor(fe::graph::Tensor_attributes().set_uid(uid)
+            .set_dim({count+1,1,1,1}).set_stride({1,1,1,1}).set_data_type(fe::DataType_t::INT64)
+            .set_alignment(alignof(int64_t)));
+    };
+    auto lengths = [&](int uid) {
+        return graph->tensor(fe::graph::Tensor_attributes().set_uid(uid)
+            .set_dim({count,1,1,1}).set_stride({1,1,1,1}).set_data_type(fe::DataType_t::INT32)
+            .set_alignment(alignof(int32_t)));
+    };
+    auto rq = offsets(EOS_RQ), rk = offsets(EOS_RK), rv = offsets(EOS_RV), ro = offsets(EOS_RO);
+    auto lq = lengths(EOS_LQ), lk = lengths(EOS_LK);
+    auto data = [&](int uid, int multiplier, auto offset) {
+        auto tensor = graph->tensor(fe::graph::Tensor_attributes().set_uid(uid)
+            .set_dim({count,H,S,HS}).set_stride({(int64_t)multiplier*C*S,HS,multiplier*C,1}));
+        tensor->set_ragged_offset(offset);
+        return tensor;
+    };
+    const int qkv_multiplier=backward?1:3;
+    auto q = data(Q_UID,qkv_multiplier,rq), k = data(K_UID,qkv_multiplier,rk), v = data(V_UID,qkv_multiplier,rv);
+    auto set_output = [&](auto tensor, int uid, int multiplier, auto offset) {
+        tensor->set_output(true).set_uid(uid).set_dim({count,H,S,HS})
+            .set_stride({(int64_t)multiplier*C*S,HS,multiplier*C,1});
+        tensor->set_ragged_offset(offset);
+    };
+    if (!backward) {
+        auto attr = fe::graph::SDPA_attributes().set_name("eos_ragged_forward")
+            .set_is_inference(false).set_attn_scale(1.0f / sqrtf((float)HS))
+            .set_causal_mask(true).set_padding_mask(true).set_seq_len_q(lq).set_seq_len_kv(lk);
+        auto [out, stats] = graph->sdpa(q,k,v,attr);
+        set_output(out,O_UID,1,ro);
+        stats->set_output(true).set_uid(Stats_UID).set_data_type(fe::DataType_t::FLOAT)
+            .set_dim({count,H,S,1}).set_stride({(int64_t)H*S,S,1,1});
+    } else {
+        auto out = data(O_UID,1,ro), dout = data(dO_UID,1,ro);
+        auto stats = graph->tensor(fe::graph::Tensor_attributes().set_uid(Stats_UID)
+            .set_data_type(fe::DataType_t::FLOAT).set_dim({count,H,S,1}).set_stride({(int64_t)H*S,S,1,1}));
+        auto attr = fe::graph::SDPA_backward_attributes().set_name("eos_ragged_backward")
+            .set_attn_scale(1.0f / sqrtf((float)HS)).set_deterministic_algorithm(false)
+            .set_causal_mask(true).set_padding_mask(true).set_seq_len_q(lq).set_seq_len_kv(lk)
+            .set_max_total_seq_len_q(physical_tokens).set_max_total_seq_len_kv(physical_tokens);
+        auto [dq,dk,dv] = graph->sdpa_backward(q,k,v,out,dout,stats,attr);
+        set_output(dq,dQ_UID,1,rq); set_output(dk,dK_UID,1,rk); set_output(dv,dV_UID,1,rv);
+    }
+    checkCudnnFE(graph->validate());
+    checkCudnnFE(graph->build_operation_graph(cudnn_handle));
+    checkCudnnFE(graph->create_execution_plans({fe::HeurMode_t::A}));
+    checkCudnnFE(graph->check_support(cudnn_handle));
+    checkCudnnFE(graph->build_plans(cudnn_handle));
+    reserve_attention_workspace(graph, backward ? "eos_backward" : "eos_forward", count,H,S,HS,0);
+    cache.emplace(key,graph);
+    return graph;
+}
+
+LlmcEosAttention* llmc_eos_attention_create(int B, int T, int NH, int C, cudaStream_t stream,
+        LlmcEosStatsCopy copy_stats,LlmcEosQkvRelayout relayout_qkv) {
+    if (!copy_stats || !relayout_qkv || B <= 0 || T < 2 || NH <= 0 || C <= 0 || C % NH ||
+        (uint64_t)B*T > INT32_MAX || (uint64_t)B*T > SIZE_MAX/(3ull*C*sizeof(floatX))) {
+        fprintf(stderr, "Invalid EOS attention allocation shape\n"); exit(EXIT_FAILURE);
+    }
+    if (deterministic_attention_backward()) {
+        fprintf(stderr, "EOS ragged SDPA requires explicit LLMC_CUDNN_ATTENTION_DETERMINISTIC_BACKWARD=0\n");
+        exit(EXIT_FAILURE);
+    }
+    auto* ctx = new LlmcEosAttention;
+    ctx->max_B=B; ctx->max_T=T; ctx->H=NH; ctx->C=C;
+    ctx->copy_stats=copy_stats;
+    ctx->relayout_qkv=relayout_qkv;
+    ctx->max_tokens=(size_t)B*T; ctx->metadata_capacity=4*ctx->max_tokens+64;
+    const size_t stats_count=(size_t)std::max(T,LLMC_EOS_TOKEN_BUDGET)*NH;
+    const size_t planar_bytes=3*ctx->max_tokens*C*sizeof(floatX);
+    const size_t metadata_bytes=ctx->max_tokens*sizeof(int32_t)+ctx->metadata_capacity*(sizeof(int32_t)+2*sizeof(int64_t))+
+        stats_count*sizeof(float);
+    if(planar_bytes>SIZE_MAX-metadata_bytes) {fprintf(stderr,"EOS allocation size overflow\n");exit(EXIT_FAILURE);}
+    const size_t bytes=metadata_bytes+planar_bytes;
+    size_t free_bytes=0,total_bytes=0;
+    cudaCheck(cudaMemGetInfo(&free_bytes,&total_bytes));
+    if (bytes > free_bytes) { fprintf(stderr,"EOS attention metadata/stats/planar gradients need %zu bytes; only %zu free\n",bytes,free_bytes); exit(EXIT_FAILURE); }
+    cudaCheck(cudaMalloc((void**)&ctx->positions,ctx->max_tokens*sizeof(int32_t)));
+    cudaCheck(cudaMalloc((void**)&ctx->lengths,ctx->metadata_capacity*sizeof(int32_t)));
+    cudaCheck(cudaMalloc((void**)&ctx->qkv_offsets,ctx->metadata_capacity*sizeof(int64_t)));
+    cudaCheck(cudaMalloc((void**)&ctx->output_offsets,ctx->metadata_capacity*sizeof(int64_t)));
+    cudaCheck(cudaMalloc((void**)&ctx->stats,stats_count*sizeof(float)));
+    cudaCheck(cudaMalloc((void**)&ctx->planar_gradients,planar_bytes));
+    cuDNNCheck(cudnnSetStream(cudnn_handle,stream));
+    // Pre-admit every selectable count class, including rounded tails. Future
+    // EOS occupancy cannot request a plan/workspace outside this envelope.
+    int lower=1;
+    for (int S=std::min(2,T);; S=S>T/2?T:S*2) {
+        const int cap=llmc_eos_group_capacity(S);
+        const int max_actual=(int)std::min((size_t)cap,(size_t)B*(T/lower));
+        for (int count=1;;count=count>cap/2?cap:count*2) {
+            eos_graph(count,NH,S,C,(int)ctx->max_tokens,false);
+            eos_graph(count,NH,S,C,(int)ctx->max_tokens,true);
+            if(count>=max_actual) break;
+        }
+        if(S==T) break;
+        lower=S+1;
+    }
+    printf("eos_attention_allocation metadata_stats_bytes=%zu planar_gradient_bytes=%zu total_owned_bytes=%zu group_token_budget=%d max_group_segments=%d workspace_bytes=%zu\n",
+        metadata_bytes,planar_bytes,bytes,LLMC_EOS_TOKEN_BUDGET,LLMC_EOS_GROUP_LIMIT,cudnn_workspace_size);
+    printf("eos_attention_backward_layout: bitwise_planar_qkv_v1\n");
+    return ctx;
+}
+
+void llmc_eos_attention_prepare(LlmcEosAttention* ctx,const int* inputs,int B,int T,int eos,cudaStream_t stream) {
+    if (!ctx || B<=0 || B>ctx->max_B || T!=ctx->max_T) {
+        fprintf(stderr,"EOS attention batch exceeds admitted shape\n"); exit(EXIT_FAILURE);
+    }
+    // Own the host arrays until all queued copies and their consumers finish.
+    cudaCheck(cudaStreamSynchronize(stream));
+    ctx->host=llmc_make_eos_plan(inputs,B,T,ctx->C,eos);
+    if(ctx->host.lengths.size()>ctx->metadata_capacity) { fprintf(stderr,"EOS metadata bound exceeded\n"); exit(EXIT_FAILURE); }
+    cudaCheck(cudaMemcpyAsync(ctx->positions,ctx->host.positions.data(),ctx->host.positions.size()*sizeof(int32_t),cudaMemcpyHostToDevice,stream));
+    cudaCheck(cudaMemcpyAsync(ctx->lengths,ctx->host.lengths.data(),ctx->host.lengths.size()*sizeof(int32_t),cudaMemcpyHostToDevice,stream));
+    cudaCheck(cudaMemcpyAsync(ctx->qkv_offsets,ctx->host.qkv_offsets.data(),ctx->host.qkv_offsets.size()*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
+    cudaCheck(cudaMemcpyAsync(ctx->output_offsets,ctx->host.output_offsets.data(),ctx->host.output_offsets.size()*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
+    ctx->prepared=true;
+}
+const int32_t* llmc_eos_attention_positions(const LlmcEosAttention* ctx) { return ctx ? ctx->positions : nullptr; }
+
+static void eos_require_disjoint(const void* a,size_t a_bytes,const void* b,size_t b_bytes) {
+    const uintptr_t ab=(uintptr_t)a,bb=(uintptr_t)b;
+    if(!a||!b||ab>UINTPTR_MAX-a_bytes||bb>UINTPTR_MAX-b_bytes||
+        !(ab+a_bytes<=bb||bb+b_bytes<=ab)) {
+        fprintf(stderr,"EOS backward input staging overlaps an immutable input\n");exit(EXIT_FAILURE);
+    }
+}
+
+static void eos_execute(LlmcEosAttention* ctx,floatX* out,float* dense_stats,floatX* qkv,
+                        floatX* dqkv,floatX* dout,cudaStream_t stream) {
+    if(!ctx || !ctx->prepared || !dense_stats) { fprintf(stderr,"EOS attention needs prepared metadata and statistics\n"); exit(EXIT_FAILURE); }
+    const bool backward=dqkv!=nullptr;
+    const size_t tokens=(size_t)ctx->host.B*ctx->host.T,plane=tokens*ctx->C;
+    if(backward) {
+        const size_t qkv_bytes=3*plane*sizeof(floatX),output_bytes=plane*sizeof(floatX);
+        eos_require_disjoint(dqkv,qkv_bytes,qkv,qkv_bytes);
+        eos_require_disjoint(dqkv,qkv_bytes,out,output_bytes);
+        eos_require_disjoint(dqkv,qkv_bytes,dout,output_bytes);
+        eos_require_disjoint(dqkv,qkv_bytes,dense_stats,tokens*ctx->H*sizeof(float));
+        // dqkv has no live gradient until this call returns. Preserve original
+        // qkv/O/dO/tape; all groups see the same immutable planar input staging.
+        ctx->relayout_qkv(qkv,dqkv,tokens,ctx->C,true,stream);
+        cudaCheck(cudaMemsetAsync(ctx->planar_gradients,0,qkv_bytes,stream));
+    }
+    cuDNNCheck(cudnnSetStream(cudnn_handle,stream));
+    for(const auto& group:ctx->host.groups) {
+        const size_t begin=group.metadata_begin;
+        auto graph=eos_graph(group.count,ctx->H,group.max_sequence,ctx->C,(int)ctx->max_tokens,backward);
+        if(backward) ctx->copy_stats(dense_stats,ctx->stats,ctx->lengths+begin,ctx->output_offsets+begin,
+            group.count,group.max_sequence,ctx->H,ctx->host.T,ctx->C,true,stream);
+        floatX* input=backward?dqkv:qkv;
+        const size_t qkv_step=backward?plane:(size_t)ctx->C;
+        int64_t* offsets=(backward?ctx->output_offsets:ctx->qkv_offsets)+begin;
+        std::unordered_map<int64_t,void*> pack={
+            {Q_UID,input},{K_UID,input+qkv_step},{V_UID,input+2*qkv_step},{O_UID,out},{Stats_UID,ctx->stats},
+            {EOS_RQ,offsets},{EOS_RK,offsets},{EOS_RV,offsets},
+            {EOS_RO,ctx->output_offsets+begin},{EOS_LQ,ctx->lengths+begin},{EOS_LK,ctx->lengths+begin}};
+        if(backward) {pack[dO_UID]=dout;pack[dQ_UID]=ctx->planar_gradients;
+            pack[dK_UID]=ctx->planar_gradients+plane;pack[dV_UID]=ctx->planar_gradients+2*plane;}
+        checkCudnnFE(graph->execute(cudnn_handle,pack,cudnn_workspace));
+        cudaCheck(cudaGetLastError());
+        if(!backward) ctx->copy_stats(dense_stats,ctx->stats,ctx->lengths+begin,ctx->output_offsets+begin,
+            group.count,group.max_sequence,ctx->H,ctx->host.T,ctx->C,false,stream);
+    }
+    if(backward) ctx->relayout_qkv(ctx->planar_gradients,dqkv,tokens,ctx->C,false,stream);
+}
+void llmc_eos_attention_forward(LlmcEosAttention* ctx,floatX* out,float* stats,floatX* qkv,cudaStream_t stream) {
+    eos_execute(ctx,out,stats,qkv,nullptr,nullptr,stream);
+}
+void llmc_eos_attention_backward(LlmcEosAttention* ctx,floatX* dqkv,floatX* dout,floatX* qkv,floatX* out,float* stats,cudaStream_t stream) {
+    eos_execute(ctx,out,stats,qkv,dqkv,dout,stream);
+}
+void llmc_eos_attention_destroy(LlmcEosAttention* ctx) {
+    if(!ctx) return;
+    cudaCheck(cudaFree(ctx->positions));cudaCheck(cudaFree(ctx->lengths));
+    cudaCheck(cudaFree(ctx->qkv_offsets));cudaCheck(cudaFree(ctx->output_offsets));cudaCheck(cudaFree(ctx->stats));
+    cudaCheck(cudaFree(ctx->planar_gradients));
+    delete ctx;
+}
+
 void destroy_cudnn() {
     if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
     cuDNNCheck(cudnnDestroy(cudnn_handle));
