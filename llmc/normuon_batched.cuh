@@ -22,6 +22,9 @@ __device__ __forceinline__ size_t llmc_normuon_batch_tensor_offset(
     size_t element_index,
     size_t width) {
     const size_t matrix_elements = width * width;
+    if (family_id == LLMC_OPTIMIZER_FAMILY_ATTENTION) {
+        return matrix_index * matrix_elements + element_index;
+    }
     const size_t layer_index = matrix_index / LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
     const size_t view_index =
         matrix_index - layer_index * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
@@ -42,6 +45,9 @@ __device__ __forceinline__ size_t llmc_normuon_batch_second_moment_offset(
     size_t row,
     size_t width) {
     const size_t matrix_elements = width * width;
+    if (family_id == LLMC_OPTIMIZER_FAMILY_ATTENTION) {
+        return matrix_index * matrix_elements + row;
+    }
     const size_t layer_index = matrix_index / LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
     const size_t view_index =
         matrix_index - layer_index * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
@@ -1718,7 +1724,8 @@ __global__ void llmc_normuon_batch_apply_update_kernel(
     float update_scale,
     float learning_rate_multiplier,
     uint64_t global_step,
-    int tensor_id) {
+    int tensor_id,
+    int views_per_layer) {
     const float decay_scale = 1.0f - learning_rate * weight_decay;
     const float update_lr = learning_rate * update_scale *
                             learning_rate_multiplier;
@@ -1728,9 +1735,9 @@ __global__ void llmc_normuon_batch_apply_update_kernel(
         const size_t matrix_index = linear / matrix_elements;
         const size_t index = linear - matrix_index * matrix_elements;
         const size_t layer_index =
-            matrix_index / LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+            matrix_index / views_per_layer;
         const size_t view_index =
-            matrix_index - layer_index * LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
+            matrix_index - layer_index * views_per_layer;
         const size_t row = index / width;
         const size_t parameter_offset = llmc_normuon_batch_tensor_offset(
             family_id, matrix_index, index, width);
@@ -4798,9 +4805,16 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
         config->execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
         parameter_type->views_per_layer !=
             llmc_normuon_family_views_per_matrix(
-                config->orthogonalization_mode, parameter_type->family_id) ||
+                config->orthogonalization_mode, parameter_type->family_id,
+                parameter_type->tensor_id) ||
         (parameter_type->family_id != LLMC_OPTIMIZER_FAMILY_MLP_WUP &&
-         parameter_type->family_id != LLMC_OPTIMIZER_FAMILY_MLP_WDOWN) ||
+         parameter_type->family_id != LLMC_OPTIMIZER_FAMILY_MLP_WDOWN &&
+         parameter_type->family_id != LLMC_OPTIMIZER_FAMILY_ATTENTION) ||
+        (parameter_type->family_id == LLMC_OPTIMIZER_FAMILY_ATTENTION &&
+         (!llmc_normuon_targets_attention(config) ||
+          config->refresh_policy == LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS ||
+          (config->orthogonalization_mode != LLMC_NORMUON_ORTHO_NEWTON_SCHULZ &&
+           config->orthogonalization_mode != LLMC_NORMUON_ORTHO_RECTANGULAR_MUON))) ||
         !(learning_rate > 0.0f)) {
         return false;
     }
@@ -5484,7 +5498,8 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
             config->update_scale,
             effective_learning_rate_multiplier,
             global_step,
-            parameter_type->tensor_id);
+            parameter_type->tensor_id,
+            parameter_type->views_per_layer);
     }
     cudaCheck(cudaGetLastError());
     return true;

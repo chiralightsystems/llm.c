@@ -3813,7 +3813,187 @@ static void test_batched_adaptive_tracker_refresh() {
     }
 }
 
-int main() {
+static LlmcOptimizerPlan attention_plan(
+    int width, int layers, LlmcNormuonOrthogonalizationMode mode,
+    LlmcNormuonConfig* config) {
+    llmc_normuon_config_defaults(config);
+    config->optimizer_selection = LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON;
+    config->orthogonalization_mode = mode;
+    if (mode == LLMC_NORMUON_ORTHO_RECTANGULAR_MUON)
+        config->retraction_mode = LLMC_NORMUON_TRACKER_RETRACTION_DISABLED;
+    BATCHED_CHECK(llmc_parse_normuon_targeted_families(
+        "attention,mlp_wup,mlp_wdown", &config->targeted_family_mask),
+        "explicit attention family parses");
+    GPT2Config shape = {};
+    shape.channels = shape.lexical_channels = width;
+    shape.num_layers = layers;
+    shape.max_seq_len = 8;
+    shape.padded_vocab_size = 128;
+    shape.position_encoding = LLMC_POSITION_ENCODING_ROPE;
+    size_t elements[NUM_PARAMETER_TENSORS], sizes[NUM_PARAMETER_TENSORS];
+    fill_in_parameter_sizes(elements, sizes, shape);
+    LlmcOptimizerPlan plan = {};
+    char error[256] = {};
+    const bool admitted = llmc_normuon_validate_config(config, error, sizeof(error)) &&
+        llmc_build_optimizer_plan(&plan, config, layers, width, elements,
+                                  error, sizeof(error));
+    if (!admitted) fprintf(stderr, "attention plan (%s): %s\n",
+        llmc_normuon_orthogonalization_mode_name(mode), error);
+    BATCHED_CHECK(admitted, "attention and MLP optimizer inventory builds");
+    return plan;
+}
+
+static void test_attention_plan_host() {
+    for (auto mode : {LLMC_NORMUON_ORTHO_NEWTON_SCHULZ,
+                      LLMC_NORMUON_ORTHO_RECTANGULAR_MUON}) {
+        LlmcNormuonConfig config;
+        const auto plan = attention_plan(8, 2, mode, &config);
+        if (!plan.built) continue;
+        BATCHED_CHECK(plan.normuon_parameter_type_count == 4 &&
+            plan.normuon_view_count == 2 * (mode == LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ? 6 : 12),
+            "attention inventory counts Q/K/V/O separately");
+        for (int tensor = 0; tensor < NUM_PARAMETER_TENSORS; ++tensor) {
+            const bool matrix = tensor == 4 || tensor == 6 || tensor == 10 || tensor == 12;
+            BATCHED_CHECK(plan.parameter_types[tensor].backend_kind ==
+                (matrix ? LLMC_OPTIMIZER_BACKEND_NORMUON : LLMC_OPTIMIZER_BACKEND_ADAMW),
+                "all biases, embeddings and normalization stay AdamW");
+        }
+        for (int tensor : {4, 6}) {
+            const auto& type = plan.parameter_types[tensor];
+            std::vector<int> coverage(type.layer_elements, 0);
+            for (int v = 0; v < type.views_per_layer; ++v) {
+                LlmcOptimizerMatrixView view;
+                BATCHED_CHECK(type.enumerate_matrix_view(&type, v, &view) &&
+                    llmc_optimizer_view_within_bounds(&type, &view) &&
+                    view.rows == 8 && view.columns == 8 &&
+                    view.second_moment_offset == view.element_offset,
+                    "Q/K/V/O square view and second moment are in bounds");
+                for (size_t e = 0; e < 64; ++e) ++coverage[view.element_offset + e];
+            }
+            BATCHED_CHECK(std::all_of(coverage.begin(), coverage.end(),
+                [](int n) { return n == 1; }), "each attention weight belongs to exactly one view");
+        }
+        int header[LLMC_NORMUON_COMPANION_HEADER_INTS] = {};
+        llmc_normuon_encode_config(header, &config);
+        LlmcNormuonConfig decoded;
+        BATCHED_CHECK(llmc_normuon_decode_config(header, LLMC_NORMUON_COMPANION_VERSION, &decoded) &&
+            llmc_normuon_config_equal(&config, &decoded), "attention mask round-trips without a schema change");
+        char error[256];
+        auto rejected = config;
+        rejected.execution_mode = LLMC_NORMUON_EXECUTION_FP32_REFERENCE;
+        BATCHED_CHECK(!llmc_normuon_validate_config(&rejected, error, sizeof(error)),
+            "attention contract rejects unsupported FP32 execution");
+        for (auto unsupported : {LLMC_NORMUON_ORTHO_SKEW_POLAR_TRACK_Q,
+            LLMC_NORMUON_ORTHO_RECTANGULAR_SKEW_POLAR_TRACK_Q,
+            LLMC_NORMUON_ORTHO_SPLIT_WUP_SQUARE_TRACKER_WDOWN_RECTANGULAR_MUON,
+            LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON,
+            LLMC_NORMUON_ORTHO_RECTANGULAR_CACHE_MUON_INVERSE_ROOT_TRACKER}) {
+            rejected = config;
+            rejected.orthogonalization_mode = unsupported;
+            BATCHED_CHECK(!llmc_normuon_validate_config(&rejected, error, sizeof(error)),
+                "attention rejects tracker, cache and split modes");
+        }
+        rejected = config;
+        rejected.refresh_policy = LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS;
+        BATCHED_CHECK(!llmc_normuon_validate_config(&rejected, error, sizeof(error)),
+            "attention rejects the rectangular FreshGNS solver");
+    }
+}
+
+static void test_attention_updates() {
+    constexpr int width = 8, layers = 2;
+    constexpr size_t square = width * width;
+    for (auto mode : {LLMC_NORMUON_ORTHO_NEWTON_SCHULZ,
+                      LLMC_NORMUON_ORTHO_RECTANGULAR_MUON}) {
+        LlmcNormuonConfig config;
+        const auto plan = attention_plan(width, layers, mode, &config);
+        if (!plan.built) return;
+        LlmcNormuonRuntime runtime;
+        llmc_normuon_runtime_reset(&runtime);
+        const bool allocated = llmc_normuon_runtime_allocate(&runtime, &plan, &config);
+        BATCHED_CHECK(allocated, "mixed attention/MLP scratch workspace allocates");
+        if (!allocated) return;
+        BATCHED_CHECK(runtime.batch_total_elements == 4U * layers * square &&
+            runtime.batch_matrix_capacity == static_cast<size_t>(layers *
+                (mode == LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ? 3 : 4)) &&
+            runtime.tracked_q == nullptr, "peak panels are reused, not tripled for QKV");
+        for (int tensor : {4, 6}) {
+            const auto& type = plan.parameter_types[tensor];
+            const size_t count = type.tensor_elements, tail = layers * width;
+            // The suffix stands in for adjacent AdamW-only bias storage.
+            std::vector<float> master(count + tail), gradient(count + tail),
+                               momentum(count + tail, 0.0f), second(count + tail, -9.25f);
+            for (size_t e = 0; e < master.size(); ++e) {
+                master[e] = 0.1f + 0.001f * static_cast<float>(e);
+                gradient[e] = round_to_floatx(0.02f * std::sin(float(e + tensor)));
+            }
+            for (size_t m = 0; m < count / square; ++m)
+                std::fill(second.begin() + m * square, second.begin() + m * square + width, 0.01f);
+            BatchedBuffers buffers(master.size());
+            buffers.load(master, gradient, momentum, second);
+            const auto initial_parameter = batched_copy_from_device(buffers.parameter, master.size());
+            for (uint64_t step = 0; step < 3; ++step) {
+                for (size_t m = 0; m < count / square; ++m) {
+                    const size_t b = m * square;
+                    std::vector<float> g(gradient.begin() + b, gradient.begin() + b + square),
+                        mom(momentum.begin() + b, momentum.begin() + b + square),
+                        weights(master.begin() + b, master.begin() + b + square),
+                        v(second.begin() + b, second.begin() + b + width);
+                    auto direction = prepare_direction_reference_batched(g, &mom, config, 0.75f);
+                    apply_bf16_polynomial_reference(&direction, width,
+                        LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT, config.refresh_schedule);
+                    finalize_reference_batched(direction, &v, &weights, width, config, 0.01f);
+                    std::copy(mom.begin(), mom.end(), momentum.begin() + b);
+                    std::copy(weights.begin(), weights.end(), master.begin() + b);
+                    std::copy(v.begin(), v.end(), second.begin() + b);
+                }
+                BATCHED_CHECK(llmc_normuon_update_parameter_type_batched_bf16(
+                    &runtime, cublas_handle, main_stream, buffers.parameter, buffers.gradient,
+                    buffers.momentum, buffers.second_moment, buffers.master, &type, &config,
+                    0.01f, 0.75f, step), "attention square update succeeds in mixed scratch mode");
+                cudaCheck(cudaStreamSynchronize(main_stream));
+            }
+            const auto actual_master = batched_copy_from_device(buffers.master, master.size());
+            const auto actual_momentum = batched_copy_from_device(buffers.momentum, master.size());
+            const auto actual_second = batched_copy_from_device(buffers.second_moment, master.size());
+            BATCHED_CHECK(batched_max_abs_difference(actual_master, master) < 5.0e-5f &&
+                batched_max_abs_difference(actual_momentum, momentum) < 1.0e-7f &&
+                batched_max_abs_difference(actual_second, second) < 5.0e-5f,
+                "all Q/K/V/O views and layers match independent BF16-operand CPU reference");
+            const auto actual_parameter = batched_copy_from_device(buffers.parameter, master.size());
+            BATCHED_CHECK(std::memcmp(actual_parameter.data() + count,
+                initial_parameter.data() + count, tail * sizeof(floatX)) == 0,
+                "attention NorMuon leaves adjacent biases untouched");
+            floatX* publication = nullptr;
+            cudaCheck(cudaMalloc(&publication, count * sizeof(floatX)));
+            for (int layer = 0; layer < layers; ++layer)
+                for (int v = 0; v < type.views_per_layer; ++v) {
+                    LlmcOptimizerMatrixView view;
+                    type.enumerate_matrix_view(&type, v, &view);
+                    const size_t offset = layer * type.layer_elements + view.element_offset;
+                    BATCHED_CHECK(llmc_normuon_round_master_view(main_stream,
+                        publication + offset, buffers.master + offset, &type, &view,
+                        2U, layer, v), "reference attention publication succeeds");
+                }
+            const auto expected_parameter = batched_copy_from_device(publication, count);
+            BATCHED_CHECK(std::memcmp(actual_parameter.data(), expected_parameter.data(),
+                count * sizeof(floatX)) == 0, "stochastic rounding uses exact layer/QKV-view identity");
+            cudaCheck(cudaFree(publication));
+        }
+        llmc_normuon_runtime_free(&runtime);
+    }
+}
+
+int main(int argc, char** argv) {
+    const bool attention_only = argc == 2 && !strcmp(argv[1], "--attention-only");
+    const bool attention_host = argc == 2 && !strcmp(argv[1], "--attention-host");
+    if (argc > 1 && !attention_only && !attention_host) {
+        fprintf(stderr, "Usage: test_normuon_batched [--attention-host|--attention-only]\n");
+        return EXIT_FAILURE;
+    }
+    test_attention_plan_host();
+    if (attention_host || batched_test_failures != 0)
+        return batched_test_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     char server_ip[2] = "";
     char filesystem_path[2] = "";
     char init_method[4] = "mpi";
@@ -3822,6 +4002,8 @@ int main() {
     set_zero_configs(&multi_gpu_config, 0, 1);
     common_start(false, false);
 
+    test_attention_updates();
+    if (!attention_only) {
     test_lr_dither_schedule();
     test_tracker_h_stability_kernel();
     test_square_wdown_batch_replay_restore();
@@ -3849,6 +4031,7 @@ int main() {
         LLMC_NORMUON_TRACKER_CORRECTION_BASIS_FREE_FIRST_ORDER,
         1.40f,
         100.0f);
+    }
 
     GPT2 unused_model = {};
     common_free(unused_model);

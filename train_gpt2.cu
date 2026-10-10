@@ -2632,7 +2632,8 @@ void error_usage() {
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
     fprintf(stderr, "  -op <string> optimizer: adamw|adamw_normuon (default = adamw)\n");
-    fprintf(stderr, "  -nf <string> NorMuon families (required = mlp_wup,mlp_wdown)\n");
+    fprintf(stderr, "  -nf <string> NorMuon families: mlp_wup,mlp_wdown (default), or attention,mlp_wup,mlp_wdown\n");
+    fprintf(stderr, "               attention weights use independent square Q/K/V/O scratch updates, biases AdamW; bf16_batched and ordinary newton_schulz|rectangular_muon only\n");
     fprintf(stderr, "  -nl <float>  NorMuon learning rate (default = 2.5e-3)\n");
     fprintf(stderr, "  -nw <float>  NorMuon weight decay (default = 1e-3)\n");
     fprintf(stderr, "  -nb <float>  NorMuon momentum (default = 0.95)\n");
@@ -3723,6 +3724,14 @@ int main(int argc, char *argv[]) {
                 parameter_type->views_per_layer);
     }
     if (model.optimizer_plan.normuon_parameter_type_count != 0) {
+        printf0("normuon_targeted_families: %s\n",
+            llmc_normuon_targets_attention(&model.optimizer_config)
+                ? "attention,mlp_wup,mlp_wdown" : "mlp_wup,mlp_wdown");
+        if (llmc_normuon_targets_attention(&model.optimizer_config)) {
+            printf0("normuon_attention_views: independent_CxC_Q_K_V_O\n");
+            printf0("normuon_attention_orthogonalization: newton_schulz_scratch\n");
+            printf0("normuon_attention_bias_optimizer: adamw\n");
+        }
         const bool fresh_gns_scratch =
             llmc_normuon_uses_fresh_gns_scratch(&model.optimizer_config);
         const bool commuted_canonical_stage2 =

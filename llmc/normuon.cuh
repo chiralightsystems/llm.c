@@ -226,6 +226,12 @@ inline bool llmc_normuon_is_split_family_mode(
 inline LlmcNormuonOrthogonalizationMode llmc_normuon_mode_for_family(
     LlmcNormuonOrthogonalizationMode mode,
     int family_id) {
+    // Q, K, V and O are independent square maps even when the MLP uses
+    // whole rectangular Wup/Wdown matrices. Attention admits scratch only.
+    if (family_id == LLMC_OPTIMIZER_FAMILY_ATTENTION &&
+        mode == LLMC_NORMUON_ORTHO_RECTANGULAR_MUON) {
+        return LLMC_NORMUON_ORTHO_NEWTON_SCHULZ;
+    }
     if (mode ==
         LLMC_NORMUON_ORTHO_SPLIT_WUP_SQUARE_TRACKER_WDOWN_RECTANGULAR_MUON) {
         return family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
@@ -251,7 +257,11 @@ inline bool llmc_normuon_family_is_tracker(
 
 inline int llmc_normuon_family_views_per_matrix(
     LlmcNormuonOrthogonalizationMode mode,
-    int family_id) {
+    int family_id,
+    int tensor_id = -1) {
+    if (family_id == LLMC_OPTIMIZER_FAMILY_ATTENTION) {
+        return tensor_id == 4 ? 3 : (tensor_id == 6 ? 1 : 0);
+    }
     return llmc_normuon_family_is_rectangular(mode, family_id)
                ? LLMC_NORMUON_RECTANGULAR_VIEWS_PER_MLP_MATRIX
                : LLMC_NORMUON_VIEWS_PER_MLP_MATRIX;
@@ -736,6 +746,11 @@ inline uint32_t llmc_normuon_required_target_mask() {
            llmc_optimizer_family_mask(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
 }
 
+inline bool llmc_normuon_targets_attention(const LlmcNormuonConfig* config) {
+    return (config->targeted_family_mask &
+            llmc_optimizer_family_mask(LLMC_OPTIMIZER_FAMILY_ATTENTION)) != 0U;
+}
+
 inline const char* llmc_optimizer_selection_name(LlmcOptimizerSelection selection) {
     switch (selection) {
         case LLMC_OPTIMIZER_SELECTION_ADAMW: return "adamw";
@@ -1019,6 +1034,8 @@ inline bool llmc_parse_normuon_targeted_families(const char* value, uint32_t* ma
             parsed |= llmc_optimizer_family_mask(LLMC_OPTIMIZER_FAMILY_MLP_WUP);
         } else if (token == "mlp_wdown") {
             parsed |= llmc_optimizer_family_mask(LLMC_OPTIMIZER_FAMILY_MLP_WDOWN);
+        } else if (token == "attention") {
+            parsed |= llmc_optimizer_family_mask(LLMC_OPTIMIZER_FAMILY_ATTENTION);
         } else {
             return false;
         }
@@ -1261,14 +1278,28 @@ inline bool llmc_normuon_validate_config(
         return false;
     }
     if (config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
-        config->targeted_family_mask != llmc_normuon_required_target_mask()) {
+        config->targeted_family_mask != llmc_normuon_required_target_mask() &&
+        config->targeted_family_mask != (llmc_normuon_required_target_mask() |
+            llmc_optimizer_family_mask(LLMC_OPTIMIZER_FAMILY_ATTENTION))) {
         valid = false;
         if (error != nullptr && error_capacity != 0U) {
             snprintf(
                 error,
                 error_capacity,
-                "NorMuon currently requires targeted families exactly "
-                "mlp_wup,mlp_wdown");
+                "NorMuon requires mlp_wup,mlp_wdown with optional attention");
+        }
+        return false;
+    }
+    if (config->optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
+        llmc_normuon_targets_attention(config) &&
+        (config->execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED ||
+         (config->orthogonalization_mode != LLMC_NORMUON_ORTHO_NEWTON_SCHULZ &&
+          config->orthogonalization_mode != LLMC_NORMUON_ORTHO_RECTANGULAR_MUON) ||
+         config->refresh_policy == LLMC_NORMUON_APPROX_CACHE_MUON_GRAM_GNS)) {
+        if (error != nullptr && error_capacity != 0U) {
+            snprintf(error, error_capacity,
+                "attention NorMuon requires bf16_batched ordinary scratch "
+                "newton_schulz or rectangular_muon polynomial updates");
         }
         return false;
     }
@@ -1367,6 +1398,20 @@ inline bool llmc_enumerate_mlp_wup_view(
     return true;
 }
 
+inline bool llmc_enumerate_attention_view(
+    const LlmcOptimizerParameterType* parameter_type,
+    int view_index,
+    LlmcOptimizerMatrixView* view) {
+    if (parameter_type == nullptr || view == nullptr || view_index < 0 ||
+        view_index >= parameter_type->views_per_layer ||
+        parameter_type->matrix_width == 0U) return false;
+    const size_t width = parameter_type->matrix_width;
+    *view = {static_cast<size_t>(view_index) * width * width,
+             static_cast<size_t>(view_index) * width * width,
+             width, width, width, 1U};
+    return true;
+}
+
 inline bool llmc_enumerate_mlp_wdown_view(
     const LlmcOptimizerParameterType* parameter_type,
     int view_index,
@@ -1455,9 +1500,9 @@ static constexpr LlmcOptimizerParameterTemplate kLlmcParameterTemplates[
     {"wpe", LLMC_OPTIMIZER_FAMILY_EMBEDDINGS, LLMC_WEIGHT_DECAY_ENABLED, 0, 0, nullptr},
     {"ln1w", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
     {"ln1b", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
-    {"qkvw", LLMC_OPTIMIZER_FAMILY_ATTENTION, LLMC_WEIGHT_DECAY_ENABLED, 1, 0, nullptr},
+    {"qkvw", LLMC_OPTIMIZER_FAMILY_ATTENTION, LLMC_WEIGHT_DECAY_ENABLED, 1, 3, llmc_enumerate_attention_view},
     {"qkvb", LLMC_OPTIMIZER_FAMILY_ATTENTION, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
-    {"attprojw", LLMC_OPTIMIZER_FAMILY_ATTENTION, LLMC_WEIGHT_DECAY_ENABLED, 1, 0, nullptr},
+    {"attprojw", LLMC_OPTIMIZER_FAMILY_ATTENTION, LLMC_WEIGHT_DECAY_ENABLED, 1, 1, llmc_enumerate_attention_view},
     {"attprojb", LLMC_OPTIMIZER_FAMILY_ATTENTION, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
     {"ln2w", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
     {"ln2b", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 1, 0, nullptr},
@@ -1534,6 +1579,11 @@ inline bool llmc_build_optimizer_plan(
         target.matrix_width = static_cast<size_t>(channels);
         target.views_per_layer = source.views_per_layer;
         target.enumerate_matrix_view = source.enumerator;
+        if (source.family_id == LLMC_OPTIMIZER_FAMILY_ATTENTION &&
+            !llmc_normuon_targets_attention(&resolved)) {
+            target.views_per_layer = 0;
+            target.enumerate_matrix_view = nullptr;
+        }
         const bool family_rectangular = llmc_normuon_family_is_rectangular(
             resolved.orthogonalization_mode, source.family_id);
         if (family_rectangular &&
@@ -1547,7 +1597,8 @@ inline bool llmc_build_optimizer_plan(
         }
         const bool targeted =
             (resolved.targeted_family_mask &
-             llmc_optimizer_family_mask(source.family_id)) != 0U;
+             llmc_optimizer_family_mask(source.family_id)) != 0U &&
+            source.enumerator != nullptr;
         target.backend_kind =
             resolved.optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
             targeted
@@ -1559,7 +1610,7 @@ inline bool llmc_build_optimizer_plan(
                 : LLMC_OPTIMIZER_HYPERPARAM_ADAMW_DEFAULT;
         if (target.backend_kind == LLMC_OPTIMIZER_BACKEND_NORMUON) {
             const int expected_views = llmc_normuon_family_views_per_matrix(
-                resolved.orthogonalization_mode, source.family_id);
+                resolved.orthogonalization_mode, source.family_id, tensor_id);
             if (target.enumerate_matrix_view == nullptr ||
                 target.views_per_layer != expected_views) {
                 if (error != nullptr && error_capacity != 0U) {
@@ -1588,16 +1639,21 @@ inline bool llmc_build_optimizer_plan(
     if (resolved.optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
         (plan->parameter_types[10].backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON ||
          plan->parameter_types[12].backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON ||
-         plan->normuon_parameter_type_count != 2 ||
+         plan->normuon_parameter_type_count !=
+             (llmc_normuon_targets_attention(&resolved) ? 4 : 2) ||
+         (llmc_normuon_targets_attention(&resolved) &&
+          (plan->parameter_types[4].backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON ||
+           plan->parameter_types[6].backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON)) ||
         plan->normuon_view_count !=
              num_layers *
-            (llmc_normuon_is_split_family_mode(resolved.orthogonalization_mode)
+            ((llmc_normuon_targets_attention(&resolved) ? 4 : 0) +
+             (llmc_normuon_is_split_family_mode(resolved.orthogonalization_mode)
                  ? 5
                  : (llmc_normuon_is_rectangular_mode(resolved.orthogonalization_mode)
                         ? LLMC_NORMUON_RECTANGULAR_VIEWS_PER_LAYER
-                        : LLMC_NORMUON_VIEWS_PER_LAYER)))) {
+                        : LLMC_NORMUON_VIEWS_PER_LAYER))))) {
         if (error != nullptr && error_capacity != 0U) {
-            snprintf(error, error_capacity, "only fcw/fcprojw may route to NorMuon");
+            snprintf(error, error_capacity, "invalid NorMuon matrix inventory");
         }
         return false;
     }
@@ -3913,7 +3969,7 @@ inline bool llmc_normuon_runtime_allocate(
             ? LLMC_NORMUON_VIEWS_PER_MLP_MATRIX
             : (rectangular ? LLMC_NORMUON_RECTANGULAR_VIEWS_PER_MLP_MATRIX
                            : LLMC_NORMUON_VIEWS_PER_MLP_MATRIX);
-    const size_t batch_matrix_capacity =
+    size_t batch_matrix_capacity =
         config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED
             ? static_cast<size_t>(plan->num_layers) *
                   batch_views_per_matrix
@@ -3922,8 +3978,26 @@ inline bool llmc_normuon_runtime_allocate(
         batch_matrix_capacity > SIZE_MAX / matrix_elements) {
         return false;
     }
-    const size_t batch_total_elements =
+    size_t batch_total_elements =
         batch_matrix_capacity * matrix_elements;
+    // Reuse panels across parameter types. QKV needs 3L square views, while
+    // a whole rectangular MLP needs only L views but 4L*d^2 panel elements.
+    // Multiplying the largest view count by the largest view size triples
+    // the workspace unnecessarily.
+    if (llmc_normuon_targets_attention(config)) {
+        batch_matrix_capacity = batch_total_elements = 0U;
+        for (const auto& type : plan->parameter_types) {
+            if (type.backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON) continue;
+            LlmcOptimizerMatrixView view;
+            if (!type.enumerate_matrix_view(&type, 0, &view)) return false;
+            const size_t count = static_cast<size_t>(type.layer_multiplicity) *
+                                 type.views_per_layer;
+            if (count > SIZE_MAX / (view.rows * view.columns)) return false;
+            const size_t elements = count * view.rows * view.columns;
+            if (count > batch_matrix_capacity) batch_matrix_capacity = count;
+            if (elements > batch_total_elements) batch_total_elements = elements;
+        }
+    }
     const size_t batch_float_matrix_count =
         config->execution_mode == LLMC_NORMUON_EXECUTION_FP32_REFERENCE
             ? 5U
