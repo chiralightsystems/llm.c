@@ -57,6 +57,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/layernorm.cuh"
 // defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
 #include "llmc/matmul.cuh"
+#include "llmc/ffn_interventions.cuh"
+#include "llmc/ffn_contract.h"
+#include "llmc/navia_ffn.h"
 #ifdef ENABLE_CUDNN
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #include "llmc/cudnn_att.h"
@@ -182,7 +185,7 @@ const char* llmc_position_encoding_name(int position_encoding) {
     }
 }
 
-typedef struct {
+typedef struct GPT2Config {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
     int padded_vocab_size; // padded to e.g. %128==0, 50304
@@ -197,7 +200,21 @@ typedef struct {
     float initializer_std; // std for token/QKV/MLP input projections
     float residual_projection_std; // std for attention/MLP residual projections
     float bridge_projection_std; // std for both bias-free lexical bridge matrices
+    int ffn_mode = 0; // append-only opt-in topology; zero is historical dense MLP
+    int ffn_hidden = 0; // zero retains 4*C
+    int ffn_block = 0; // 32 only for tied GUM, otherwise zero
+    float ffn_gate_scale = 1.0f; // fixed checkpoint-owned GUM sigmoid scale
 } GPT2Config;
+
+int gpt2_ffn_hidden(const GPT2Config* config) {
+    return config->ffn_hidden ? config->ffn_hidden : 4 * config->channels;
+}
+int gpt2_ffn_up_width(const GPT2Config* config) {
+    return gpt2_ffn_hidden(config) * (config->ffn_mode == LLMC_MLP_SWIGLU ? 2 : 1);
+}
+const char* gpt2_mlp_activation_name(int mode) {
+    return llmc_ffn_is_topology(mode) ? llmc_ffn_name(mode) : llmc_mlp_activation_name(mode);
+}
 
 int gpt2_lexical_channels(const GPT2Config* config) {
     return config->lexical_channels > 0
@@ -262,7 +279,7 @@ bool gpt2_validate_position_config(const GPT2Config* config) {
 }
 
 // the parameters of the model
-constexpr const int NUM_PARAMETER_TENSORS = 18;
+constexpr const int NUM_PARAMETER_TENSORS = 21;
 static_assert(
     NUM_PARAMETER_TENSORS == LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT,
     "The GPT-2 tensor schema and optimizer plan must stay aligned");
@@ -277,14 +294,17 @@ typedef struct {
     floatX* attprojb; // (L, C)
     floatX* ln2w; // (L, C)
     floatX* ln2b; // (L, C)
-    floatX* fcw; // (L, 4*C, C)
-    floatX* fcb; // (L, 4*C)
-    floatX* fcprojw; // (L, C, 4*C)
+    floatX* fcw; // (L, F, C); F=H, or packed gate/value F=2H for SwiGLU
+    floatX* fcb; // (L, F)
+    floatX* fcprojw; // (L, C, H), independent dense contraction
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
     floatX* lnfb; // (C)
     floatX* lexical_downw; // (C, E), absent when E == C
     floatX* lexical_upw; // (E, C), absent when E == C
+    floatX* gum_u; // (L,b,b), one complete independent bank per layer
+    floatX* gum_g; // (L,b,b), shared by all H/b blocks within that layer
+    floatX* gum_v; // (L,b,b), no local affine biases
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -294,6 +314,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t E = (size_t)gpt2_lexical_channels(&config);
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
+    size_t H = gpt2_ffn_hidden(&config), F = gpt2_ffn_up_width(&config);
     param_sizes[0] = Vp * E; // wte
     param_sizes[1] = config.position_encoding != LLMC_POSITION_ENCODING_LEARNED_ABSOLUTE
         ? 0
@@ -306,15 +327,18 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[7] = L * C; // attprojb
     param_sizes[8] = L * C; // ln2w
     param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
+    param_sizes[10] = L * F * C; // fcw; packed gate/value for SwiGLU
+    param_sizes[11] = L * F; // fcb, same packing
+    param_sizes[12] = L * C * H; // fcprojw remains independent dense contraction
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
     const bool use_bridge = E != C;
     param_sizes[16] = use_bridge ? C * E : 0; // lexical_downw
     param_sizes[17] = use_bridge ? E * C : 0; // lexical_upw
+    const size_t bank = config.ffn_mode == LLMC_MLP_TIED_GUM_RELU_SQUARED
+        ? L * config.ffn_block * config.ffn_block : 0;
+    param_sizes[18] = bank; param_sizes[19] = bank; param_sizes[20] = bank;
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -337,7 +361,8 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb,
-        &params->lexical_downw, &params->lexical_upw
+        &params->lexical_downw, &params->lexical_upw,
+        &params->gum_u, &params->gum_g, &params->gum_v
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -368,8 +393,8 @@ typedef struct {
     floatX* ln2; // (L, B, T, C)
     float* ln2_mean; // (L, B, T)
     float* ln2_rstd; // (L, B, T)
-    floatX* fch; // (L, B, T, 4*C)
-    floatX* fch_gelu; // (L, B, T, 4*C)
+    floatX* fch; // legacy preactivation / shared scratch at max(F,4C)
+    floatX* fch_gelu; // (L or 1, B, T, H), post-FFN activation
     floatX* residual3; // (L, B, T, C)
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     float* lnf_mean; // (B, T)
@@ -385,7 +410,7 @@ typedef struct {
     floatX* output;
 
     // some additional scratch buffers
-    floatX* scratch_bt4c;   // (B, T, max(4*C, E))
+    floatX* scratch_bt4c;   // (B, T, max(F,4*C,E)), reused adjoint/bridge scratch
     floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
@@ -405,6 +430,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t NH = config.num_heads;
     size_t C = config.channels;
     size_t E = (size_t)gpt2_lexical_channels(&config);
+    size_t H = gpt2_ffn_hidden(&config), F = gpt2_ffn_up_width(&config);
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
@@ -424,9 +450,9 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
     // Custom FP32 activation replays the full input GEMM, not saved BF16
     // preactivations. Keep one legacy-sized panel for non-cuDNN attention scratch.
-    tensors[10] = TENSOR_SPEC(data->fch, (fp32_mlp ? 1 : L) * B * T * 4*C);
+    tensors[10] = TENSOR_SPEC(data->fch, (fp32_mlp ? 1 : L) * B * T * max(F,4*C));
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * H : B * T * H);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
@@ -446,7 +472,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t scratch_floats = 32 + 4*C*sm_count; // layernorm_backward
     const size_t threads_per_sm = (size_t)deviceProp.maxThreadsPerMultiProcessor;
     const size_t bias_block = threads_per_sm == 1536 ? 768 : 1024;
-    for (size_t output_channels : {C, 3*C, 4*C}) {
+    for (size_t output_channels : {C, 3*C, F}) {
         const size_t grid_x = CEIL_DIV(output_channels, 8*x128::size);
         const size_t grid_y = max((size_t)1, threads_per_sm*sm_count/(bias_block*grid_x));
         if (grid_y > 1) scratch_floats = max(scratch_floats, output_channels*grid_y);
@@ -460,7 +486,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     // The bridge recomputes lexical activations into this buffer and then
     // overwrites them with their gradients. It costs no extra memory when
     // E <= 4C (including the requested E4096/C1024 shape).
-    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * max(4 * C, E));
+    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * max(max(F,4*C), E));
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
 
@@ -548,6 +574,9 @@ typedef struct {
     int mlp_activation; // declared, checkpoint-bound pointwise MLP policy
     float* mlp_preact_fp32; // one shared full-precision GEMM+bias replay panel
     float* mlp_dact_fp32; // one shared full-precision dH panel
+    float* mlp_local_fp32; // GUM 3*B*T*H adjoints, shared replay scratch
+    float* mlp_bank_partials_fp32; // explicit GUM split-K sums, shared across layers
+    size_t mlp_bank_partial_capacity; // floats; never stored in checkpoints
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
@@ -606,6 +635,11 @@ void gpt2_init_common(GPT2 *model) {
     model->mlp_activation = LLMC_MLP_GELU;
     model->mlp_preact_fp32 = nullptr;
     model->mlp_dact_fp32 = nullptr;
+    model->mlp_local_fp32 = nullptr;
+    model->mlp_bank_partials_fp32 = nullptr;
+    model->mlp_bank_partial_capacity = 0;
+    model->config.ffn_mode = model->config.ffn_hidden = model->config.ffn_block = 0;
+    model->config.ffn_gate_scale = 1.0f;
     model->attention_boundary_policy = LLMC_ATTENTION_ROW_CAUSAL;
     model->eos_token_id = -1;
 #ifdef ENABLE_CUDNN
@@ -653,19 +687,30 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
 
     // allocate the space
     fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute,
-        llmc_mlp_activation_is_custom(model->mlp_activation));
+        llmc_mlp_activation_is_custom(model->mlp_activation) || llmc_ffn_is_topology(model->mlp_activation));
     model->acts_memory_bytes =
         activation_allocation_bytes(model->acts_specs);
     model->acts_memory = malloc_and_point_activations(model->acts_specs);
-    if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+    if (llmc_mlp_activation_is_custom(model->mlp_activation) || llmc_ffn_is_topology(model->mlp_activation)) {
         if (model->gelu_fusion != 0) {
             fprintf(stderr, "Custom MLP activation requires -ge 0; fused GELU cannot implement this activation\n");
             exit(EXIT_FAILURE);
         }
-        const size_t bytes = size_t(B) * T * 4 * model->config.channels * sizeof(float);
+        const size_t bytes = size_t(B) * T * gpt2_ffn_up_width(&model->config) * sizeof(float);
         cudaCheck(cudaMalloc(&model->mlp_preact_fp32, bytes));
         cudaCheck(cudaMalloc(&model->mlp_dact_fp32, bytes));
-        printf0("mlp_fp32_scratch_bytes: %zu\n", 2 * bytes);
+        const size_t local_bytes = model->mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED
+            ? size_t(B)*T*gpt2_ffn_hidden(&model->config)*3*sizeof(float) : 0;
+        if (local_bytes) cudaCheck(cudaMalloc(&model->mlp_local_fp32, local_bytes));
+        if (model->mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED) {
+            model->mlp_bank_partial_capacity = llmc_tiled_gum_backward_bank_scratch_floats(
+                B*T,gpt2_ffn_hidden(&model->config),model->config.ffn_block);
+            cudaCheck(cudaMalloc(&model->mlp_bank_partials_fp32,
+                model->mlp_bank_partial_capacity*sizeof(float)));
+        }
+        const size_t bank_partial_bytes = model->mlp_bank_partial_capacity*sizeof(float);
+        printf0("mlp_fp32_scratch_bytes: %zu\n", 2 * bytes + local_bytes + bank_partial_bytes);
+        if (bank_partial_bytes) printf0("mlp_bank_partial_scratch_bytes: %zu\n",bank_partial_bytes);
     }
     // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
@@ -747,7 +792,7 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // report on mixed memory allocation status (re-using our float reduce function, bit awk ok)
     int reduced_memory_status = (int) multi_gpu_cpu_float_sum((float)memory_status, &multi_gpu_config);
     if (reduced_memory_status >= 1) {
-        if (llmc_mlp_activation_is_custom(model->mlp_activation) ||
+        if (llmc_mlp_activation_is_custom(model->mlp_activation) || llmc_ffn_is_topology(model->mlp_activation) ||
             model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
             fprintf(stderr, "Custom MLP device allocation admission failed: managed-memory fallback forbidden\n");
             exit(EXIT_FAILURE);
@@ -894,6 +939,13 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
         model_header[1] = PRECISION_MODE == PRECISION_FP32
             ? LLMC_MODEL_VERSION_FP32_MLP_ACTIVATION : LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION;
     }
+    if (llmc_ffn_is_topology(model->mlp_activation)) {
+        llmc_store_ffn_contract(model_header, model_header[1], model->mlp_activation,
+            gpt2_ffn_hidden(&model->config), model->config.ffn_block,model->config.ffn_gate_scale);
+        llmc_checkpoint_store_u64(model_header, 90, (uint64_t)model->num_parameters);
+        model_header[1] = PRECISION_MODE == PRECISION_FP32
+            ? LLMC_MODEL_VERSION_FP32_FFN : LLMC_MODEL_VERSION_BF16_FFN;
+    }
     if (model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
         llmc_store_eos_contract(model_header,model_header[1],model->eos_token_id);
         model_header[1] = PRECISION_MODE == PRECISION_FP32 ? LLMC_MODEL_VERSION_FP32_EOS : LLMC_MODEL_VERSION_BF16_EOS;
@@ -930,7 +982,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->eos_token_id = -1;
     if (version == LLMC_MODEL_VERSION_FP32_EOS || version == LLMC_MODEL_VERSION_BF16_EOS) {
         const int base = model_header[64];
-        const bool base_bf16 = base == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION || llmc_model_version_is_bf16(base);
+        const bool base_bf16 = base == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION ||
+            base == LLMC_MODEL_VERSION_BF16_FFN || llmc_model_version_is_bf16(base);
         if (!llmc_valid_eos_contract(model_header,model_header[3]) ||
             (version == LLMC_MODEL_VERSION_BF16_EOS) != base_bf16 ||
             base == LLMC_MODEL_VERSION_FP32_EOS || base == LLMC_MODEL_VERSION_BF16_EOS) {
@@ -939,6 +992,21 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         model->attention_boundary_policy=model_header[66];model->eos_token_id=model_header[67];version=base;
     }
     model->mlp_activation = LLMC_MLP_GELU;
+    model->config.ffn_mode = model->config.ffn_hidden = model->config.ffn_block = 0;
+    model->config.ffn_gate_scale = 1.0f;
+    const bool ffn_checkpoint = version == LLMC_MODEL_VERSION_FP32_FFN || version == LLMC_MODEL_VERSION_BF16_FFN;
+    if (ffn_checkpoint) {
+        if (!llmc_valid_ffn_contract(model_header) ||
+            (version == LLMC_MODEL_VERSION_BF16_FFN) != llmc_model_version_is_bf16(model_header[80])) {
+            fprintf(stderr, "Invalid FFN checkpoint topology/precision contract\n"); exit(EXIT_FAILURE);
+        }
+        model->mlp_activation = model_header[82];
+        model->config.ffn_mode = model_header[82];
+        model->config.ffn_hidden = model_header[83];
+        model->config.ffn_block = model_header[84];
+        model->config.ffn_gate_scale = llmc_ffn_contract_gate_scale(model_header);
+        version = model_header[80];
+    }
     if (version == LLMC_MODEL_VERSION_FP32_MLP_ACTIVATION ||
         version == LLMC_MODEL_VERSION_BF16_MLP_ACTIVATION) {
         if (!llmc_valid_mlp_contract(model_header, 18) ||
@@ -1035,6 +1103,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     // allocate memory for the model parameters
     gpt2_allocate_weights(model);
+    if (ffn_checkpoint && llmc_checkpoint_load_u64(model_header,90) != model->num_parameters) {
+        fprintf(stderr, "FFN checkpoint inventory/count mismatch\n"); exit(EXIT_FAILURE);
+    }
     if (llmc_model_version_is_bridged(version) &&
         llmc_checkpoint_load_u64(model_header, 16) !=
             (uint64_t)model->num_parameters) {
@@ -1066,6 +1137,8 @@ bool gpt2_set_hyperparameters(GPT2Config* config, int depth, int max_seq_len) {
     else if (depth == 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
     else { return false; }
     config->num_layers = depth;
+    config->ffn_mode = config->ffn_hidden = config->ffn_block = 0;
+    config->ffn_gate_scale = 1.0f;
     config->channels = channels;
     config->lexical_channels = channels;
     config->num_heads = num_heads;
@@ -1182,6 +1255,8 @@ bool gpt2_config_from_descriptor(GPT2Config* config, const char* descriptor) {
 }
 
 void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
+    config->ffn_mode = config->ffn_hidden = config->ffn_block = 0;
+    config->ffn_gate_scale = 1.0f;
     // we use channels instead of depth for GPT-3 because GPT-3 model depths are not one-to-one
     // note that our models are not necessarily identical to GPT-3 because
     // we use dense attention, not the alternating dense/banded attention of GPT-3
@@ -1211,9 +1286,11 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     gpt2_set_initializer_defaults(config);
 }
 
-void gpt2_initialize_weights(GPT2 *model);
+void gpt2_initialize_weights(GPT2 *model, bool zero_attention_output = false);
 
-void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
+void gpt_build_from_descriptor(GPT2 *model, const char* descriptor,
+        int activation = LLMC_MLP_GELU, int hidden = 0, int block = 0,
+        bool zero_attention_output = false, float gate_scale = 1.0f) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
     // - explicit "gpt2:dX", or "gpt2:dX:tY" to override max context length.
@@ -1242,12 +1319,32 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
+    if (!llmc_ffn_gate_scale_valid(gate_scale) ||
+        (activation != LLMC_MLP_TIED_GUM_RELU_SQUARED && gate_scale != 1.0f)) {
+        fprintf(stderr,"GUM gate scale requires tied_gum_relu_squared and scale1 or2\n");exit(EXIT_FAILURE);
+    }
+    model->config.ffn_gate_scale = gate_scale;
+
+    if (llmc_ffn_is_topology(activation)) {
+        hidden = hidden ? hidden : activation == LLMC_MLP_SWIGLU
+            ? (8 * model->config.channels) / 3 : 4 * model->config.channels;
+        block = block ? block : activation == LLMC_MLP_TIED_GUM_RELU_SQUARED ? 32 : 0;
+        if (!llmc_ffn_valid_shape(activation, hidden, block)) {
+            fprintf(stderr, "Invalid FFN geometry: hidden multiple128; GUM block32, SwiGLU block0\n"); exit(EXIT_FAILURE);
+        }
+        model->config.ffn_mode = activation;
+        model->config.ffn_hidden = hidden;
+        model->config.ffn_block = block;
+    } else if ((hidden && hidden != 4*model->config.channels) || block) {
+        fprintf(stderr, "Historical dense MLP requires hidden4C and no block option\n"); exit(EXIT_FAILURE);
+    }
+    model->mlp_activation = activation;
 
     gpt2_allocate_weights(model);
-    gpt2_initialize_weights(model);
+    gpt2_initialize_weights(model, zero_attention_output);
 }
 
-void gpt2_initialize_weights(GPT2 *model) {
+void gpt2_initialize_weights(GPT2 *model, bool zero_attention_output) {
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
@@ -1314,7 +1411,7 @@ void gpt2_initialize_weights(GPT2 *model) {
             bridge_offset += model->param_elements[i];
         }
         for (int i = LLMC_LEGACY_PARAMETER_TENSOR_COUNT;
-             i < NUM_PARAMETER_TENSORS;
+             i < 18;
              ++i) {
             const size_t n = model->param_elements[i];
             float* fp32_buffer = (float*)mallocCheck(n * sizeof(float));
@@ -1331,6 +1428,33 @@ void gpt2_initialize_weights(GPT2 *model) {
             free(fp32_buffer);
             bridge_offset += n;
         }
+    }
+
+    if (model->config.ffn_mode == LLMC_MLP_TIED_GUM_RELU_SQUARED) {
+        // Independent CPU bank stream, after all ordinary draws: ReLU/GUM
+        // have identical cold attention and dense outer tensors at seed42.
+        mt19937_state local_rng; manual_seed(&local_rng, 42);
+        size_t bank_offset = 0;
+        for (int i = 0; i < 18; ++i) bank_offset += model->param_elements[i];
+        const int b = model->config.ffn_block;
+        for (int family = 0; family < 3; ++family) {
+            for (size_t layer = 0; layer < L; ++layer) {
+                float bank[32*32];
+                llmc_navia_ffn_bank(bank, b, &local_rng);
+                for (int j = 0; j < b*b; ++j)
+                    params_memory_cpu[bank_offset + layer*b*b + j] = (floatX)bank[j];
+            }
+            bank_offset += model->param_elements[18+family];
+        }
+    }
+
+    if (zero_attention_output) {
+        // Preserve the ordinary RNG draws above, then replace only attention
+        // Wo (all layers). Wdown and every other tensor retain their draws.
+        size_t wo_offset = 0;
+        for (int i = 0; i < 6; ++i) wo_offset += model->param_elements[i];
+        memset(params_memory_cpu + wo_offset, 0,
+               model->param_elements[6] * sizeof(floatX));
     }
 
     // copy them to GPU
@@ -1368,6 +1492,28 @@ void gpt2_apply_rope_or_exit(
 
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
+void gpt2_ffn_fp32_forward(GPT2* model, floatX* out, const floatX* inp,
+        const floatX* up, const floatX* bias, int layer, int rows) {
+    const int C = model->config.channels;
+    const int H = gpt2_ffn_hidden(&model->config);
+    if (!llmc_ffn_is_topology(model->mlp_activation)) {
+        llmc_mlp_activation_forward(out,model->mlp_preact_fp32,inp,up,bias,
+            rows,C,H,model->mlp_activation,main_stream);
+    } else {
+        llmc_mlp_gemm_fp32(model->mlp_preact_fp32,up,inp,
+            gpt2_ffn_up_width(&model->config),rows,C,true,main_stream);
+        if (model->mlp_activation == LLMC_MLP_SWIGLU) {
+            llmc_swiglu_forward(out,model->mlp_preact_fp32,bias,rows,H,main_stream);
+        } else {
+            const int b = model->config.ffn_block;
+            const size_t offset = size_t(layer)*b*b;
+            llmc_tiled_gum_forward(out,model->mlp_preact_fp32,bias,
+                model->params.gum_u+offset,model->params.gum_g+offset,
+                model->params.gum_v+offset,rows,H,b,main_stream,model->config.ffn_gate_scale);
+        }
+    }
+}
+
 void gpt2_forward(
     GPT2 *model,
     const int* inputs,
@@ -1395,7 +1541,7 @@ void gpt2_forward(
         exit(EXIT_FAILURE);
     }
     if (model->mlp_activation != LLMC_MLP_GELU &&
-        (!llmc_mlp_activation_is_custom(model->mlp_activation) ||
+        (!(llmc_mlp_activation_is_custom(model->mlp_activation) || llmc_ffn_is_topology(model->mlp_activation)) ||
          model->gelu_fusion != 0 || model->mlp_preact_fp32 == nullptr)) {
         fprintf(stderr, "Custom MLP requires its declared FP32 scratch and unfused activation path\n");
         exit(EXIT_FAILURE);
@@ -1408,6 +1554,7 @@ void gpt2_forward(
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
     const size_t E = (size_t)gpt2_lexical_channels(&model->config);
+    const size_t H = gpt2_ffn_hidden(&model->config), F = gpt2_ffn_up_width(&model->config);
     const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
 
     // validate B,T are not larger than the values used at initialisation
@@ -1473,9 +1620,9 @@ void gpt2_forward(
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_fcw = params.fcw + l * F * C;
+        floatX* l_fcb = params.fcb + l * F;
+        floatX* l_fcprojw = params.fcprojw + l * C * H;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
@@ -1486,10 +1633,10 @@ void gpt2_forward(
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + (model->mlp_activation == LLMC_MLP_GELU ? l * B * T * 4*C : 0);
+        floatX* l_fch = acts.fch + (model->mlp_activation == LLMC_MLP_GELU ? l * B * T * H : 0);
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * H : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
@@ -1541,13 +1688,12 @@ void gpt2_forward(
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         #endif
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
-            llmc_mlp_activation_forward(l_fch_gelu, model->mlp_preact_fp32, l_ln2,
-                l_fcw, l_fcb, B*T, C, 4*C, model->mlp_activation, main_stream);
+        if (llmc_mlp_activation_is_custom(model->mlp_activation) || llmc_ffn_is_topology(model->mlp_activation)) {
+            gpt2_ffn_fp32_forward(model,l_fch_gelu,l_ln2,l_fcw,l_fcb,l,B*T);
         } else {
-            matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+            matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, F, main_stream, l_fch, model->gelu_fusion);
         }
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, H, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -1695,6 +1841,7 @@ void gpt2_backward_and_reduce(
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
     const size_t E = (size_t)gpt2_lexical_channels(&model->config);
+    const size_t H = gpt2_ffn_hidden(&model->config), F = gpt2_ffn_up_width(&model->config);
     const bool use_bridge = gpt2_uses_embedding_bridge(&model->config);
 
     ParameterTensors params = model->params; // for brevity
@@ -1795,8 +1942,8 @@ void gpt2_backward_and_reduce(
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_fcw = params.fcw + l * F * C;
+        floatX* l_fcprojw = params.fcprojw + l * C * H;
         // get the pointers of the gradients of the weights for this layer
         floatX* dl_ln1w = grads.ln1w + l * C;
         floatX* dl_ln1b = grads.ln1b + l * C;
@@ -1806,9 +1953,9 @@ void gpt2_backward_and_reduce(
         floatX* dl_attprojb = grads.attprojb + l * C;
         floatX* dl_ln2w = grads.ln2w + l * C;
         floatX* dl_ln2b = grads.ln2b + l * C;
-        floatX* dl_fcw = grads.fcw + l * 4*C * C;
-        floatX* dl_fcb = grads.fcb + l * 4*C;
-        floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
+        floatX* dl_fcw = grads.fcw + l * F * C;
+        floatX* dl_fcb = grads.fcb + l * F;
+        floatX* dl_fcprojw = grads.fcprojw + l * C * H;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
@@ -1820,8 +1967,8 @@ void gpt2_backward_and_reduce(
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch_pre_gelu = acts.fch + (model->mlp_activation == LLMC_MLP_GELU ? l * B * T * 4*C : 0);
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_pre_gelu = acts.fch + (model->mlp_activation == LLMC_MLP_GELU ? l * B * T * H : 0);
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * H : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
@@ -1829,30 +1976,41 @@ void gpt2_backward_and_reduce(
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
-        if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
+        if (llmc_mlp_activation_is_custom(model->mlp_activation) || llmc_ffn_is_topology(model->mlp_activation)) {
             // Always replay the same full FP32 GEMM+bias, even for -r 0.
             // Replaying a saved BF16 auxiliary would change the derivative.
             if (model->recompute >= 2)
                 layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
-            llmc_mlp_activation_forward(l_fch_gelu, model->mlp_preact_fp32, l_ln2,
-                l_fcw, params.fcb + l * 4*C, B*T, C, 4*C, model->mlp_activation, main_stream);
+            gpt2_ffn_fp32_forward(model,l_fch_gelu,l_ln2,l_fcw,params.fcb+l*F,l,B*T);
             matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
-                l_fcprojw, scratchF, B,T,4*C,C,main_stream,nullptr,0,model->mlp_dact_fp32);
-            llmc_mlp_activation_backward(dl_bt4c, model->mlp_dact_fp32, model->mlp_preact_fp32,
-                size_t(B)*T*4*C, model->mlp_activation, main_stream);
+                l_fcprojw, scratchF, B,T,H,C,main_stream,nullptr,0,model->mlp_dact_fp32);
+            if (model->mlp_activation == LLMC_MLP_SWIGLU) {
+                llmc_swiglu_backward(dl_bt4c,model->mlp_dact_fp32,model->mlp_preact_fp32,B*T,H,main_stream);
+            } else if (model->mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED) {
+                const int block = model->config.ffn_block;
+                const size_t offset = size_t(l)*block*block;
+                llmc_tiled_gum_backward(dl_bt4c,grads.gum_u+offset,grads.gum_g+offset,grads.gum_v+offset,
+                    model->mlp_local_fp32,model->mlp_dact_fp32,model->mlp_preact_fp32,
+                    params.gum_u+offset,params.gum_g+offset,params.gum_v+offset,B*T,H,block,
+                    model->mlp_bank_partials_fp32,model->mlp_bank_partial_capacity,main_stream,
+                    model->config.ffn_gate_scale);
+            } else {
+                llmc_mlp_activation_backward(dl_bt4c,model->mlp_dact_fp32,model->mlp_preact_fp32,
+                    size_t(B)*T*H,model->mlp_activation,main_stream);
+            }
         } else {
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*H, main_stream);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, H, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
         }
         }
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, F, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
@@ -1895,8 +2053,8 @@ void gpt2_backward_and_reduce(
                 3 * C * C, 3 * C,
                 C * C, C,
                 C, C,
-                4 * C * C, 4 * C,
-                C * 4 * C, C
+                F * C, F,
+                C * H, C
             };
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
@@ -2007,7 +2165,7 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
     }
     size_t size = model->param_elements[param_tensor_id] ;
     // if we are in the transformer block, we need to additionally offset by the layer id
-    if(2 <= param_tensor_id && param_tensor_id <= 13) {
+    if((2 <= param_tensor_id && param_tensor_id <= 13) || param_tensor_id >= 18) {
         size /= model->config.num_layers;
         offset += (ptrdiff_t)(layer_id * size);
     }
@@ -2112,6 +2270,11 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     second is the attention matmul, which is also usually a small contribution.
     */
     size_t N = model->num_parameters;
+    if (model->config.ffn_mode == LLMC_MLP_TIED_GUM_RELU_SQUARED) {
+        const size_t bank_parameters = size_t(model->config.num_layers)*3*model->config.ffn_block*model->config.ffn_block;
+        const size_t bank_matrix_macs = size_t(model->config.num_layers)*3*gpt2_ffn_hidden(&model->config)*model->config.ffn_block;
+        N = N - bank_parameters + bank_matrix_macs;
+    }
     int L = model->config.num_layers;
     int C = model->config.channels;
     int T = model->seq_len;
@@ -2142,6 +2305,9 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->mlp_preact_fp32);
     cudaFreeCheck(&model->mlp_dact_fp32);
+    cudaFreeCheck(&model->mlp_local_fp32);
+    cudaFreeCheck(&model->mlp_bank_partials_fp32);
+    model->mlp_bank_partial_capacity = 0;
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
     cudaFreeCheck(&model->accumulated_mean_loss);
@@ -2218,6 +2384,12 @@ void save_state(
     if (llmc_mlp_activation_is_custom(model->mlp_activation)) {
         llmc_store_mlp_contract(state_header, 44, state_header[1], model->mlp_activation);
         state_header[1] = LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION;
+    }
+    if (llmc_ffn_is_topology(model->mlp_activation)) {
+        llmc_store_ffn_contract(state_header, state_header[1], model->mlp_activation,
+            gpt2_ffn_hidden(&model->config), model->config.ffn_block,model->config.ffn_gate_scale);
+        llmc_checkpoint_store_u64(state_header,90,(uint64_t)model->num_parameters);
+        state_header[1] = LLMC_OPTIMIZER_STATE_VERSION_FFN;
     }
     if (model->attention_boundary_policy == LLMC_ATTENTION_ISOLATE_SEGMENTS) {
         llmc_store_eos_contract(state_header,state_header[1],model->eos_token_id);
@@ -2312,6 +2484,14 @@ void load_state(
         fprintf(stderr,"Optimizer state/model EOS attention contract mismatch\n");exit(EXIT_FAILURE);
     }
     if(eos_state) state_version=state_header[64];
+    const bool topology_state = state_version == LLMC_OPTIMIZER_STATE_VERSION_FFN;
+    if (topology_state != llmc_ffn_is_topology(model->mlp_activation) ||
+        (topology_state && (!llmc_ffn_contract_matches(state_header, model->mlp_activation,
+            gpt2_ffn_hidden(&model->config),model->config.ffn_block,model->config.ffn_gate_scale) ||
+            llmc_checkpoint_load_u64(state_header,90) != model->num_parameters))) {
+        fprintf(stderr,"Optimizer state/model FFN topology contract mismatch\n");exit(EXIT_FAILURE);
+    }
+    if (topology_state) state_version = state_header[80];
     const bool custom_mlp_state = state_version == LLMC_OPTIMIZER_STATE_VERSION_MLP_ACTIVATION;
     if (custom_mlp_state != llmc_mlp_activation_is_custom(model->mlp_activation) ||
         (custom_mlp_state && !llmc_mlp_contract_matches(state_header, 44, model->mlp_activation))) {
@@ -2695,7 +2875,11 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
-    fprintf(stderr, "  -ma <str>   MLP activation: gelu (default), swish_power125_k8, swish, relu_squared, swish_power2_k8 (custom requires -ge 0)\n");
+    fprintf(stderr, "  -ma <str>   MLP activation: gelu (default), swish_power125_k8, swish, relu_squared, swish_power2_k8, swiglu, tied_gum_relu_squared (custom requires -ge 0)\n");
+    fprintf(stderr, "  -mh <int>   FFN hidden width; historical4C, SwiGLU8C/3, GUM4C\n");
+    fprintf(stderr, "  -mb <int>   GUM block width32 only; absent for other modes\n");
+    fprintf(stderr, "  -mg <int>   fixed GUM sigmoid scale (1|2); omitted uses cold1 or checkpoint-owned scale\n");
+    fprintf(stderr, "  -wz <int>   zero attention Wo at cold initialization (0|1, default 0); cannot load/resume\n");
     fprintf(stderr, "  -pa <int>   zero-update allocation/forward/backward preflight, no checkpoint (0|1, default 0)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
@@ -2794,9 +2978,13 @@ int main(int argc, char *argv[]) {
     int max_steps = -1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
+    int zero_attention_output = 0;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int mlp_activation = LLMC_MLP_GELU;
     bool mlp_activation_explicit = false;
+    int mlp_hidden = 0, mlp_block = 0;
+    float mlp_gum_gate_scale = 1.0f;
+    bool mlp_gum_gate_scale_explicit = false;
     int allocation_preflight = 0;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
@@ -2864,11 +3052,33 @@ int main(int argc, char *argv[]) {
         }
         // Parse new multi-letter options before legacy single-letter prefixes.
         // In particular -ma must never become atoi("swish_power125_k8") for -m.
-        if (strcmp(argv[i], "-ma") == 0) {
-            if (!llmc_parse_mlp_activation(argv[i+1], &mlp_activation)) {
+        if (strcmp(argv[i], "-wz") == 0) {
+            if (strcmp(argv[i+1], "0") && strcmp(argv[i+1], "1")) error_usage();
+            zero_attention_output = argv[i+1][0] == '1';
+            continue;
+        }
+        else if (strcmp(argv[i], "-ma") == 0) {
+            if (!strcmp(argv[i+1],"swiglu")) mlp_activation = LLMC_MLP_SWIGLU;
+            else if (!strcmp(argv[i+1],"tied_gum_relu_squared")) mlp_activation = LLMC_MLP_TIED_GUM_RELU_SQUARED;
+            else if (!llmc_parse_mlp_activation(argv[i+1], &mlp_activation)) {
                 fprintf(stderr, "Unknown -ma activation: %s\n", argv[i+1]); exit(EXIT_FAILURE);
             }
             mlp_activation_explicit = true;
+            continue;
+        }
+        if (!strcmp(argv[i],"-mg")) {
+            if (!llmc_parse_ffn_gate_scale(argv[i+1],&mlp_gum_gate_scale)) {
+                fprintf(stderr,"-mg expects exactly1 or2\n");exit(EXIT_FAILURE);
+            }
+            mlp_gum_gate_scale_explicit = true;
+            continue;
+        }
+        if (!strcmp(argv[i],"-mh") || !strcmp(argv[i],"-mb")) {
+            int value;
+            if (!llmc_parse_ffn_width(argv[i+1],&value)) {
+                fprintf(stderr,"%s expects a positive integer\n",argv[i]); exit(EXIT_FAILURE);
+            }
+            if (!strcmp(argv[i],"-mh")) mlp_hidden = value; else mlp_block = value;
             continue;
         }
         if (strcmp(argv[i], "-pa") == 0) {
@@ -3204,6 +3414,30 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Invalid optimizer configuration: %s\n", optimizer_config_error);
         exit(EXIT_FAILURE);
     }
+    // Reject unsupported opt-in recipes before CUDA/device initialization.
+    if (zero_attention_output && (resume || ends_with_bin(load_filename))) {
+        fprintf(stderr,"Zero attention Wo is cold initialization only; loaded weights are checkpoint-owned\n");
+        exit(EXIT_FAILURE);
+    }
+    if (mlp_gum_gate_scale_explicit && !resume && !ends_with_bin(load_filename) &&
+        mlp_activation != LLMC_MLP_TIED_GUM_RELU_SQUARED) {
+        fprintf(stderr,"Explicit -mg is only valid for tied_gum_relu_squared\n");exit(EXIT_FAILURE);
+    }
+    if (llmc_ffn_is_topology(mlp_activation)) {
+        if (recompute != 2 || zero_stage != 0 || num_processes != 1 || gelu_fusion > 0) {
+            fprintf(stderr,"FFN topology requires -r2 -z0 singleGPU and -ge0\n");exit(EXIT_FAILURE);
+        }
+        if ((mlp_block && (mlp_activation != LLMC_MLP_TIED_GUM_RELU_SQUARED || mlp_block != 32)) ||
+            (mlp_hidden && (mlp_hidden % 128 || mlp_hidden > INT_MAX/2))) {
+            fprintf(stderr,"FFN geometry requires hidden multiple128; GUM block32 only\n");exit(EXIT_FAILURE);
+        }
+        if (optimizer_config.optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
+            (optimizer_config.targeted_family_mask != llmc_normuon_required_target_mask() ||
+             optimizer_config.orthogonalization_mode != LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ||
+             optimizer_config.execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED)) {
+            fprintf(stderr,"FFN NorMuon requires rectangular_muon bf16_batched on Wup/Wdown only\n");exit(EXIT_FAILURE);
+        }
+    }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
 
@@ -3404,8 +3638,13 @@ int main(int argc, char *argv[]) {
                             "The trainer checkpoint/state formats do not support NoPE.\n");
             exit(EXIT_FAILURE);
         }
-        gpt_build_from_descriptor(&model, load_filename);
+        gpt_build_from_descriptor(&model, load_filename, mlp_activation, mlp_hidden, mlp_block,
+                                 zero_attention_output != 0,mlp_gum_gate_scale);
     }
+
+    printf0("attention_output_initialization: %s\n",
+            resuming || ends_with_bin(load_filename) ? "checkpoint_owned" :
+            zero_attention_output ? "zero" : "llmc_gpt2_v1");
 
     if (!llmc_valid_eos_policy(attention_boundary_policy,eos_token_id,model.config.vocab_size)) {
         fprintf(stderr,"EOS policy requires an in-vocabulary token; row_causal_v1 requires -ei -1\n");exit(EXIT_FAILURE);
@@ -3512,15 +3751,39 @@ int main(int argc, char *argv[]) {
     }
     model.use_master_weights = use_master_weights;
     if (mlp_activation_explicit) {
+        if ((llmc_ffn_is_topology(model.mlp_activation) || llmc_ffn_is_topology(mlp_activation)) &&
+                model.mlp_activation != mlp_activation) {
+            fprintf(stderr,"Explicit -ma cannot change checkpoint FFN inventory; use a cold descriptor\n"); exit(EXIT_FAILURE);
+        }
         if (model.mlp_activation != LLMC_MLP_GELU && model.mlp_activation != mlp_activation) {
             fprintf(stderr, "Explicit -ma conflicts with checkpoint-bound activation\n");
             exit(EXIT_FAILURE);
         }
         model.mlp_activation = mlp_activation;
     }
-    if (llmc_mlp_activation_is_custom(model.mlp_activation) && gelu_fusion != 0) {
+    if ((mlp_hidden && mlp_hidden != gpt2_ffn_hidden(&model.config)) ||
+        (mlp_block && mlp_block != model.config.ffn_block)) {
+        fprintf(stderr,"Explicit FFN geometry conflicts with checkpoint inventory\n");exit(EXIT_FAILURE);
+    }
+    if (mlp_gum_gate_scale_explicit &&
+        (model.mlp_activation != LLMC_MLP_TIED_GUM_RELU_SQUARED ||
+         model.config.ffn_gate_scale != mlp_gum_gate_scale)) {
+        fprintf(stderr,"Explicit -mg conflicts with checkpoint-owned GUM gate scale; use a cold descriptor\n");exit(EXIT_FAILURE);
+    }
+    if (llmc_ffn_is_topology(model.mlp_activation) &&
+        (multi_gpu_config.num_processes != 1 || zero_stage != 0 || recompute != 2)) {
+        fprintf(stderr,"FFN topology requires singleGPU, zero_stage0, recompute2\n");exit(EXIT_FAILURE);
+    }
+    if (llmc_ffn_is_topology(model.mlp_activation) &&
+        model.optimizer_config.optimizer_selection == LLMC_OPTIMIZER_SELECTION_ADAMW_NORMUON &&
+        (model.optimizer_config.targeted_family_mask != llmc_normuon_required_target_mask() ||
+         model.optimizer_config.orthogonalization_mode != LLMC_NORMUON_ORTHO_RECTANGULAR_MUON ||
+         model.optimizer_config.execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED)) {
+        fprintf(stderr,"FFN NorMuon requires rectangular_muon bf16_batched on Wup/Wdown only\n");exit(EXIT_FAILURE);
+    }
+    if ((llmc_mlp_activation_is_custom(model.mlp_activation) || llmc_ffn_is_topology(model.mlp_activation)) && gelu_fusion != 0) {
         fprintf(stderr, "%s requires -ge 0; no silent numerical-path override\n",
-            llmc_mlp_activation_name(model.mlp_activation));
+            gpt2_mlp_activation_name(model.mlp_activation));
         exit(EXIT_FAILURE);
     }
     if (allocation_preflight && resuming) {
@@ -3529,8 +3792,30 @@ int main(int argc, char *argv[]) {
     }
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
-    printf0("mlp_activation: %s\n", llmc_mlp_activation_name(model.mlp_activation));
-    printf0("mlp_activation_numerics: %s\n", llmc_mlp_activation_is_custom(model.mlp_activation)
+    printf0("mlp_hidden_width: %d\n", gpt2_ffn_hidden(&model.config));
+    printf0("mlp_block_width: %d\n", model.config.ffn_block);
+    const size_t ffn_h = gpt2_ffn_hidden(&model.config);
+    const size_t ffn_matrix_parameters = size_t(model.config.channels)*ffn_h*
+        (model.mlp_activation == LLMC_MLP_SWIGLU ? 3 : 2) +
+        (model.mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED ? 3*32*32 : 0);
+    const size_t ffn_matrix_macs = size_t(model.config.channels)*ffn_h*
+        (model.mlp_activation == LLMC_MLP_SWIGLU ? 3 : 2) +
+        (model.mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED ? 3*ffn_h*32 : 0);
+    printf0("mlp_matrix_parameters_per_layer: %zu\n", ffn_matrix_parameters);
+    printf0("mlp_forward_matrix_macs_per_token_per_layer: %zu\n", ffn_matrix_macs);
+    printf0("mlp_bias_parameters_per_layer: %zu\n", size_t(gpt2_ffn_up_width(&model.config))+model.config.channels);
+    printf0("model_mfu_basis: dense_matrix_heuristic_includes_repeated_bank_uses_excludes_recompute_bias_pointwise_optimizer\n");
+    if (llmc_ffn_is_topology(model.mlp_activation)) {
+        printf0("mlp_local_bias: absent\n");
+        printf0("mlp_initialization: %s\n", model.mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED
+            ? "navia_local_v1" : "llmc_gpt2_v1");
+        printf0("mlp_local_bank_policy: %s\n", model.mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED
+            ? "one_per_layer" : "none");
+        printf0("mlp_local_gradient: sum_over_rows_and_blocks\n");
+        printf0("mlp_tensor_inventory: 21_append_only\n");
+    }
+    printf0("mlp_activation: %s\n", gpt2_mlp_activation_name(model.mlp_activation));
+    printf0("mlp_activation_numerics: %s\n", (llmc_mlp_activation_is_custom(model.mlp_activation) || llmc_ffn_is_topology(model.mlp_activation))
         ? "fp32_gemm_bias_activation_bf16_output" : "historical_gelu");
     if (model.mlp_activation == LLMC_MLP_SWISH_POWER125_K8) {
         printf0("mlp_activation_formula: x*sigmoid(x)*(1+softplus(8*(x-1))/8)^(1/4)\n");
@@ -3545,8 +3830,21 @@ int main(int argc, char *argv[]) {
     } else if (model.mlp_activation == LLMC_MLP_SWISH_POWER2_K8) {
         printf0("mlp_activation_formula: x*sigmoid(x)*(1+softplus(8*(x-1))/8)\n");
         printf0("mlp_activation_parameters: p=2 k=8 transition=1 swish_beta=1\n");
+    } else if (model.mlp_activation == LLMC_MLP_SWIGLU) {
+        printf0("mlp_activation_formula: swish(gate)*value\n");
+        printf0("mlp_activation_parameters: swish_beta=1 packed_gate_then_value\n");
+    } else if (model.mlp_activation == LLMC_MLP_TIED_GUM_RELU_SQUARED) {
+        printf0("mlp_activation_formula: %s\n",model.config.ffn_gate_scale == 1.0f
+            ? "max(0,U*h+sigmoid(G*h)*(V*h))^2"
+            : "max(0,U*h+2*sigmoid(G*h)*(V*h))^2");
+        printf0("mlp_activation_parameters: exponent=2 gate_beta=1 gate_scale=%.9g block32\n",
+            model.config.ffn_gate_scale);
+        printf0("mlp_gum_gate_scale: %.9g\n",model.config.ffn_gate_scale);
     }
-    if (llmc_mlp_activation_is_custom(model.mlp_activation)) {
+    if (llmc_ffn_is_topology(model.mlp_activation)) {
+        printf0("mlp_activation_backward: fp32_local_vjp_summed_bank_gradients_then_bf16\n");
+        printf0("mlp_activation_recompute: full_input_gemm_fp32_bias_local_map_activation\n");
+    } else if (llmc_mlp_activation_is_custom(model.mlp_activation)) {
         printf0("mlp_activation_backward: fp32_dH_times_derivative_of_fp32_replayed_preact_then_bf16\n");
         printf0("mlp_activation_recompute: full_input_gemm_fp32_bias_activation\n");
     }
@@ -4147,7 +4445,7 @@ int main(int argc, char *argv[]) {
         nonfinite_stopped = !isfinite(model.mean_loss) || !isfinite(preflight_grad_norm);
         printf0("llmc_allocation_preflight: {\"status\":\"%s\",\"optimizer_steps\":0,\"checkpoint_saved\":0,\"batch\":%d,\"sequence_length\":%d,\"memory_used_bytes\":%zu,\"mlp_activation\":\"%s\",\"loss\":\"%.9g\",\"grad_norm\":\"%.9g\"}\n",
             nonfinite_stopped ? "nonfinite" : "passed",B,T,total_bytes-free_bytes,
-            llmc_mlp_activation_name(model.mlp_activation),model.mean_loss,preflight_grad_norm);
+            gpt2_mlp_activation_name(model.mlp_activation),model.mean_loss,preflight_grad_norm);
         fflush(stdout);
     }
     for (; !allocation_preflight && step <= train_num_batches; step++) {
@@ -4438,7 +4736,7 @@ int main(int argc, char *argv[]) {
                 "{\"status\":\"nonfinite\",\"step\":%d,\"completed_optimizer_steps\":%d,\"optimizer_step_applied\":false,\"loss_finite\":%s,\"grad_norm_finite\":%s,\"loss\":\"%.9g\",\"grad_norm\":\"%.9g\",\"mlp_activation\":\"%s\"}",
                 step+1,completed_optimizer_steps,isfinite(model.mean_loss)?"true":"false",
                 isfinite(grad_norm)?"true":"false",model.mean_loss,grad_norm,
-                llmc_mlp_activation_name(model.mlp_activation));
+                gpt2_mlp_activation_name(model.mlp_activation));
             printf0("llmc_nonfinite_guard: %s\n",guard_json);
             if (output_log_dir != nullptr && multi_gpu_config.process_rank == 0) {
                 const std::string path = std::string(output_log_dir) + "/nonfinite_guard.json";

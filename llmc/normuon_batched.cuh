@@ -6,8 +6,10 @@ gradient / FP32 master-weight optimizer contract. Dense polynomial and tracker
 products use BF16 operands with FP32 accumulation. Persistent momentum, second
 moment, master weights, and tracked Q remain FP32.
 
-The rectangular_muon scratch mode is handled as one contiguous 4d^2 matrix per
-layer and uses the smaller-side Gram matrix for its polynomial update.
+The rectangular_muon scratch mode handles one contiguous matrix per layer,
+with its checkpoint-owned rows and columns, and uses the smaller-side Gram
+matrix for its polynomial update. Historical dense MLPs have 4d^2 elements;
+packed SwiGLU expansion and contraction can have different element counts.
 
 Tracker retraction intentionally follows the native batched right form
 D(3I-D^T D)/2. The FP32 reference uses the algebraically equivalent left form;
@@ -86,18 +88,18 @@ __device__ __forceinline__ size_t llmc_normuon_batch_q_offset(
     return q_view_index * matrix_elements + element_index;
 }
 
-__device__ __forceinline__ size_t llmc_normuon_batch_rectangular_offset(
+__host__ __device__ __forceinline__ size_t llmc_normuon_batch_rectangular_offset(
     size_t matrix_index,
     size_t element_index,
-    size_t width) {
-    return matrix_index * (4U * width * width) + element_index;
+    size_t matrix_elements) {
+    return matrix_index * matrix_elements + element_index;
 }
 
-__device__ __forceinline__ size_t llmc_normuon_batch_rectangular_second_offset(
+__host__ __device__ __forceinline__ size_t llmc_normuon_batch_rectangular_second_offset(
     size_t matrix_index,
     size_t row,
-    size_t width) {
-    return matrix_index * (4U * width * width) + row;
+    size_t matrix_elements) {
+    return matrix_index * matrix_elements + row;
 }
 
 __global__ void llmc_normuon_batch_prepare_momentum_kernel(
@@ -174,7 +176,7 @@ __global__ void llmc_normuon_batch_prepare_rectangular_momentum_kernel(
     float sum = 0.0f;
     for (size_t index = threadIdx.x; index < matrix_elements; index += blockDim.x) {
         const size_t offset = llmc_normuon_batch_rectangular_offset(
-            matrix_index, index, width);
+            matrix_index, index, matrix_elements);
         const float grad = gradient_scale * static_cast<float>(gradient[offset]);
         const float next_momentum =
             momentum_beta * momentum[offset] + (1.0f - momentum_beta) * grad;
@@ -1796,7 +1798,7 @@ __global__ void llmc_normuon_batch_second_moment_rectangular_kernel(
             sum += value * value;
         }
         const size_t second_offset =
-            llmc_normuon_batch_rectangular_second_offset(matrix_index, axis, width);
+            llmc_normuon_batch_rectangular_second_offset(matrix_index, axis, rows * columns);
         const float mean = sum / static_cast<float>(reduced_count);
         const float next = beta2 * second_moment[second_offset] +
                            (1.0f - beta2) * mean;
@@ -1833,7 +1835,7 @@ __global__ void llmc_normuon_batch_second_moment_rectangular_kernel(
     __syncthreads();
     for (size_t axis = threadIdx.x; axis < axis_count; axis += blockDim.x) {
         const size_t second_offset =
-            llmc_normuon_batch_rectangular_second_offset(matrix_index, axis, width);
+            llmc_normuon_batch_rectangular_second_offset(matrix_index, axis, rows * columns);
         const float local_scale =
             rsqrtf(fmaxf(second_moment[second_offset], epsilon)) * global_scale;
         if (!isfinite(local_scale)) {
@@ -1872,7 +1874,7 @@ __global__ void llmc_normuon_batch_validate_rectangular_update_kernel(
         const size_t axis = row;
         const size_t axis_stride = rows;
         const size_t parameter_offset =
-            llmc_normuon_batch_rectangular_offset(matrix_index, index, width);
+            llmc_normuon_batch_rectangular_offset(matrix_index, index, matrix_elements);
         const float local_scale = row_scales[matrix_index * axis_stride + axis];
         const size_t direction_offset = matrix_index * panel_stride + index;
         const float updated = master[parameter_offset] * decay_scale -
@@ -1918,7 +1920,7 @@ __global__ void llmc_normuon_batch_apply_rectangular_update_kernel(
         const size_t axis = row;
         const size_t axis_stride = rows;
         const size_t parameter_offset =
-            llmc_normuon_batch_rectangular_offset(matrix_index, index, width);
+            llmc_normuon_batch_rectangular_offset(matrix_index, index, matrix_elements);
         const float local_scale = row_scales[matrix_index * axis_stride + axis];
         const size_t direction_offset = matrix_index * panel_stride + index;
         const float updated = master[parameter_offset] * decay_scale -
@@ -4833,19 +4835,11 @@ inline bool llmc_normuon_update_parameter_type_batched_bf16(
     // family still needs its native panel stride.  Switching this stride at
     // the family boundary keeps square Wup GEMMs contiguous while retaining
     // the four-d^2 rectangular stride for Wdown scratch updates.
-    runtime->matrix_elements =
-        rectangular ? 4U * static_cast<size_t>(width) * width
-                    : static_cast<size_t>(width) * width;
-    const int rows = rectangular
-        ? (parameter_type->family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
-               ? 4 * width
-               : width)
-        : width;
-    const int columns = rectangular
-        ? (parameter_type->family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP
-               ? width
-               : 4 * width)
-        : width;
+    LlmcOptimizerMatrixView active_view;
+    if (!parameter_type->enumerate_matrix_view(parameter_type,0,&active_view)) return false;
+    const int rows = static_cast<int>(active_view.rows);
+    const int columns = static_cast<int>(active_view.columns);
+    runtime->matrix_elements = active_view.rows * active_view.columns;
     const int lr_dither_family_slot =
         llmc_normuon_lr_dither_family_slot(parameter_type->family_id);
     if (runtime->lr_dither_enabled &&

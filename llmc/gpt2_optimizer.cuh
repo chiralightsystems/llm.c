@@ -404,13 +404,18 @@ void gpt2_update(
     // trajectory of legacy 16-tensor checkpoints. Their update dispatch is a
     // no-op, but evaluating an uninitialized seed would still be undefined.
     const int seeded_tensor_count = gpt2_uses_embedding_bridge(&model->config)
-        ? NUM_PARAMETER_TENSORS
+        ? 18
         : LLMC_LEGACY_PARAMETER_TENSOR_COUNT;
     for (int tensor_id = 0;
          tensor_id < seeded_tensor_count;
          ++tensor_id) {
         tensor_seeds[tensor_id] = random_u32(&update_rng_state);
     }
+    // Local owners have independent rounding seeds; the ordinary tensor RNG
+    // stream is unchanged in the ReLU-squared and GUM matching pair.
+    unsigned long long local_rng = model->rng_state ^ 0x4e415649415f4646ULL;
+    for (int tensor_id = 18; tensor_id < NUM_PARAMETER_TENSORS; ++tensor_id)
+        tensor_seeds[tensor_id] = random_u32(&local_rng);
     if (!init_from_master_only) {
         model->rng_state = update_rng_state;
     }

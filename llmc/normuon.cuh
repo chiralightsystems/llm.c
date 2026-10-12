@@ -20,7 +20,7 @@ the single-GPU CUDA implementation. It does not depend on the FRNA host runtime.
 
 #include <string>
 
-constexpr int LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT = 18;
+constexpr int LLMC_OPTIMIZER_PARAMETER_TYPE_COUNT = 21;
 constexpr int LLMC_OPTIMIZER_FAMILY_COUNT = 6;
 constexpr int LLMC_NORMUON_POLYNOMIAL_STAGE_COUNT = 5;
 constexpr int LLMC_NORMUON_VIEWS_PER_LAYER = 8;
@@ -1442,7 +1442,8 @@ inline bool llmc_enumerate_mlp_wup_rectangular_view(
     const size_t width = parameter_type->matrix_width;
     view->element_offset = 0U;
     view->second_moment_offset = 0U;
-    view->rows = 4U * width;
+    if (parameter_type->layer_elements % width != 0U) return false;
+    view->rows = parameter_type->layer_elements / width;
     view->columns = width;
     view->row_stride = width;
     view->column_stride = 1U;
@@ -1461,8 +1462,9 @@ inline bool llmc_enumerate_mlp_wdown_rectangular_view(
     view->element_offset = 0U;
     view->second_moment_offset = 0U;
     view->rows = width;
-    view->columns = 4U * width;
-    view->row_stride = 4U * width;
+    if (parameter_type->layer_elements % width != 0U) return false;
+    view->columns = parameter_type->layer_elements / width;
+    view->row_stride = view->columns;
     view->column_stride = 1U;
     return true;
 }
@@ -1514,6 +1516,9 @@ static constexpr LlmcOptimizerParameterTemplate kLlmcParameterTemplates[
     {"lnfb", LLMC_OPTIMIZER_FAMILY_NORMALIZATION, LLMC_WEIGHT_DECAY_DISABLED, 0, 0, nullptr},
     {"lexical_downw", LLMC_OPTIMIZER_FAMILY_EMBEDDINGS, LLMC_WEIGHT_DECAY_ENABLED, 0, 0, nullptr},
     {"lexical_upw", LLMC_OPTIMIZER_FAMILY_EMBEDDINGS, LLMC_WEIGHT_DECAY_ENABLED, 0, 0, nullptr},
+    {"gum_u", LLMC_OPTIMIZER_FAMILY_MLP_WUP, LLMC_WEIGHT_DECAY_ENABLED, 1, 0, nullptr},
+    {"gum_g", LLMC_OPTIMIZER_FAMILY_MLP_WUP, LLMC_WEIGHT_DECAY_ENABLED, 1, 0, nullptr},
+    {"gum_v", LLMC_OPTIMIZER_FAMILY_MLP_WUP, LLMC_WEIGHT_DECAY_ENABLED, 1, 0, nullptr},
 };
 
 inline void llmc_optimizer_plan_reset(LlmcOptimizerPlan* plan) {
@@ -1586,11 +1591,11 @@ inline bool llmc_build_optimizer_plan(
         }
         const bool family_rectangular = llmc_normuon_family_is_rectangular(
             resolved.orthogonalization_mode, source.family_id);
-        if (family_rectangular &&
+        if (family_rectangular && source.enumerator != nullptr &&
             source.family_id == LLMC_OPTIMIZER_FAMILY_MLP_WUP) {
             target.views_per_layer = LLMC_NORMUON_RECTANGULAR_VIEWS_PER_MLP_MATRIX;
             target.enumerate_matrix_view = llmc_enumerate_mlp_wup_rectangular_view;
-        } else if (family_rectangular &&
+        } else if (family_rectangular && source.enumerator != nullptr &&
                    source.family_id == LLMC_OPTIMIZER_FAMILY_MLP_WDOWN) {
             target.views_per_layer = LLMC_NORMUON_RECTANGULAR_VIEWS_PER_MLP_MATRIX;
             target.enumerate_matrix_view = llmc_enumerate_mlp_wdown_rectangular_view;
@@ -3939,6 +3944,38 @@ inline bool llmc_normuon_runtime_layout_workspace(
     return laid_out_bytes <= runtime->workspace_bytes;
 }
 
+// Shared by allocation and CPU-only planning checks. Batched execution owns
+// one panel per simultaneous view; the reference path reuses one panel.
+inline bool llmc_normuon_workspace_geometry(
+    const LlmcOptimizerPlan* plan,
+    int execution_mode,
+    size_t* matrix_capacity,
+    size_t* total_elements,
+    size_t* max_rows) {
+    if (plan == nullptr || !plan->built || matrix_capacity == nullptr ||
+        total_elements == nullptr || max_rows == nullptr ||
+        (execution_mode != LLMC_NORMUON_EXECUTION_BF16_BATCHED &&
+         execution_mode != LLMC_NORMUON_EXECUTION_FP32_REFERENCE)) return false;
+    *matrix_capacity = *total_elements = *max_rows = 0U;
+    for (const auto& type : plan->parameter_types) {
+        if (type.backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON) continue;
+        LlmcOptimizerMatrixView view;
+        if (type.enumerate_matrix_view == nullptr ||
+            !type.enumerate_matrix_view(&type, 0, &view) ||
+            view.rows == 0U || view.columns == 0U ||
+            view.rows > SIZE_MAX / view.columns) return false;
+        const size_t elements = view.rows * view.columns;
+        const size_t count = execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED
+            ? static_cast<size_t>(type.layer_multiplicity) * type.views_per_layer
+            : 1U;
+        if (count == 0U || count > SIZE_MAX / elements) return false;
+        *matrix_capacity = max(*matrix_capacity, count);
+        *total_elements = max(*total_elements, count * elements);
+        *max_rows = max(*max_rows, max(view.rows, view.columns));
+    }
+    return *matrix_capacity != 0U;
+}
+
 inline bool llmc_normuon_runtime_allocate(
     LlmcNormuonRuntime* runtime,
     const LlmcOptimizerPlan* plan,
@@ -3964,40 +4001,9 @@ inline bool llmc_normuon_runtime_allocate(
     }
     const size_t matrix_elements =
         rectangular ? 4U * square_elements : square_elements;
-    const size_t batch_views_per_matrix =
-        llmc_normuon_is_split_family_mode(config->orthogonalization_mode)
-            ? LLMC_NORMUON_VIEWS_PER_MLP_MATRIX
-            : (rectangular ? LLMC_NORMUON_RECTANGULAR_VIEWS_PER_MLP_MATRIX
-                           : LLMC_NORMUON_VIEWS_PER_MLP_MATRIX);
-    size_t batch_matrix_capacity =
-        config->execution_mode == LLMC_NORMUON_EXECUTION_BF16_BATCHED
-            ? static_cast<size_t>(plan->num_layers) *
-                  batch_views_per_matrix
-            : 1U;
-    if (batch_matrix_capacity == 0U ||
-        batch_matrix_capacity > SIZE_MAX / matrix_elements) {
-        return false;
-    }
-    size_t batch_total_elements =
-        batch_matrix_capacity * matrix_elements;
-    // Reuse panels across parameter types. QKV needs 3L square views, while
-    // a whole rectangular MLP needs only L views but 4L*d^2 panel elements.
-    // Multiplying the largest view count by the largest view size triples
-    // the workspace unnecessarily.
-    if (llmc_normuon_targets_attention(config)) {
-        batch_matrix_capacity = batch_total_elements = 0U;
-        for (const auto& type : plan->parameter_types) {
-            if (type.backend_kind != LLMC_OPTIMIZER_BACKEND_NORMUON) continue;
-            LlmcOptimizerMatrixView view;
-            if (!type.enumerate_matrix_view(&type, 0, &view)) return false;
-            const size_t count = static_cast<size_t>(type.layer_multiplicity) *
-                                 type.views_per_layer;
-            if (count > SIZE_MAX / (view.rows * view.columns)) return false;
-            const size_t elements = count * view.rows * view.columns;
-            if (count > batch_matrix_capacity) batch_matrix_capacity = count;
-            if (elements > batch_total_elements) batch_total_elements = elements;
-        }
-    }
+    size_t batch_matrix_capacity, batch_total_elements, max_rows;
+    if (!llmc_normuon_workspace_geometry(plan, config->execution_mode,
+            &batch_matrix_capacity, &batch_total_elements, &max_rows)) return false;
     const size_t batch_float_matrix_count =
         config->execution_mode == LLMC_NORMUON_EXECUTION_FP32_REFERENCE
             ? 5U
@@ -4013,7 +4019,6 @@ inline bool llmc_normuon_runtime_allocate(
     }
     const size_t batch_stats_elements =
         batch_matrix_capacity * LLMC_NORMUON_BATCH_STATS_STRIDE + 8U;
-    const size_t max_rows = rectangular ? 4U * width : width;
     if (batch_matrix_capacity > SIZE_MAX / max_rows) {
         return false;
     }
